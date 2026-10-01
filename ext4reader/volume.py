@@ -1,0 +1,312 @@
+"""Mounted EXT4 volume: block/inode I/O, discovery, metadata flush."""
+
+from __future__ import annotations
+
+import struct
+import time
+from dataclasses import dataclass, field
+
+from ext4reader import constants as C
+from ext4reader.debuglog import LOG
+from ext4reader.inode import Inode, parse_inode
+from ext4reader.io_backend import BlockDevice
+from ext4reader.partitions import list_partitions
+from ext4reader.superblock import (
+    Superblock,
+    parse_group_desc,
+    parse_superblock,
+    update_group_desc_fields,
+)
+
+
+class Ext4Error(RuntimeError):
+    pass
+
+
+@dataclass
+class VolumeInfo:
+    offset: int
+    size: int
+    partition_index: int
+    partition_name: str
+    scheme: str
+    sb: Superblock
+    write_blockers: list[str] = field(default_factory=list)
+
+    @property
+    def label(self) -> str:
+        return self.sb.volume_name or "(이름 없음)"
+
+    @property
+    def writable(self) -> bool:
+        return not self.write_blockers
+
+
+class Ext4Volume:
+    def __init__(self, dev: BlockDevice, offset: int = 0, size: int = 0, owns_device: bool = True):
+        self.dev = dev
+        self.owns_device = owns_device
+        self.part_offset = offset
+        self.part_size = size or max(0, dev.size() - offset)
+        raw = self.dev.read(offset + 1024, 1024)
+        self.sb = parse_superblock(raw)
+        LOG.info(
+            "Ext4Volume 열기 offset=%s size=%s block=%s inodes=%s inode_size=%s groups=%s label=%s "
+            "state=0x%X incompat=0x%X ro_compat=0x%X recover=%s valid=%s journal=%s",
+            offset,
+            self.part_size,
+            self.sb.block_size,
+            self.sb.inodes_count,
+            self.sb.inode_size,
+            self.sb.groups_count,
+            self.sb.volume_name,
+            self.sb.state,
+            self.sb.feature_incompat,
+            self.sb.feature_ro_compat,
+            self.sb.needs_recovery,
+            bool(self.sb.state & C.EXT4_VALID_FS),
+            self.sb.has_journal,
+        )
+        if self.sb.feature_incompat & C.EXT4_FEATURE_INCOMPAT_CASEFOLD:
+            LOG.info("casefold 볼륨 — 파일 이름 대소문자는 구분하지 않습니다. 쓰기는 가능합니다.")
+        self.dirty_groups: set[int] = set()
+        self.dirty_super = False
+        self._load_groups()
+
+    def _load_groups(self) -> None:
+        gdt_block = self.sb.first_data_block + 1
+        total = self.sb.groups_count * self.sb.desc_size
+        data = self.read_bytes(gdt_block * self.sb.block_size, total)
+        groups = []
+        for g in range(self.sb.groups_count):
+            rec = data[g * self.sb.desc_size : (g + 1) * self.sb.desc_size]
+            groups.append(parse_group_desc(self.sb, g, rec))
+        self.groups = groups
+
+    def read_bytes(self, fs_offset: int, length: int) -> bytes:
+        return self.dev.read(self.part_offset + fs_offset, length)
+
+    def write_bytes(self, fs_offset: int, data: bytes) -> None:
+        self.dev.write(self.part_offset + fs_offset, data)
+
+    def read_block(self, phys: int) -> bytes:
+        if phys < 0 or phys >= self.sb.blocks_count:
+            raise Ext4Error(f"블록 번호가 범위를 벗어났습니다: {phys}")
+        return self.read_bytes(phys * self.sb.block_size, self.sb.block_size)
+
+    def write_block(self, phys: int, data: bytes) -> None:
+        if len(data) != self.sb.block_size:
+            if len(data) < self.sb.block_size:
+                data = data + b"\x00" * (self.sb.block_size - len(data))
+            else:
+                data = data[: self.sb.block_size]
+        self.write_bytes(phys * self.sb.block_size, data)
+
+    def _inode_loc(self, ino: int) -> tuple[int, int]:
+        if ino < 1 or ino > self.sb.inodes_count:
+            raise Ext4Error(f"잘못된 inode: {ino}")
+        g = (ino - 1) // self.sb.inodes_per_group
+        index = (ino - 1) % self.sb.inodes_per_group
+        gd = self.groups[g]
+        offset = gd.inode_table * self.sb.block_size + index * self.sb.inode_size
+        return g, offset
+
+    def read_inode(self, ino: int) -> Inode:
+        _g, off = self._inode_loc(ino)
+        raw = self.read_bytes(off, self.sb.inode_size)
+        return parse_inode(self.sb, ino, raw)
+
+    def write_inode(self, inode: Inode) -> None:
+        inode.apply_checksum(self.sb)
+        _g, off = self._inode_loc(inode.ino)
+        self.write_bytes(off, bytes(inode.raw[: self.sb.inode_size]))
+
+    def flush_metadata(self) -> None:
+        if self.dirty_groups:
+            gdt_block = self.sb.first_data_block + 1
+            # rewrite dirty descriptors in place
+            for g in sorted(self.dirty_groups):
+                gd = self.groups[g]
+                update_group_desc_fields(self.sb, gd)
+                off = gdt_block * self.sb.block_size + g * self.sb.desc_size
+                self.write_bytes(off, bytes(gd.raw[: self.sb.desc_size]))
+            self.dirty_groups.clear()
+        if self.dirty_super:
+            self.sb.update_counts()
+            self.sb.write_checksum()
+            self.write_bytes(1024, bytes(self.sb.raw[:1024]))
+            self.dirty_super = False
+        self.dev.flush()
+
+    def journal_start(self) -> int | None:
+        if not self.sb.has_journal or not self.sb.journal_inum:
+            return 0
+        try:
+            from ext4reader.extents import file_extents
+
+            j = self.read_inode(self.sb.journal_inum)
+            ex = file_extents(self, j)
+            if not ex:
+                return None
+            block = self.read_block(ex[0].physical)
+            magic = struct.unpack(">I", block[0:4])[0]
+            if magic != C.JBD2_MAGIC_NUMBER:
+                return None
+            return struct.unpack(">I", block[28:32])[0]
+        except Exception as exc:
+            LOG.warning("저널 슈퍼블록을 읽지 못함: %s", exc)
+            return None
+
+    def journal_needs_recovery(self) -> bool:
+        s_start = self.journal_start()
+        if s_start is None:
+            return bool(self.sb.needs_recovery)
+        if s_start != 0:
+            LOG.info("저널 재생 필요 s_start=%s recover_flag=%s", s_start, self.sb.needs_recovery)
+            return True
+        if self.sb.needs_recovery:
+            LOG.info("RECOVER 플래그는 있으나 저널이 비어 있습니다 (s_start=0). 쓰기를 막을 필요는 없습니다.")
+        return False
+
+    def fs_write_blockers(self) -> list[str]:
+        return self.hard_write_blockers() + self.soft_write_warnings()
+
+    def hard_write_blockers(self) -> list[str]:
+        reasons = []
+        unknown = self.sb.feature_incompat & ~C.SUPPORTED_INCOMPAT_WRITE
+        if unknown & C.EXT4_FEATURE_INCOMPAT_ENCRYPT:
+            reasons.append("암호화된 파일시스템입니다.")
+        if unknown & C.EXT4_FEATURE_INCOMPAT_META_BG:
+            reasons.append("META_BG 레이아웃은 쓰기를 지원하지 않습니다.")
+        if unknown & C.EXT4_FEATURE_INCOMPAT_MMP:
+            reasons.append("다중 마운트 보호(MMP)가 켜져 있습니다.")
+        if self.sb.feature_ro_compat & C.EXT4_FEATURE_RO_COMPAT_BIGALLOC:
+            reasons.append("bigalloc 파일시스템은 쓰기를 지원하지 않습니다.")
+        if self.sb.feature_ro_compat & C.EXT4_FEATURE_RO_COMPAT_READONLY:
+            reasons.append("읽기 전용으로 표시된 파일시스템입니다.")
+        leftover = self.sb.feature_incompat & ~C.SUPPORTED_INCOMPAT_WRITE & ~C.EXT4_FEATURE_INCOMPAT_RECOVER
+        leftover &= ~(
+            C.EXT4_FEATURE_INCOMPAT_ENCRYPT
+            | C.EXT4_FEATURE_INCOMPAT_CASEFOLD
+            | C.EXT4_FEATURE_INCOMPAT_META_BG
+            | C.EXT4_FEATURE_INCOMPAT_MMP
+            | C.EXT4_FEATURE_INCOMPAT_INLINE_DATA
+        )
+        if leftover:
+            reasons.append(f"알 수 없는 incompat 기능(0x{leftover:X})이 있습니다.")
+        if not self.sb.has_extents:
+            reasons.append("EXT4 extents가 없는 볼륨(EXT2/3)에는 쓸 수 없습니다.")
+        return reasons
+
+    def soft_write_warnings(self) -> list[str]:
+        reasons = []
+        if self.journal_needs_recovery():
+            reasons.append("저널에 재생하지 않은 기록이 있습니다. 리눅스에서 한 번 마운트한 뒤 빼는 것이 안전합니다.")
+        if not (self.sb.state & C.EXT4_VALID_FS):
+            reasons.append("파일시스템이 깨끗하게 언마운트되지 않았습니다.")
+        return reasons
+
+    def write_blockers(self) -> list[str]:
+        reasons = []
+        if not self.dev.writable:
+            reasons.append("장치를 읽기 전용으로 열었습니다.")
+        reasons.extend(self.fs_write_blockers())
+        return reasons
+
+    def require_write(self) -> None:
+        reasons = []
+        if not self.dev.writable:
+            reasons.append("장치를 읽기 전용으로 열었습니다.")
+        reasons.extend(self.hard_write_blockers())
+        if reasons:
+            raise Ext4Error("쓸 수 없습니다:\n- " + "\n- ".join(reasons))
+
+    def close(self) -> None:
+        try:
+            self.flush_metadata()
+        finally:
+            if self.owns_device:
+                self.dev.close()
+
+
+def probe_superblock(dev: BlockDevice, offset: int) -> Superblock | None:
+    try:
+        data = dev.read(offset + 1024, 1024)
+        if len(data) < 1024:
+            return None
+        return parse_superblock(data)
+    except Exception:
+        return None
+
+
+def discover_volumes(dev: BlockDevice) -> list[VolumeInfo]:
+    found: list[VolumeInfo] = []
+    seen_off: set[int] = set()
+    parts = []
+    try:
+        parts = list_partitions(dev)
+    except Exception:
+        parts = []
+
+    candidates: list[tuple[int, int, int, str, str]] = []
+    for p in parts:
+        candidates.append((p.start, p.size, p.index, p.name, p.scheme))
+    if not candidates:
+        candidates.append((0, dev.size(), 0, "", "전체"))
+
+    for start, size, idx, name, scheme in candidates:
+        if start in seen_off:
+            continue
+        sb = probe_superblock(dev, start)
+        if not sb:
+            continue
+        seen_off.add(start)
+        info = VolumeInfo(
+            offset=start,
+            size=size or (sb.blocks_count * sb.block_size),
+            partition_index=idx,
+            partition_name=name,
+            scheme=scheme,
+            sb=sb,
+        )
+        try:
+            tmp = Ext4Volume(dev, start, info.size, owns_device=False)
+            info.write_blockers = tmp.hard_write_blockers()
+        except Exception:
+            pass
+        found.append(info)
+
+    if not found:
+        sb = probe_superblock(dev, 0)
+        if sb:
+            found.append(
+                VolumeInfo(
+                    offset=0,
+                    size=dev.size(),
+                    partition_index=0,
+                    partition_name="",
+                    scheme="슈퍼블록",
+                    sb=sb,
+                )
+            )
+    return found
+
+
+def format_bytes(n: int) -> str:
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            if unit == "B":
+                return f"{int(n)} {unit}"
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def format_time(ts: int) -> str:
+    if not ts:
+        return "-"
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+    except Exception:
+        return str(ts)

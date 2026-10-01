@@ -1,0 +1,639 @@
+"""Enumerate and open Windows physical disks (HDD, SSD, USB, SD/MMC)."""
+
+from __future__ import annotations
+
+import ctypes
+import os
+import subprocess
+import sys
+import threading
+from ctypes import wintypes
+from dataclasses import dataclass
+
+from ext4reader.io_backend import BlockDevice, IoError
+
+GENERIC_READ = 0x80000000
+GENERIC_WRITE = 0x40000000
+FILE_SHARE_READ = 0x00000001
+FILE_SHARE_WRITE = 0x00000002
+FILE_SHARE_DELETE = 0x00000004
+OPEN_EXISTING = 3
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+FILE_BEGIN = 0
+FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+FSCTL_LOCK_VOLUME = 0x00090018
+FSCTL_DISMOUNT_VOLUME = 0x00090020
+FSCTL_ALLOW_EXTENDED_DASD_IO = 0x00090083
+IOCTL_STORAGE_GET_DEVICE_NUMBER = 0x002D1080
+IOCTL_STORAGE_CHECK_VERIFY2 = 0x002D0800
+STALE_HANDLE_ERRORS = {6, 31, 995, 1167}  # invalid handle / gen fail / aborted / unplugged
+
+IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = 0x000700A0
+IOCTL_STORAGE_QUERY_PROPERTY = 0x002D1400
+
+BUS_NAMES = {
+    0: "알 수 없음",
+    1: "SCSI",
+    2: "ATAPI",
+    3: "ATA",
+    4: "IEEE1394",
+    6: "Fibre",
+    7: "USB",
+    8: "RAID",
+    9: "iSCSI",
+    10: "SAS",
+    11: "SATA",
+    12: "SD",
+    13: "MMC",
+    14: "Virtual",
+    15: "VHD",
+    17: "NVMe",
+    19: "UFS",
+}
+
+BUS_KIND = {
+    3: "HDD/SSD",
+    7: "USB",
+    11: "HDD/SSD",
+    12: "SD 카드",
+    13: "SD 카드",
+    17: "SSD",
+    19: "SD 카드",
+}
+
+
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+kernel32.CreateFileW.argtypes = [
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.HANDLE,
+]
+kernel32.CreateFileW.restype = ctypes.c_void_p
+kernel32.ReadFile.argtypes = [
+    wintypes.HANDLE,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+    wintypes.LPVOID,
+]
+kernel32.ReadFile.restype = wintypes.BOOL
+kernel32.WriteFile.argtypes = [
+    wintypes.HANDLE,
+    wintypes.LPCVOID,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+    wintypes.LPVOID,
+]
+kernel32.WriteFile.restype = wintypes.BOOL
+kernel32.SetFilePointerEx.argtypes = [
+    wintypes.HANDLE,
+    ctypes.c_longlong,
+    ctypes.POINTER(ctypes.c_longlong),
+    wintypes.DWORD,
+]
+kernel32.SetFilePointerEx.restype = wintypes.BOOL
+kernel32.DeviceIoControl.argtypes = [
+    wintypes.HANDLE,
+    wintypes.DWORD,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+    wintypes.LPVOID,
+]
+kernel32.DeviceIoControl.restype = wintypes.BOOL
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+kernel32.CloseHandle.restype = wintypes.BOOL
+kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+kernel32.FlushFileBuffers.restype = wintypes.BOOL
+kernel32.SetLastError.argtypes = [wintypes.DWORD]
+kernel32.SetLastError.restype = None
+kernel32.FindFirstVolumeW.argtypes = [wintypes.LPWSTR, wintypes.DWORD]
+kernel32.FindFirstVolumeW.restype = wintypes.HANDLE
+kernel32.FindNextVolumeW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD]
+kernel32.FindNextVolumeW.restype = wintypes.BOOL
+kernel32.FindVolumeClose.argtypes = [wintypes.HANDLE]
+kernel32.FindVolumeClose.restype = wintypes.BOOL
+
+
+class STORAGE_DEVICE_NUMBER(ctypes.Structure):
+    _fields_ = [
+        ("DeviceType", wintypes.DWORD),
+        ("DeviceNumber", wintypes.DWORD),
+        ("PartitionNumber", wintypes.DWORD),
+    ]
+
+
+class _SHELLEXECUTEINFOW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("fMask", wintypes.ULONG),
+        ("hwnd", wintypes.HWND),
+        ("lpVerb", wintypes.LPCWSTR),
+        ("lpFile", wintypes.LPCWSTR),
+        ("lpParameters", wintypes.LPCWSTR),
+        ("lpDirectory", wintypes.LPCWSTR),
+        ("nShow", ctypes.c_int),
+        ("hInstApp", wintypes.HINSTANCE),
+        ("lpIDList", ctypes.c_void_p),
+        ("lpClass", wintypes.LPCWSTR),
+        ("hkeyClass", wintypes.HKEY),
+        ("dwHotKey", wintypes.DWORD),
+        ("hIcon", wintypes.HANDLE),
+        ("hProcess", wintypes.HANDLE),
+    ]
+
+
+SEE_MASK_NOCLOSEPROCESS = 0x00000040
+SEE_MASK_NOASYNC = 0x00000100
+SW_SHOWNORMAL = 1
+ERROR_CANCELLED = 1223
+
+_shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+_shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(_SHELLEXECUTEINFOW)]
+_shell32.ShellExecuteExW.restype = wintypes.BOOL
+
+
+def is_admin() -> bool:
+    if sys.platform != "win32":
+        return True
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _shell_runas(file: str, params: str, directory: str, hwnd=None) -> tuple[bool, str]:
+    info = _SHELLEXECUTEINFOW()
+    info.cbSize = ctypes.sizeof(_SHELLEXECUTEINFOW)
+    info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC
+    info.hwnd = hwnd if hwnd else None
+    info.lpVerb = "runas"
+    info.lpFile = file
+    info.lpParameters = params or None
+    info.lpDirectory = directory or None
+    info.nShow = SW_SHOWNORMAL
+    if not _shell32.ShellExecuteExW(ctypes.byref(info)):
+        err = ctypes.get_last_error()
+        if err in (ERROR_CANCELLED, 5):
+            return False, "관리자 권한이 거부되었습니다. 확인 창에서 예를 눌러 주세요."
+        return False, f"관리자 권한으로 시작하지 못했습니다. (Win32 {err})"
+    if info.hProcess:
+        kernel32.CloseHandle(info.hProcess)
+    return True, ""
+
+
+def restart_as_admin(hwnd=None) -> tuple[bool, str]:
+    """Relaunch this app elevated. Returns (ok, error_message)."""
+    if sys.platform != "win32":
+        return False, "이 프로그램은 Windows용입니다."
+    if is_admin():
+        return True, ""
+    from ext4reader.host import app_exe, is_frozen, project_root
+
+    try:
+        exe = app_exe()
+    except RuntimeError as exc:
+        return False, str(exc)
+    root = project_root()
+    extra = subprocess.list2cmdline(sys.argv[1:]) if len(sys.argv) > 1 else ""
+    if is_frozen():
+        ok, err = _shell_runas(exe, extra, root, hwnd)
+        return (True, "") if ok else (False, err)
+    # Elevated processes often start in C:\Windows\System32 and ignore lpDirectory,
+    # so the child must put the project on sys.path itself.
+    code = (
+        "import os,sys,runpy;"
+        f"p={root!r};"
+        "os.chdir(p);"
+        "sys.path.insert(0,p);"
+        "os.environ['PYTHONPATH']=p;"
+        "os.environ['EXT4READER_HOST']='1';"
+        "runpy.run_module('ext4reader', run_name='__main__')"
+    )
+    params = "-c " + subprocess.list2cmdline([code])
+    ok, err = _shell_runas(exe, params, root, hwnd)
+    if ok:
+        return True, ""
+    bat = os.path.join(root, "run_as_admin.bat")
+    if os.path.isfile(bat):
+        ok2, err2 = _shell_runas(bat, "", root, hwnd)
+        if ok2:
+            return True, ""
+        return False, err2 or err
+    return False, err
+
+
+@dataclass
+class DiskInfo:
+    index: int
+    path: str
+    model: str
+    vendor: str
+    bus_type: int
+    removable: bool
+    size: int
+    sector_size: int
+    error: str = ""
+
+    @property
+    def bus_name(self) -> str:
+        return BUS_NAMES.get(self.bus_type, f"Bus {self.bus_type}")
+
+    @property
+    def kind(self) -> str:
+        if self.bus_type in BUS_KIND:
+            return BUS_KIND[self.bus_type]
+        if self.removable:
+            return "이동식"
+        return "디스크"
+
+    @property
+    def title(self) -> str:
+        name = (self.vendor + " " + self.model).strip() or f"PhysicalDrive{self.index}"
+        return f"{self.kind} · {name}"
+
+
+def _decode_c_string(buf: bytes, offset: int) -> str:
+    if offset <= 0 or offset >= len(buf):
+        return ""
+    raw = buf[offset:]
+    end = raw.find(b"\x00")
+    if end >= 0:
+        raw = raw[:end]
+    return raw.decode("ascii", errors="ignore").strip()
+
+
+def _query_geometry(handle) -> tuple[int, int]:
+    out = ctypes.create_string_buffer(256)
+    returned = wintypes.DWORD(0)
+    ok = kernel32.DeviceIoControl(
+        handle,
+        IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
+        None,
+        0,
+        out,
+        256,
+        ctypes.byref(returned),
+        None,
+    )
+    if not ok:
+        return 0, 512
+    data = out.raw
+    sector = int.from_bytes(data[20:24], "little") or 512
+    size = int.from_bytes(data[24:32], "little")
+    return size, sector
+
+
+def _query_storage(handle) -> tuple[str, str, int, bool]:
+    query = ctypes.create_string_buffer(12)
+    # PropertyId = StorageDeviceProperty (0), QueryType = PropertyStandardQuery (0)
+    out = ctypes.create_string_buffer(1024)
+    returned = wintypes.DWORD(0)
+    ok = kernel32.DeviceIoControl(
+        handle,
+        IOCTL_STORAGE_QUERY_PROPERTY,
+        query,
+        12,
+        out,
+        1024,
+        ctypes.byref(returned),
+        None,
+    )
+    if not ok:
+        return "", "", 0, False
+    data = out.raw
+    removable = bool(data[10])
+    vendor_off = int.from_bytes(data[12:16], "little")
+    product_off = int.from_bytes(data[16:20], "little")
+    bus = data[28]
+    vendor = _decode_c_string(data, vendor_off)
+    product = _decode_c_string(data, product_off)
+    return vendor, product, bus, removable
+
+
+def _physical_index(path: str) -> int | None:
+    tag = "PHYSICALDRIVE"
+    up = path.upper().replace("/", "\\")
+    if tag not in up:
+        return None
+    tail = up.split(tag, 1)[1]
+    digits = "".join(ch for ch in tail if ch.isdigit())
+    if not digits:
+        return None
+    return int(digits)
+
+
+def _ioctl(handle, code: int, inbuf=None, out_cb: int = 0) -> bytes:
+    out = ctypes.create_string_buffer(out_cb) if out_cb else None
+    returned = wintypes.DWORD(0)
+    ok = kernel32.DeviceIoControl(
+        handle,
+        code,
+        inbuf,
+        len(inbuf) if inbuf else 0,
+        out,
+        out_cb,
+        ctypes.byref(returned),
+        None,
+    )
+    if not ok:
+        raise OSError(ctypes.get_last_error())
+    return out.raw[: returned.value] if out else b""
+
+
+def _allow_extended_io(handle) -> None:
+    try:
+        _ioctl(handle, FSCTL_ALLOW_EXTENDED_DASD_IO)
+    except OSError:
+        pass
+
+
+def _lock_volumes_for_disk(disk_index: int) -> list:
+    """Lock/dismount Windows volumes on this physical disk so EXT4 writes are not blocked."""
+    from ext4reader.debuglog import LOG
+
+    locked = []
+    name = ctypes.create_unicode_buffer(260)
+    find = kernel32.FindFirstVolumeW(name, 260)
+    if find == INVALID_HANDLE_VALUE or find is None:
+        return locked
+    try:
+        while True:
+            vol = name.value.rstrip("\\")
+            handle = kernel32.CreateFileW(
+                vol,
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                None,
+            )
+            if handle != INVALID_HANDLE_VALUE and handle is not None:
+                try:
+                    raw = _ioctl(handle, IOCTL_STORAGE_GET_DEVICE_NUMBER, out_cb=ctypes.sizeof(STORAGE_DEVICE_NUMBER))
+                    num = STORAGE_DEVICE_NUMBER.from_buffer_copy(raw)
+                    if num.DeviceNumber == disk_index:
+                        try:
+                            _ioctl(handle, FSCTL_LOCK_VOLUME)
+                        except OSError as exc:
+                            LOG.info("볼륨 잠금 실패 %s: %s", vol, exc)
+                        try:
+                            _ioctl(handle, FSCTL_DISMOUNT_VOLUME)
+                            LOG.info("Windows 볼륨 분리 %s (PhysicalDrive%s part=%s)", vol, disk_index, num.PartitionNumber)
+                        except OSError as exc:
+                            LOG.info("볼륨 분리 실패 %s: %s", vol, exc)
+                        locked.append(handle)
+                        handle = None
+                except OSError:
+                    pass
+                finally:
+                    if handle:
+                        kernel32.CloseHandle(handle)
+            if not kernel32.FindNextVolumeW(find, name, 260):
+                break
+    finally:
+        kernel32.FindVolumeClose(find)
+    return locked
+
+
+def _open_handle(path: str, writable: bool):
+    access = GENERIC_READ | (GENERIC_WRITE if writable else 0)
+    share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+    handle = kernel32.CreateFileW(
+        path,
+        access,
+        share,
+        None,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        None,
+    )
+    if handle == INVALID_HANDLE_VALUE or handle is None:
+        err = ctypes.get_last_error()
+        raise IoError(f"{path} 를 열 수 없습니다. (Win32 {err})", winerr=err)
+    _allow_extended_io(handle)
+    return handle
+
+
+def list_physical_disks() -> list[DiskInfo]:
+    disks: list[DiskInfo] = []
+    for idx in range(32):
+        path = rf"\\.\PhysicalDrive{idx}"
+        handle = kernel32.CreateFileW(
+            path,
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            0,
+            None,
+        )
+        if handle == INVALID_HANDLE_VALUE or handle is None:
+            continue
+        try:
+            size, sector = _query_geometry(handle)
+            vendor, product, bus, removable = _query_storage(handle)
+            disks.append(
+                DiskInfo(
+                    index=idx,
+                    path=path,
+                    model=product or f"PhysicalDrive{idx}",
+                    vendor=vendor,
+                    bus_type=bus,
+                    removable=removable,
+                    size=size,
+                    sector_size=sector or 512,
+                )
+            )
+        except Exception as exc:
+            disks.append(
+                DiskInfo(
+                    index=idx,
+                    path=path,
+                    model=f"PhysicalDrive{idx}",
+                    vendor="",
+                    bus_type=0,
+                    removable=False,
+                    size=0,
+                    sector_size=512,
+                    error=str(exc),
+                )
+            )
+        finally:
+            kernel32.CloseHandle(handle)
+    return disks
+
+
+class WindowsPhysicalDevice(BlockDevice):
+    def __init__(self, path: str, sector_size: int = 512, writable: bool = False):
+        from ext4reader.debuglog import LOG
+
+        self.path = path
+        self.sector_size = sector_size or 512
+        self._writable = writable
+        self._io_lock = threading.RLock()
+        self._closed = False
+        self._stop_ka = threading.Event()
+        self._volume_locks: list = []
+        LOG.info("디스크 열기 %s writable=%s sector=%s", path, writable, self.sector_size)
+        if writable:
+            idx = _physical_index(path)
+            if idx is not None:
+                self._volume_locks = _lock_volumes_for_disk(idx)
+        self._handle = _open_handle(path, writable)
+        self._size, geo_ss = _query_geometry(self._handle)
+        if geo_ss:
+            self.sector_size = geo_ss
+        LOG.info("디스크 열림 size=%s sector=%s", self._size, self.sector_size)
+        self._ka = None
+        if self._size:
+            self._ka = threading.Thread(target=self._keepalive, daemon=True, name=f"disk-ka-{path}")
+            self._ka.start()
+
+    @property
+    def writable(self) -> bool:
+        return self._writable
+
+    @property
+    def display_path(self) -> str:
+        return self.path
+
+    def size(self) -> int:
+        return self._size
+
+    def _keepalive(self) -> None:
+        from ext4reader.debuglog import LOG
+
+        while not self._stop_ka.wait(15):
+            try:
+                with self._io_lock:
+                    if self._closed:
+                        return
+                    try:
+                        _ioctl(self._handle, IOCTL_STORAGE_CHECK_VERIFY2)
+                    except OSError:
+                        self._raw_read_once(0, self.sector_size)
+            except Exception as exc:
+                LOG.warning("디스크 연결 유지 실패 %s: %s", self.path, exc)
+                try:
+                    with self._io_lock:
+                        if not self._closed:
+                            self._reopen_locked()
+                except Exception:
+                    pass
+
+    def _reopen_locked(self) -> None:
+        from ext4reader.debuglog import LOG
+
+        old = self._handle
+        try:
+            kernel32.CloseHandle(old)
+        except Exception:
+            pass
+        if self._writable:
+            idx = _physical_index(self.path)
+            if idx is not None:
+                for h in self._volume_locks:
+                    try:
+                        kernel32.CloseHandle(h)
+                    except Exception:
+                        pass
+                self._volume_locks = _lock_volumes_for_disk(idx)
+        self._handle = _open_handle(self.path, self._writable)
+        self._size, geo_ss = _query_geometry(self._handle)
+        if geo_ss:
+            self.sector_size = geo_ss
+        LOG.warning("디스크 핸들을 다시 열었습니다 %s", self.path)
+
+    def _retry(self, fn):
+        last: BaseException | None = None
+        with self._io_lock:
+            for attempt in range(3):
+                try:
+                    return fn()
+                except IoError as exc:
+                    last = exc
+                    if exc.winerr not in STALE_HANDLE_ERRORS or attempt == 2 or self._closed:
+                        raise
+                    from ext4reader.debuglog import LOG
+
+                    LOG.warning("디스크 I/O 재시도 Win32 %s (%s/%s)", exc.winerr, attempt + 1, 3)
+                    self._reopen_locked()
+        if last:
+            raise last
+        raise IoError("디스크 I/O 실패")
+
+    def _seek(self, offset: int) -> None:
+        kernel32.SetLastError(0)
+        new_pos = ctypes.c_longlong(0)
+        ok = kernel32.SetFilePointerEx(self._handle, offset, ctypes.byref(new_pos), FILE_BEGIN)
+        if not ok:
+            err = ctypes.get_last_error()
+            raise IoError(f"오프셋 {offset} 이동 실패 (Win32 {err})", winerr=err)
+
+    def _raw_read_once(self, offset: int, length: int) -> bytes:
+        self._seek(offset)
+        buf = ctypes.create_string_buffer(length)
+        done = wintypes.DWORD(0)
+        kernel32.SetLastError(0)
+        ok = kernel32.ReadFile(self._handle, buf, length, ctypes.byref(done), None)
+        if not ok:
+            err = ctypes.get_last_error()
+            raise IoError(
+                f"{self.path} 오프셋 {offset}에서 {length}바이트 읽기 실패 (Win32 {err})",
+                winerr=err,
+            )
+        return buf.raw[: done.value] + b"\x00" * max(0, length - done.value)
+
+    def _raw_write_once(self, offset: int, data: bytes) -> None:
+        self._seek(offset)
+        done = wintypes.DWORD(0)
+        buf = ctypes.create_string_buffer(data, len(data))
+        kernel32.SetLastError(0)
+        ok = kernel32.WriteFile(self._handle, buf, len(data), ctypes.byref(done), None)
+        err = ctypes.get_last_error()
+        if not ok or done.value != len(data):
+            raise IoError(f"{offset}에서 쓰기 실패 (Win32 {err})", winerr=err)
+
+    def _raw_read(self, offset: int, length: int) -> bytes:
+        return self._retry(lambda: self._raw_read_once(offset, length))
+
+    def _raw_write(self, offset: int, data: bytes) -> None:
+        self._retry(lambda: self._raw_write_once(offset, data))
+
+    def flush(self) -> None:
+        with self._io_lock:
+            if self._closed:
+                return
+            kernel32.FlushFileBuffers(self._handle)
+
+    def close(self) -> None:
+        self._stop_ka.set()
+        with self._io_lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                kernel32.CloseHandle(self._handle)
+            except Exception:
+                pass
+            for h in self._volume_locks:
+                try:
+                    kernel32.CloseHandle(h)
+                except Exception:
+                    pass
+            self._volume_locks = []
+
+    def __enter__(self) -> "WindowsPhysicalDevice":
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.close()

@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.img
+*.raw
+*.iso
+*.bin
+*.dd
+Ext4Reader.exe
+*.log
+.cursor/
+agent-transcripts/
