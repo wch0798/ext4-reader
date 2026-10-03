@@ -11,6 +11,7 @@ class WriteFallbackTests(unittest.TestCase):
         dev._partition_offset = 1048576
         dev._partition_size = 1023869452288
         dev._size = 1023871549440
+        dev._write_blockers = []
         return dev
 
     def test_physicaldrive_retry_uses_absolute_offset_and_stops_on_success(self):
@@ -257,3 +258,78 @@ class StoragePrivilegeTests(unittest.TestCase):
 
         with patch.object(wd, "_enable_privilege", return_value=(False, wd.ERROR_NOT_ALL_ASSIGNED)):
             self.assertFalse(wd._enable_storage_privileges())
+
+
+class WindowsWritePolicyTests(unittest.TestCase):
+    def test_policy_detector_reports_removable_disk_deny_write(self):
+        import ext4reader.windows_disk as wd
+
+        values = {
+            ("HKLM", r"SOFTWARE\Policies\Microsoft\Windows\RemovableStorageDevices\{53f5630d-b6bf-11d0-94f2-00a0c91efb8b}", "Deny_Write"): 1,
+        }
+
+        def fake_read(root, path, name):
+            root_name = "HKLM" if root == wd.winreg.HKEY_LOCAL_MACHINE else "HKCU"
+            return values.get((root_name, path, name))
+
+        with patch.object(wd, "_read_reg_dword", side_effect=fake_read):
+            blockers = wd._windows_write_policy_blockers()
+
+        self.assertTrue(any("이동식 디스크 쓰기 액세스 거부" in x for x in blockers))
+
+    def test_policy_detector_reports_bitlocker_removable_write_policy(self):
+        import ext4reader.windows_disk as wd
+
+        def fake_read(root, path, name):
+            if (
+                root == wd.winreg.HKEY_LOCAL_MACHINE
+                and path == r"SYSTEM\CurrentControlSet\Policies\Microsoft\FVE"
+                and name == "RDVDenyWriteAccess"
+            ):
+                return 1
+            return None
+
+        with patch.object(wd, "_read_reg_dword", side_effect=fake_read):
+            blockers = wd._windows_write_policy_blockers()
+
+        self.assertTrue(any("BitLocker 정책" in x for x in blockers))
+
+    def test_disk_attribute_parser_detects_read_only(self):
+        import ext4reader.windows_disk as wd
+
+        raw = (
+            (16).to_bytes(4, "little")
+            + (0).to_bytes(4, "little")
+            + wd.DISK_ATTRIBUTE_READ_ONLY.to_bytes(8, "little")
+        )
+        with patch.object(wd, "_ioctl", return_value=raw):
+            attrs, err = wd._query_disk_attributes(123)
+
+        self.assertEqual(err, 0)
+        self.assertEqual(attrs, wd.DISK_ATTRIBUTE_READ_ONLY)
+
+    def test_gpt_attribute_parser_detects_read_only(self):
+        import ext4reader.windows_disk as wd
+
+        raw = bytearray(160)
+        raw[0:4] = wd.PARTITION_STYLE_GPT.to_bytes(4, "little")
+        raw[64:72] = wd.GPT_ATTRIBUTE_READ_ONLY.to_bytes(8, "little")
+        with patch.object(wd, "_ioctl", return_value=bytes(raw)):
+            attrs, err = wd._query_partition_gpt_attributes(123)
+
+        self.assertEqual(err, 0)
+        self.assertEqual(attrs, wd.GPT_ATTRIBUTE_READ_ONLY)
+
+    def test_final_access_denied_reports_detected_policy(self):
+        dev = WriteFallbackTests().make_dev()
+        dev._write_blockers = ["컴퓨터 정책: 이동식 디스크 쓰기 액세스 거부 [Deny_Write=1]"]
+
+        dev._write_at = lambda offset, data: (_ for _ in ()).throw(IoError("win32", winerr=5))
+        dev._nt_write_at = lambda offset, data: (_ for _ in ()).throw(IoError("nt", winerr=5))
+        dev._scsi_write10 = lambda offset, data: (_ for _ in ()).throw(IoError("scsi", winerr=5))
+
+        with self.assertRaises(IoError) as cm:
+            dev._fallback_after_volume_access_denied(4755456, b"x" * 4096)
+
+        self.assertIn("Windows가 저장장치 쓰기를 정책/속성으로 차단", str(cm.exception))
+        self.assertIn("Deny_Write=1", str(cm.exception))
