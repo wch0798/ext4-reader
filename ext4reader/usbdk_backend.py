@@ -27,7 +27,12 @@ from ext4reader.usbdk_setup import UsbDkRequiredError, find_usbdk_helper, usbdk_
 MAX_DEVICE_ID_LEN = 200
 TRANSFER_FAILURE = 0
 TRANSFER_SUCCESS = 1
+TRANSFER_SUCCESS_ASYNC = 2
 BULK_TRANSFER_TYPE = 1
+
+WAIT_OBJECT_0 = 0
+WAIT_TIMEOUT = 258
+USB_TRANSFER_TIMEOUT_MS = 15000
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 CBW_SIGNATURE = 0x43425355
@@ -133,6 +138,16 @@ class _USB_DK_TRANSFER_REQUEST(ctypes.Structure):
         ("IsochronousPacketsArraySize", ctypes.c_uint64),
         ("IsochronousPacketsArray", ctypes.c_uint64),
         ("Result", _USB_DK_TRANSFER_RESULT),
+    ]
+
+
+class _OVERLAPPED(ctypes.Structure):
+    _fields_ = [
+        ("Internal", ctypes.c_void_p),
+        ("InternalHigh", ctypes.c_void_p),
+        ("Offset", wintypes.DWORD),
+        ("OffsetHigh", wintypes.DWORD),
+        ("hEvent", wintypes.HANDLE),
     ]
 
 
@@ -355,6 +370,30 @@ class _UsbDkApi:
         self.dll.UsbDk_ResetPipe.restype = wintypes.BOOL
         self.dll.UsbDk_ResetDevice.argtypes = [wintypes.HANDLE]
         self.dll.UsbDk_ResetDevice.restype = wintypes.BOOL
+        self.dll.UsbDk_GetRedirectorSystemHandle.argtypes = [wintypes.HANDLE]
+        self.dll.UsbDk_GetRedirectorSystemHandle.restype = wintypes.HANDLE
+
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.kernel32.CreateEventW.argtypes = [
+            wintypes.LPVOID,
+            wintypes.BOOL,
+            wintypes.BOOL,
+            wintypes.LPCWSTR,
+        ]
+        self.kernel32.CreateEventW.restype = wintypes.HANDLE
+        self.kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        self.kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        self.kernel32.GetOverlappedResult.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_OVERLAPPED),
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.BOOL,
+        ]
+        self.kernel32.GetOverlappedResult.restype = wintypes.BOOL
+        self.kernel32.CancelIoEx.argtypes = [wintypes.HANDLE, ctypes.POINTER(_OVERLAPPED)]
+        self.kernel32.CancelIoEx.restype = wintypes.BOOL
+        self.kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        self.kernel32.CloseHandle.restype = wintypes.BOOL
 
     def devices(self) -> list[_USB_DK_DEVICE_INFO]:
         ptr = ctypes.POINTER(_USB_DK_DEVICE_INFO)()
@@ -424,25 +463,73 @@ class _UsbDkApi:
         req.IsochronousPacketsArraySize = 0
         req.IsochronousPacketsArray = 0
 
-        result = int(fn(handle, ctypes.byref(req), None))
-        transferred = int(req.Result.GenResult.BytesTransferred)
-        usbd_status = int(req.Result.GenResult.UsbdStatus)
-        if result != TRANSFER_SUCCESS or usbd_status != 0:
-            raise UsbDkError(
-                f"UsbDk bulk transfer 실패 endpoint=0x{endpoint:02X} "
-                f"result={result} usbd=0x{usbd_status:08X} "
-                f"bytes={transferred}/{length}",
-                winerr=31,
-            )
-        if transferred != length:
-            raise UsbDkError(
-                f"UsbDk bulk transfer 짧은 전송 endpoint=0x{endpoint:02X} "
-                f"{transferred}/{length}",
-                winerr=23,
-            )
-        if data is None:
-            return bytes(buf.raw[:length])
-        return b""
+        system_handle = self.dll.UsbDk_GetRedirectorSystemHandle(handle)
+        raw_system = int(system_handle) if system_handle else 0
+        if not raw_system or raw_system == INVALID_HANDLE_VALUE:
+            raise UsbDkError("UsbDk redirector system handle을 얻지 못했습니다.", winerr=6)
+
+        event = self.kernel32.CreateEventW(None, False, False, None)
+        if not event:
+            err = ctypes.get_last_error()
+            raise UsbDkError(f"UsbDk transfer event 생성 실패 Win32={err}", winerr=err)
+
+        ov = _OVERLAPPED()
+        ov.hEvent = event
+        try:
+            result = int(fn(handle, ctypes.byref(req), ctypes.byref(ov)))
+            if result == TRANSFER_SUCCESS_ASYNC:
+                wait = int(self.kernel32.WaitForSingleObject(event, USB_TRANSFER_TIMEOUT_MS))
+                if wait == WAIT_TIMEOUT:
+                    self.kernel32.CancelIoEx(system_handle, ctypes.byref(ov))
+                    raise UsbDkError(
+                        f"UsbDk bulk transfer timeout endpoint=0x{endpoint:02X}",
+                        winerr=1460,
+                    )
+                if wait != WAIT_OBJECT_0:
+                    err = ctypes.get_last_error()
+                    raise UsbDkError(
+                        f"UsbDk bulk transfer wait 실패 endpoint=0x{endpoint:02X} "
+                        f"wait={wait} Win32={err}",
+                        winerr=err or 31,
+                    )
+                ignored = wintypes.DWORD(0)
+                if not self.kernel32.GetOverlappedResult(
+                    system_handle,
+                    ctypes.byref(ov),
+                    ctypes.byref(ignored),
+                    False,
+                ):
+                    err = ctypes.get_last_error()
+                    raise UsbDkError(
+                        f"UsbDk bulk transfer completion 실패 endpoint=0x{endpoint:02X} "
+                        f"Win32={err}",
+                        winerr=err,
+                    )
+            elif result != TRANSFER_SUCCESS:
+                raise UsbDkError(
+                    f"UsbDk bulk transfer 제출 실패 endpoint=0x{endpoint:02X} result={result}",
+                    winerr=31,
+                )
+
+            transferred = int(req.Result.GenResult.BytesTransferred)
+            usbd_status = int(req.Result.GenResult.UsbdStatus)
+            if usbd_status != 0:
+                raise UsbDkError(
+                    f"UsbDk bulk transfer 실패 endpoint=0x{endpoint:02X} "
+                    f"usbd=0x{usbd_status:08X} bytes={transferred}/{length}",
+                    winerr=31,
+                )
+            if transferred != length:
+                raise UsbDkError(
+                    f"UsbDk bulk transfer 짧은 전송 endpoint=0x{endpoint:02X} "
+                    f"{transferred}/{length}",
+                    winerr=23,
+                )
+            if data is None:
+                return bytes(buf.raw[:length])
+            return b""
+        finally:
+            self.kernel32.CloseHandle(event)
 
     def reset_pipe(self, handle, endpoint: int) -> None:
         try:
