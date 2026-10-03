@@ -601,6 +601,26 @@ class App(tk.Tk):
             )
             read_only = not writable
             if writable:
+                recovery_stats = None
+                if vol.journal_needs_recovery() or vol.sb.needs_recovery:
+                    try:
+                        self.set_status("EXT4 저널을 Windows에서 복구하는 중…")
+                        self.update_idletasks()
+                        recovery_stats = vol.recover_pending_journal()
+                        LOG.info(
+                            "Windows JBD2 복구 성공 transactions=%s replayed=%s revoked=%s",
+                            recovery_stats.transactions,
+                            recovery_stats.replayed_blocks,
+                            recovery_stats.revoked_blocks,
+                        )
+                    except Exception as exc:
+                        LOG.exception("Windows JBD2 복구 실패")
+                        messagebox.showwarning(
+                            "저널 자동 복구 실패 — 읽기 전용으로 연결",
+                            "EXT4 저널을 Windows에서 안전하게 복구하지 못했습니다.\n"
+                            "원본 보호를 위해 읽기 전용으로 연결합니다.\n\n"
+                            + str(exc),
+                        )
                 hard = vol.hard_write_blockers()
                 soft = vol.soft_write_warnings()
                 LOG.info("쓰기 검사 hard=%s soft=%s", hard, soft)

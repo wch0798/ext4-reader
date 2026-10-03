@@ -88,6 +88,22 @@ class Ext4Volume:
         self._dir_index: dict = {}
         self._load_groups()
 
+    def reload_metadata(self) -> None:
+        """Drop cached metadata and re-read the superblock/GDT after journal replay."""
+        self._block_cache.clear()
+        self._inode_cache.clear()
+        self._extent_cache.clear()
+        self._block_bm_cache.clear()
+        self._inode_bm_cache.clear()
+        self._dirty_block_bm.clear()
+        self._dirty_inode_bm.clear()
+        self._alloc_hint.clear()
+        self._dir_list.clear()
+        self._dir_index.clear()
+        raw = self.dev.read(self.part_offset + 1024, 1024)
+        self.sb = parse_superblock(raw)
+        self._load_groups()
+
     def _load_groups(self) -> None:
         gdt_block = self.sb.first_data_block + 1
         total = self.sb.groups_count * self.sb.desc_size
@@ -262,8 +278,27 @@ class Ext4Volume:
             LOG.info("저널 재생 필요 s_start=%s recover_flag=%s", s_start, self.sb.needs_recovery)
             return True
         if self.sb.needs_recovery:
-            LOG.info("RECOVER 플래그는 있으나 저널이 비어 있습니다 (s_start=0). 쓰기를 막을 필요는 없습니다.")
+            # JBD2 문서상 s_start == 0만으로 journal이 clean하다고 단정할 수 없다.
+            LOG.warning("RECOVER 플래그가 남아 있지만 JBD2 s_start=0입니다. 안전을 위해 복구 필요로 취급합니다.")
+            return True
         return False
+
+    def recover_pending_journal(self):
+        """Replay a pending internal JBD2 journal on Windows.
+
+        Returns ReplayStats. Unsupported/corrupt journals raise Ext4Error and
+        remain read-only; no recovery flag is cleared on failure.
+        """
+        if not self.dev.writable:
+            raise Ext4Error("저널 복구를 하려면 장치를 쓰기 가능으로 열어야 합니다.")
+        if not self.journal_needs_recovery() and not self.sb.needs_recovery:
+            from ext4reader.journal import ReplayStats
+            return ReplayStats(0, 0, 0, 0)
+        try:
+            from ext4reader.journal import JournalRecoveryError, recover_journal
+            return recover_journal(self)
+        except JournalRecoveryError as exc:
+            raise Ext4Error(f"Windows 저널 복구 실패: {exc}") from exc
 
     def fs_write_blockers(self) -> list[str]:
         return self.hard_write_blockers() + self.soft_write_warnings()
@@ -272,7 +307,7 @@ class Ext4Volume:
         reasons = []
         if self.journal_needs_recovery():
             reasons.append(
-                "저널에 재생하지 않은 기록이 있습니다. 리눅스에서 한 번 마운트한 뒤 빼는 것이 안전합니다."
+                "저널에 재생하지 않은 기록이 있습니다. 쓰기 연결 시 Windows에서 자동 복구를 시도합니다."
             )
         unknown = self.sb.feature_incompat & ~C.SUPPORTED_INCOMPAT_WRITE
         if unknown & C.EXT4_FEATURE_INCOMPAT_ENCRYPT:
@@ -281,6 +316,8 @@ class Ext4Volume:
             reasons.append("META_BG 레이아웃은 쓰기를 지원하지 않습니다.")
         if unknown & C.EXT4_FEATURE_INCOMPAT_MMP:
             reasons.append("다중 마운트 보호(MMP)가 켜져 있습니다.")
+        if self.sb.state & C.EXT4_ERROR_FS:
+            reasons.append("EXT4 슈퍼블록에 파일시스템 오류 상태가 기록되어 있습니다.")
         if self.sb.feature_ro_compat & C.EXT4_FEATURE_RO_COMPAT_BIGALLOC:
             reasons.append("bigalloc 파일시스템은 쓰기를 지원하지 않습니다.")
         if self.sb.feature_ro_compat & C.EXT4_FEATURE_RO_COMPAT_READONLY:
