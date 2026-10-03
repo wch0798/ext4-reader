@@ -16,6 +16,10 @@ class WriteFallbackTests(unittest.TestCase):
         dev._write_blockers = []
         dev._handle = 888
         dev.sector_size = 512
+        dev._removable = True
+        dev._disk_offline = False
+        dev._nt_handle = None
+        dev._use_overlapped = False
         dev._partition_volume = _LockedVolume(
             handle=999,
             name=r"\\.\HarddiskVolume27",
@@ -23,9 +27,13 @@ class WriteFallbackTests(unittest.TestCase):
             locked=True,
             offline=False,
         )
+        dev._volume_locks = [dev._partition_volume]
         dev._write_locked_partition_device = lambda offset, data: (_ for _ in ()).throw(
             IoError("partition access denied", winerr=5)
         )
+        # Most fallback-ordering tests focus on pre-existing routes. Dedicated
+        # tests below enable the new whole-disk OFFLINE stage explicitly.
+        dev._activate_whole_disk_offline = lambda: (False, 5)
         return dev
 
     def test_physicaldrive_retry_uses_absolute_offset_and_stops_on_success(self):
@@ -138,6 +146,50 @@ class WriteFallbackTests(unittest.TestCase):
             ],
         )
 
+    def test_whole_disk_offline_stage_runs_before_localsystem(self):
+        dev = self.make_dev()
+        payload = b"d" * 4096
+        absolute = dev._partition_offset + 4755456
+        calls = []
+        physical_attempts = {"count": 0}
+
+        def write_at(offset, data):
+            physical_attempts["count"] += 1
+            calls.append(("physical", physical_attempts["count"], offset))
+            if physical_attempts["count"] == 1:
+                raise IoError("physical denied", winerr=5)
+
+        dev._write_at = write_at
+        dev._nt_write_at = lambda offset, data: (_ for _ in ()).throw(
+            IoError("native denied", winerr=5)
+        )
+        dev._scsi_write10 = lambda offset, data: (_ for _ in ()).throw(
+            IoError("scsi denied", winerr=5)
+        )
+
+        def activate():
+            calls.append(("offline",))
+            dev._disk_offline = True
+            dev._partition_volume = None
+            return True, 0
+
+        dev._activate_whole_disk_offline = activate
+
+        with patch(
+            "ext4reader.system_raw_helper.run_system_raw_write",
+            side_effect=AssertionError("LocalSystem must not run after offline write succeeds"),
+        ):
+            dev._fallback_after_volume_access_denied(4755456, payload)
+
+        self.assertEqual(
+            calls,
+            [
+                ("physical", 1, absolute),
+                ("offline",),
+                ("physical", 2, absolute),
+            ],
+        )
+
     def test_localsystem_helper_runs_only_after_all_admin_paths_fail(self):
         dev = self.make_dev()
         payload = b"s" * 4096
@@ -171,6 +223,7 @@ class WriteFallbackTests(unittest.TestCase):
         self.assertEqual(kwargs["partition_offset"], 1048576)
         self.assertEqual(kwargs["partition_size"], 1023869452288)
         self.assertEqual(kwargs["sector_size"], 512)
+        self.assertTrue(kwargs["try_disk_offline"])
         self.assertEqual(kwargs["data"], payload)
 
     def test_partition_write_target_is_relative_to_partition_start(self):
@@ -411,6 +464,64 @@ class StoragePrivilegeTests(unittest.TestCase):
 
         with patch.object(wd, "_enable_privilege", return_value=(False, wd.ERROR_NOT_ALL_ASSIGNED)):
             self.assertFalse(wd._enable_storage_privileges())
+
+
+class WholeDiskOfflineTests(unittest.TestCase):
+    def test_set_disk_offline_uses_nonpersistent_attribute_mask_and_verifies(self):
+        import ext4reader.windows_disk as wd
+
+        calls = []
+
+        def fake_ioctl(handle, code, inbuf=None, out_cb=0):
+            calls.append((handle, code, bytes(inbuf) if inbuf is not None else None, out_cb))
+            return b""
+
+        with patch.object(wd, "_ioctl", side_effect=fake_ioctl), patch.object(
+            wd,
+            "_query_disk_attributes",
+            return_value=(wd.DISK_ATTRIBUTE_OFFLINE, 0),
+        ):
+            ok, err = wd._set_disk_offline_state(123, True)
+
+        self.assertTrue(ok)
+        self.assertEqual(err, 0)
+        self.assertEqual(calls[0][1], wd.IOCTL_DISK_SET_DISK_ATTRIBUTES)
+        raw = calls[0][2]
+        self.assertEqual(len(raw), 40)
+        self.assertEqual(int.from_bytes(raw[0:4], "little"), 16)
+        self.assertEqual(raw[4], 0)
+        self.assertEqual(
+            int.from_bytes(raw[8:16], "little"),
+            wd.DISK_ATTRIBUTE_OFFLINE,
+        )
+        self.assertEqual(
+            int.from_bytes(raw[16:24], "little"),
+            wd.DISK_ATTRIBUTE_OFFLINE,
+        )
+
+    def test_set_disk_online_clears_only_offline_attribute(self):
+        import ext4reader.windows_disk as wd
+
+        sent = []
+
+        def fake_ioctl(handle, code, inbuf=None, out_cb=0):
+            sent.append(bytes(inbuf))
+            return b""
+
+        with patch.object(wd, "_ioctl", side_effect=fake_ioctl), patch.object(
+            wd,
+            "_query_disk_attributes",
+            return_value=(0, 0),
+        ):
+            ok, err = wd._set_disk_offline_state(123, False)
+
+        self.assertTrue(ok)
+        self.assertEqual(err, 0)
+        self.assertEqual(int.from_bytes(sent[0][8:16], "little"), 0)
+        self.assertEqual(
+            int.from_bytes(sent[0][16:24], "little"),
+            wd.DISK_ATTRIBUTE_OFFLINE,
+        )
 
 
 class WindowsWritePolicyTests(unittest.TestCase):
