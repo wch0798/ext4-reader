@@ -258,6 +258,128 @@ def _dx_insert_entry(block: bytearray, entries_off: int, h: int, lblk: int) -> b
     return True
 
 
+def _dx_pick(items: list[tuple[int, int]], h: int) -> int:
+    if not items:
+        raise DirError("디렉터리 인덱스가 비어 있습니다.")
+    idx = 0
+    for i, (eh, _blk) in enumerate(items):
+        if i == 0:
+            continue
+        if eh <= h:
+            idx = i
+        else:
+            break
+    return items[idx][1]
+
+
+def _dx_place(entries: list[tuple[int, int]], h: int, blk: int) -> list[tuple[int, int]]:
+    """Insert a dx pointer. Entry 0 stays the leftmost child."""
+    out = list(entries)
+    pos = len(out)
+    for i in range(1, len(out)):
+        if out[i][0] > h:
+            pos = i
+            break
+    out.insert(pos, (h & 0xFFFFFFFF, blk))
+    return out
+
+
+def _dx_node_limit(bs: int, entries_off: int, tail: int) -> int:
+    return max(0, (bs - tail - entries_off) // 8)
+
+
+def _write_dx_entries(block: bytearray, off: int, limit: int, entries: list[tuple[int, int]]) -> None:
+    count = len(entries)
+    if count < 1 or count > limit:
+        raise DirError("디렉터리 인덱스 항목 수가 맞지 않습니다.")
+    struct.pack_into("<HH", block, off, limit, count)
+    struct.pack_into("<I", block, off + 4, entries[0][1] & 0xFFFFFFFF)
+    for i in range(1, count):
+        eh, blk = entries[i]
+        struct.pack_into("<II", block, off + i * 8, eh & 0xFFFFFFFF, blk & 0xFFFFFFFF)
+
+
+def _format_dx_node(bs: int, tail: int, entries: list[tuple[int, int]]) -> bytearray:
+    limit = _dx_node_limit(bs, 8, tail)
+    buf = bytearray(bs)
+    struct.pack_into("<IHBB", buf, 0, 0, bs & 0xFFFF, 0, 0)
+    _write_dx_entries(buf, 8, limit, entries)
+    return buf
+
+
+def _dx_insert_pointer(load_block, root: bytearray, h: int, target: int, bs: int, tail: int, alloc_logical) -> dict[int, bytearray]:
+    """Link ``target`` under ``h``. Grows index levels in memory and returns dirty blocks.
+
+    Nothing is written here. The caller allocates the new logical blocks and
+    writes the returned blocks only after the plan succeeds.
+    """
+    info_length = root[29] or 8
+    levels = root[30]
+    entries_off = 24 + info_length
+    dirty: dict[int, bytearray] = {0: root}
+    cache: dict[int, bytearray] = {0: root}
+
+    def block_at(lblk: int) -> bytearray:
+        hit = cache.get(lblk)
+        if hit is not None:
+            return hit
+        buf = bytearray(load_block(lblk))
+        cache[lblk] = buf
+        return buf
+
+    path = [[0, entries_off, root]]
+    node_l = _dx_pick(_dx_entries(root, entries_off)[2], h)
+    for _ in range(levels):
+        node = block_at(node_l)
+        path.append([node_l, 8, node])
+        node_l = _dx_pick(_dx_entries(node, 8)[2], h)
+
+    insert_h = h & 0xFFFFFFFF
+    insert_blk = target
+    while True:
+        lblk, off, block = path[-1]
+        limit, count, items = _dx_entries(block, off)
+        if count < limit:
+            _write_dx_entries(block, off, limit, _dx_place(items, insert_h, insert_blk))
+            dirty[lblk] = block
+            break
+        if lblk == 0:
+            if block[30] >= 255:
+                raise DirError("디렉터리 인덱스 단계가 너무 깊습니다.")
+            node_limit = _dx_node_limit(bs, 8, tail)
+            if len(items) < 1 or len(items) > node_limit:
+                raise DirError("디렉터리 인덱스를 한 단계 올릴 수 없습니다.")
+            child_l = alloc_logical()
+            child = _format_dx_node(bs, tail, items)
+            _write_dx_entries(block, off, limit, [(0, child_l)])
+            block[30] = block[30] + 1
+            dirty[0] = block
+            dirty[child_l] = child
+            cache[child_l] = child
+            path.append([child_l, 8, child])
+            continue
+        if len(items) < 2:
+            raise DirError("디렉터리 인덱스를 나눌 수 없습니다.")
+        mid = len(items) // 2
+        left, right = items[:mid], items[mid:]
+        split_h = right[0][0]
+        if insert_h >= split_h:
+            right = _dx_place(right, insert_h, insert_blk)
+        else:
+            left = _dx_place(left, insert_h, insert_blk)
+        _write_dx_entries(block, off, limit, left)
+        dirty[lblk] = block
+        new_l = alloc_logical()
+        right_b = _format_dx_node(bs, tail, right)
+        dirty[new_l] = right_b
+        cache[new_l] = right_b
+        path.pop()
+        if not path:
+            raise DirError("디렉터리 인덱스를 확장할 수 없습니다.")
+        insert_h, insert_blk = split_h, new_l
+    return dirty
+
+
 def _probe_leaf(vol, inode: Inode, name: bytes) -> tuple[int, bytes, int]:
     """Return (logical_leaf, root_block, hash)."""
     root = bytearray(read_dir_lblock(vol, inode, 0))
@@ -267,29 +389,12 @@ def _probe_leaf(vol, inode: Inode, name: bytes) -> tuple[int, bytes, int]:
     seed = vol.sb.hash_seed
     h = dirhash(name, hv, seed)
     entries_off = 24 + info_length
-    _limit, count, items = _dx_entries(root, entries_off)
-    # binary-ish linear search
-    idx = 0
-    for i, (eh, _blk) in enumerate(items):
-        if i == 0:
-            continue
-        if eh <= h:
-            idx = i
-        else:
-            break
-    lblk = items[idx][1]
-    if levels > 0:
+    _limit, _count, items = _dx_entries(root, entries_off)
+    lblk = _dx_pick(items, h)
+    for _ in range(levels):
         node = read_dir_lblock(vol, inode, lblk)
         _l, _c, child = _dx_entries(node, 8)
-        cidx = 0
-        for i, (eh, _blk) in enumerate(child):
-            if i == 0:
-                continue
-            if eh <= h:
-                cidx = i
-            else:
-                break
-        lblk = child[cidx][1]
+        lblk = _dx_pick(child, h)
     return lblk, bytes(root), h
 
 
@@ -299,7 +404,7 @@ class DirError(RuntimeError):
 
 def add_dir_entry(vol, dir_inode: Inode, name: str, ino: int, ftype: int) -> Inode:
     from ext4reader.extents import Extent, build_extent_tree, discard_old_extent_indexes, file_extents
-    from ext4reader.bitmap import alloc_blocks
+    from ext4reader.bitmap import alloc_blocks, free_phys_runs
 
     name_b = name.encode("utf-8")
     if len(name_b) > C.EXT4_NAME_LEN:
@@ -330,8 +435,7 @@ def add_dir_entry(vol, dir_inode: Inode, name: str, ino: int, ftype: int) -> Ino
             dir_inode.set_times()
             vol.write_inode(dir_inode)
             return dir_inode
-        # split: new leaf + dx entry
-        new_phys = alloc_blocks(vol, 1, prefer_group=(dir_inode.ino - 1) // vol.sb.inodes_per_group)[0]
+        # split: new leaf + dx entry. The leaf is rewritten only after the index plan succeeds.
         old_ents = [e for e in parse_dirent_block(bytes(leaf), usable) if e.name not in (".", "..")]
         dummy = DirEntry(name=name, inode=ino, file_type=ftype)
         old_ents.append(dummy)
@@ -346,7 +450,9 @@ def add_dir_entry(vol, dir_inode: Inode, name: str, ino: int, ftype: int) -> Ino
         hashed.sort(key=lambda x: x[0])
         mid = max(1, len(hashed) // 2)
         left, right = hashed[:mid], hashed[mid:]
-        split_hash = right[0][0] if right else hashed[-1][0]
+        if not right:
+            raise DirError("디렉터리 분할에 실패했습니다.")
+        split_hash = right[0][0]
 
         def pack_ents(ents: list[DirEntry]) -> bytearray:
             buf = _empty_dirent_block(bs, usable)
@@ -358,36 +464,58 @@ def add_dir_entry(vol, dir_inode: Inode, name: str, ino: int, ftype: int) -> Ino
 
         left_b = pack_ents([e for _h, e in left])
         right_b = pack_ents([e for _h, e in right])
-        write_lblock(dir_inode, lblk, left_b)
-        # append logical block to directory
+        # Plan the index link before any leaf is rewritten. A full root grows
+        # another level; a failed plan leaves the old leaf intact.
         exts = file_extents(vol, dir_inode)
         next_l = 0
         for ex in exts:
             next_l = max(next_l, ex.logical + ex.length)
-        new_exts = list(exts) + [Extent(next_l, 1, new_phys, False)]
+        root = bytearray(read_dir_lblock(vol, dir_inode, 0))
+        cursor = next_l + 1
+
+        def alloc_logical() -> int:
+            nonlocal cursor
+            logical = cursor
+            cursor += 1
+            return logical
+
+        dirty = _dx_insert_pointer(
+            lambda lb: read_dir_lblock(vol, dir_inode, lb),
+            root,
+            split_hash,
+            next_l,
+            bs,
+            tail,
+            alloc_logical,
+        )
+        new_logicals = [next_l, *range(next_l + 1, cursor)]
+        phys_list = alloc_blocks(
+            vol,
+            len(new_logicals),
+            prefer_group=(dir_inode.ino - 1) // vol.sb.inodes_per_group,
+        )
+        new_exts = list(exts) + [
+            Extent(logical, 1, phys, False) for logical, phys in zip(new_logicals, phys_list)
+        ]
         try:
             body = build_extent_tree(vol, dir_inode, new_exts)
         except ValueError:
+            free_phys_runs(vol, [(phys, 1) for phys in phys_list])
             raise DirError("디렉터리 extent 트리를 확장할 수 없습니다.")
+        except Exception:
+            free_phys_runs(vol, [(phys, 1) for phys in phys_list])
+            raise
         dir_inode.set_i_block(body)
-        dir_inode.set_size((next_l + 1) * bs)
-        dir_inode.set_blocks(
-            sum(e.length for e in new_exts if not e.uninitialized),
-            bs,
-        )
+        dir_inode.set_size(cursor * bs)
+        dir_inode.set_blocks(sum(e.length for e in new_exts if not e.uninitialized), bs)
         vol.write_inode(dir_inode)
         discard_old_extent_indexes(vol, dir_inode)
-        _dir_csum_set(vol, dir_inode, right_b)
-        vol.write_block(new_phys, bytes(right_b))
-        root = bytearray(read_dir_lblock(vol, dir_inode, 0))
-        info_length = root[29] or 8
-        levels = root[30]
-        if levels != 0:
-            raise DirError("2단 해시 디렉터리 분할은 지원하지 않습니다.")
-        entries_off = 24 + info_length
-        if not _dx_insert_entry(root, entries_off, split_hash, next_l):
-            raise DirError("디렉터리 인덱스가 가득 찼습니다.")
-        write_lblock(dir_inode, 0, root)
+        for logical, data in dirty.items():
+            if logical != 0:
+                write_lblock(dir_inode, logical, data)
+        write_lblock(dir_inode, next_l, right_b)
+        write_lblock(dir_inode, 0, dirty[0])
+        write_lblock(dir_inode, lblk, left_b)
         return dir_inode
 
     # linear

@@ -19,6 +19,7 @@ from ext4reader.directory import (
 )
 from ext4reader.extents import (
     Extent,
+    _collect_index_blocks,
     build_extent_tree,
     discard_old_extent_indexes,
     extent_at,
@@ -217,6 +218,27 @@ def mkdir(vol: Ext4Volume, parent: Inode, name: str) -> Inode:
     return inode
 
 
+def _phys_in_runs(runs: list[tuple[int, int]], block: int) -> bool:
+    for phys, length in runs:
+        if length > 0 and phys <= block < phys + length:
+            return True
+    return False
+
+
+def release_inode_blocks(vol: Ext4Volume, child: Inode) -> None:
+    """Free file data and the extent-tree index blocks that describe it."""
+    runs = [(ex.physical, ex.length) for ex in file_extents(vol, child) if ex.length]
+    indexes = [
+        block
+        for block in _collect_index_blocks(vol, child)
+        if block and not _phys_in_runs(runs, block)
+    ]
+    if runs:
+        free_phys_runs(vol, runs)
+    if indexes:
+        free_phys_runs(vol, [(block, 1) for block in indexes])
+
+
 def unlink(vol: Ext4Volume, parent: Inode, name: str) -> None:
     vol.require_write()
     if name in (".", ".."):
@@ -244,9 +266,7 @@ def unlink(vol: Ext4Volume, parent: Inode, name: str) -> None:
     parent.set_times()
     vol.write_inode(parent)
 
-    runs = [(ex.physical, ex.length) for ex in file_extents(vol, child) if ex.length]
-    if runs:
-        free_phys_runs(vol, runs)
+    release_inode_blocks(vol, child)
     # zero inode
     child.raw[:] = b"\x00" * len(child.raw)
     child.dtime = int(time.time())

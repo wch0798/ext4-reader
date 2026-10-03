@@ -270,6 +270,10 @@ class Ext4Volume:
 
     def hard_write_blockers(self) -> list[str]:
         reasons = []
+        if self.journal_needs_recovery():
+            reasons.append(
+                "저널에 재생하지 않은 기록이 있습니다. 리눅스에서 한 번 마운트한 뒤 빼는 것이 안전합니다."
+            )
         unknown = self.sb.feature_incompat & ~C.SUPPORTED_INCOMPAT_WRITE
         if unknown & C.EXT4_FEATURE_INCOMPAT_ENCRYPT:
             reasons.append("암호화된 파일시스템입니다.")
@@ -297,8 +301,6 @@ class Ext4Volume:
 
     def soft_write_warnings(self) -> list[str]:
         reasons = []
-        if self.journal_needs_recovery():
-            reasons.append("저널에 재생하지 않은 기록이 있습니다. 리눅스에서 한 번 마운트한 뒤 빼는 것이 안전합니다.")
         if not (self.sb.state & C.EXT4_VALID_FS):
             reasons.append("파일시스템이 깨끗하게 언마운트되지 않았습니다.")
         return reasons

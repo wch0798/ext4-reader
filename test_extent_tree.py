@@ -160,13 +160,120 @@ def test_prealloc_tail_initializes():
 
 
 def test_recycle_targets():
-    from ext4reader.fuse_mount import recycle_repair_targets
+    from ext4reader.fuse_mount import recycle_attr_path, recycle_repair_targets
 
     assert recycle_repair_targets("/Game/desktop.ini") is None
     assert recycle_repair_targets("/$RECYCLE.BIN") == ("/$RECYCLE.BIN", "")
     sid = "/$RECYCLE.BIN/S-1-5-21-1-1001"
     assert recycle_repair_targets(sid + "/desktop.ini") == ("/$RECYCLE.BIN", sid)
+    assert recycle_attr_path("/$RECYCLE.BIN")
+    assert recycle_attr_path("/$RECYCLE.BIN/desktop.ini")
+    assert recycle_attr_path(sid)
+    assert recycle_attr_path(sid + "/desktop.ini")
+    assert not recycle_attr_path(sid + "/$Iabc")
+    assert not recycle_attr_path("/Game")
     print("recycle targets ok")
+
+
+def test_htree_grows_levels():
+    from ext4reader.directory import _dx_entries, _dx_insert_pointer, _dx_pick, _write_dx_entries
+
+    bs = 64
+    root = bytearray(bs)
+    root[28] = 1
+    root[29] = 8
+    root[30] = 0
+    _write_dx_entries(root, 32, 3, [(0, 1)])
+    blocks = {0: root}
+    nxt = 2
+    placed = {0: 1}
+
+    def alloc():
+        nonlocal nxt
+        logical = nxt
+        nxt += 1
+        return logical
+
+    def probe(h):
+        node = blocks[0]
+        levels = node[30]
+        _limit, _count, items = _dx_entries(node, 32)
+        lblk = _dx_pick(items, h)
+        for _ in range(levels):
+            _limit, _count, items = _dx_entries(blocks[lblk], 8)
+            lblk = _dx_pick(items, h)
+        return lblk
+
+    for i in range(80):
+        h = (i + 1) * 10
+        target = 100000 + i
+        dirty = _dx_insert_pointer(lambda lb: blocks[lb], blocks[0], h, target, bs, 0, alloc)
+        for logical, data in dirty.items():
+            blocks[logical] = data
+        placed[h] = target
+        for eh, expect in placed.items():
+            assert probe(eh) == expect, (eh, probe(eh), expect, blocks[0][30])
+    assert blocks[0][30] >= 2
+    print("htree levels ok", blocks[0][30], "index blocks", nxt - 2)
+
+
+def test_unlink_frees_extent_indexes():
+    from ext4reader.writer import release_inode_blocks
+
+    vol = make_vol()
+    inode = MemInode()
+    inode.uses_extents = True
+    start = vol.sb.free_blocks_count
+    data = alloc_blocks(vol, 8)
+    extents = [Extent(i, 1, data[i], False) for i in range(8)]
+    inode.set_i_block(build_extent_tree(vol, inode, extents))
+    assert vol.sb.free_blocks_count == start - 9
+    release_inode_blocks(vol, inode)
+    assert vol.sb.free_blocks_count == start
+    print("unlink index free ok")
+
+
+def test_journal_recovery_blocks_writes():
+    import types
+
+    from ext4reader.volume import Ext4Error, Ext4Volume
+
+    sb = SimpleNamespace(feature_incompat=0, feature_ro_compat=0, has_extents=True, state=1, needs_recovery=True)
+    vol = SimpleNamespace(
+        sb=sb,
+        dev=SimpleNamespace(writable=True),
+        journal_start=lambda: 0,
+    )
+    vol.journal_needs_recovery = types.MethodType(Ext4Volume.journal_needs_recovery, vol)
+    vol.hard_write_blockers = types.MethodType(Ext4Volume.hard_write_blockers, vol)
+    assert Ext4Volume.journal_needs_recovery(vol) is False
+    Ext4Volume.require_write(vol)
+    vol.journal_start = lambda: 4
+    assert Ext4Volume.journal_needs_recovery(vol) is True
+    try:
+        Ext4Volume.require_write(vol)
+    except Ext4Error as exc:
+        assert "저널" in str(exc)
+    else:
+        raise AssertionError("저널 재생이 필요한데도 쓰기가 허용되었습니다.")
+    assert not any("저널" in item for item in Ext4Volume.soft_write_warnings(vol))
+    print("journal block ok")
+
+
+def test_stat_ex_slot():
+    import ctypes
+
+    import fuse
+
+    from ext4reader.fuse_mount import _install_winfsp_stat_ex
+
+    before = ctypes.sizeof(fuse.fuse_operations)
+    _install_winfsp_stat_ex(fuse.FUSE)
+    after = ctypes.sizeof(fuse.fuse_operations)
+    assert after - before == 16 * 8
+    assert fuse.fuse_operations.chflags.offset == before + 15 * 8
+    assert callable(fuse.FUSE.chflags)
+    print("stat ex slot ok", before, after)
 
 
 if __name__ == "__main__":
@@ -175,4 +282,8 @@ if __name__ == "__main__":
     test_block_count_is_not_capped_at_2tb()
     test_prealloc_tail_initializes()
     test_recycle_targets()
+    test_htree_grows_levels()
+    test_unlink_frees_extent_indexes()
+    test_journal_recovery_blocks_writes()
+    test_stat_ex_slot()
     print("all ok")

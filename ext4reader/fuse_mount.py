@@ -38,6 +38,28 @@ _RECYCLE_INI = (
 )
 
 
+# WinFsp fuse_common.h. Reported through fuse_stat_ex.st_flags.
+_UF_HIDDEN = 0x00008000
+_UF_SYSTEM = 0x00000080
+_FSP_CAP_STAT_EX = 1 << 23
+
+
+def recycle_attr_path(path: str) -> bool:
+    """``$RECYCLE.BIN``, its SID folder, and their desktop.ini need hidden+system."""
+    parts = [p for p in path.replace("\\", "/").split("/") if p]
+    if not parts or parts[0].upper() != "$RECYCLE.BIN":
+        return False
+    if len(parts) == 1:
+        return True
+    if len(parts) == 2 and parts[1].lower() == "desktop.ini":
+        return True
+    if len(parts) == 2 and parts[1].upper().startswith("S-1-"):
+        return True
+    if len(parts) == 3 and parts[1].upper().startswith("S-1-") and parts[2].lower() == "desktop.ini":
+        return True
+    return False
+
+
 def recycle_repair_targets(path: str) -> tuple[str, str] | None:
     """Paths under an existing ``$RECYCLE.BIN`` that Explorer expects to exist."""
     parts = [p for p in path.replace("\\", "/").split("/") if p]
@@ -261,6 +283,8 @@ class Ext4FuseOps:
         self._path_ino: dict[str, int] = {}
         self._ra: tuple | None = None
         self._wb: list | None = None
+        self._win_flags: dict[str, int] = {}
+        self._st_flags = 0
 
     def _node(self, path: str):
         ino = self._path_ino.get(path)
@@ -437,6 +461,7 @@ class Ext4FuseOps:
             self._materialize_recycle(path)
         except Exception:
             LOG.exception("휴지통 항목 준비 실패 %s", path)
+        self._st_flags = 0
         node = self._node(path)
         mode = int(node.mode)
         if not stat.S_IFMT(mode):
@@ -444,8 +469,13 @@ class Ext4FuseOps:
         if self.read_only:
             mode &= ~0o222
         nlink = max(2 if node.is_dir else 1, node.links)
+        flags = int(self._win_flags.get(path, 0))
+        if recycle_attr_path(path):
+            flags |= _UF_HIDDEN | _UF_SYSTEM
+        self._st_flags = flags
         return {
             "st_mode": mode,
+            "st_flags": flags,
             "st_ino": node.ino,
             "st_dev": 0,
             "st_nlink": min(nlink, 65535),
@@ -458,6 +488,15 @@ class Ext4FuseOps:
             "st_blocks": node.blocks,
             "st_blksize": max(self.vol.sb.block_size, 65536),
         }
+
+    def chflags(self, path, flags):
+        return self._wrap(self._chflags, self._fuse_path(path), flags)
+
+    def _chflags(self, path, flags):
+        if self.read_only:
+            raise self._err(errno.EROFS)
+        self._win_flags[path] = int(flags) & 0xFFFFFFFF
+        return 0
 
     def readdir(self, path, fh):
         return self._wrap(self._readdir, self._fuse_path(path))
@@ -1050,8 +1089,105 @@ def _log_drive(letter: str) -> None:
     )
 
 
+_WINFSP_STAT_EX = False
+
+
+def _conn_addr(conn) -> int:
+    if conn is None:
+        return 0
+    if isinstance(conn, int):
+        return conn
+    value = getattr(conn, "value", None)
+    if isinstance(value, int):
+        return value
+    try:
+        return int(ctypes.cast(conn, ctypes.c_void_p).value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _install_winfsp_stat_ex(FUSE) -> None:
+    """Teach fusepy the WinFsp chflags slot and fuse_stat_ex.st_flags."""
+    global _WINFSP_STAT_EX
+    if _WINFSP_STAT_EX:
+        return
+    import fuse as fuse_mod
+
+    fields = list(fuse_mod.fuse_operations._fields_)
+    if not any(name == "chflags" for name, *_rest in fields):
+        gaps = (
+            "poll",
+            "write_buf",
+            "read_buf",
+            "flock",
+            "fallocate",
+            "getpath",
+            "reserved01",
+            "reserved02",
+            "statfs_x",
+            "setvolname",
+            "exchange",
+            "getxtimes",
+            "setbkuptime",
+            "setchgtime",
+            "setcrtime",
+        )
+        fields.extend((name, ctypes.c_void_p) for name in gaps)
+        fields.append(
+            ("chflags", ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32))
+        )
+
+        class fuse_operations_ex(ctypes.Structure):
+            _fields_ = fields
+
+        # fusepy looks this name up when the mount starts. The stock struct
+        # stops before WinFsp's chflags slot, so attributes never persist.
+        fuse_mod.fuse_operations = fuse_operations_ex
+
+    orig_init = FUSE.init
+
+    def init(self, conn):
+        self._stat_ex = False
+        addr = _conn_addr(conn)
+        try:
+            if addr:
+                capable = ctypes.c_uint.from_address(addr + 20).value
+                if capable & _FSP_CAP_STAT_EX:
+                    want = ctypes.c_uint.from_address(addr + 24)
+                    want.value |= _FSP_CAP_STAT_EX
+                    self._stat_ex = True
+        except Exception:
+            LOG.exception("파일 속성 확장(STAT_EX)을 켜지 못했습니다")
+        if not self._stat_ex:
+            LOG.warning("WinFsp가 확장 속성을 받지 않습니다. 숨김/시스템 속성이 빠질 수 있습니다.")
+        return orig_init(self, conn)
+
+    FUSE.init = init
+
+    orig_fgetattr = FUSE.fgetattr
+
+    def fgetattr(self, path, buf, fip):
+        rc = orig_fgetattr(self, path, buf, fip)
+        if rc == 0 and getattr(self, "_stat_ex", False):
+            flags = int(getattr(self.operations, "_st_flags", 0) or 0) & 0xFFFFFFFF
+            extra = ctypes.addressof(buf.contents) + ctypes.sizeof(fuse_mod.c_stat)
+            ctypes.memset(extra, 0, 32)
+            ctypes.c_uint32.from_address(extra).value = flags
+        return rc
+
+    FUSE.fgetattr = fgetattr
+
+    def chflags(self, path, flags):
+        decoded = path.decode(self.encoding) if isinstance(path, bytes) else path
+        return self.operations("chflags", decoded, flags)
+
+    FUSE.chflags = chflags
+    _WINFSP_STAT_EX = True
+
+
 def _run_fuse(ops, letter: str, label: str, read_only: bool, session: MountSession) -> None:
     FUSE, _FuseOSError, Operations = _ensure_fuse()
+    _install_winfsp_stat_ex(FUSE)
 
     class EXT4FS(Ext4FuseOps, Operations):
         pass
