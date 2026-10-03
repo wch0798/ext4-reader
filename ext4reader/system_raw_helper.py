@@ -66,6 +66,8 @@ def run_system_raw_write(
     volume_handle: int | None,
     relative_offset: int,
     absolute_offset: int,
+    partition_offset: int,
+    partition_size: int,
     data: bytes,
     sector_size: int,
     timeout: float = 25.0,
@@ -98,6 +100,8 @@ def run_system_raw_write(
         "volume_handle": int(volume_handle) if volume_handle is not None else None,
         "relative_offset": int(relative_offset),
         "absolute_offset": int(absolute_offset),
+        "partition_offset": int(partition_offset),
+        "partition_size": int(partition_size),
         "sector_size": int(sector_size),
         "data_b64": base64.b64encode(data).decode("ascii"),
         "sha256": hashlib.sha256(data).hexdigest(),
@@ -330,10 +334,8 @@ def _read_win32(handle: int, offset: int, length: int) -> bytes:
 
 def _execute_request(req: dict) -> dict:
     from ext4reader.windows_disk import (
-        WindowsPhysicalDevice,
-        _enable_privilege,
         _enable_storage_privileges,
-        _open_handle,
+        _query_storage,
         kernel32,
     )
 
@@ -346,6 +348,8 @@ def _execute_request(req: dict) -> dict:
     volume_source = req.get("volume_handle")
     relative_offset = int(req["relative_offset"])
     absolute_offset = int(req["absolute_offset"])
+    partition_offset = int(req["partition_offset"])
+    partition_size = int(req["partition_size"])
     sector_size = int(req["sector_size"])
     data = base64.b64decode(req["data_b64"], validate=True)
 
@@ -355,14 +359,26 @@ def _execute_request(req: dict) -> dict:
         raise IoError("SYSTEM helper 데이터 SHA-256 불일치", winerr=13)
     if sector_size <= 0 or absolute_offset % sector_size or len(data) % sector_size:
         raise IoError("SYSTEM helper 쓰기 정렬 오류", winerr=87)
+    if partition_offset < 0 or partition_size <= 0:
+        raise IoError("SYSTEM helper 파티션 범위 오류", winerr=87)
+    if relative_offset < 0 or relative_offset + len(data) > partition_size:
+        raise IoError("SYSTEM helper 파티션 밖 쓰기 거부", winerr=87)
+    if absolute_offset != partition_offset + relative_offset:
+        raise IoError("SYSTEM helper 물리/파티션 오프셋 불일치", winerr=87)
 
     _enable_storage_privileges()
-    _enable_privilege("SeDebugPrivilege")
 
     handles: list[int] = []
     failures: list[str] = []
     physical_dup = _duplicate_handle(parent_pid, physical_source)
     handles.append(physical_dup)
+
+    _vendor, _product, _bus, removable = _query_storage(wintypes.HANDLE(physical_dup))
+    if not removable:
+        raise IoError(
+            "SYSTEM helper는 removable 저장장치에만 raw write를 허용합니다.",
+            winerr=5,
+        )
 
     volume_dup = None
     if volume_source is not None:
@@ -397,46 +413,11 @@ def _execute_request(req: dict) -> dict:
             except IoError as exc:
                 failures.append(f"{name}: {exc}")
 
-        fresh = None
-        try:
-            fresh = _open_handle(path, True)
-            try:
-                _write_win32(int(fresh), absolute_offset, data)
-                if _read_win32(int(fresh), absolute_offset, len(data)) != data:
-                    raise IoError("SYSTEM fresh PhysicalDrive read-back 불일치", winerr=23)
-                return {"ok": True, "method": "SYSTEM fresh-PhysicalDrive WriteFile"}
-            except IoError as exc:
-                failures.append(f"SYSTEM fresh-PhysicalDrive WriteFile: {exc}")
-
-            try:
-                from ext4reader.windows_disk import _nt_open_raw_handle, ntdll
-
-                nt_handle = _nt_open_raw_handle(path)
-                try:
-                    _write_nt(int(nt_handle.value), absolute_offset, data)
-                finally:
-                    ntdll.NtClose(nt_handle)
-                if _read_win32(int(fresh), absolute_offset, len(data)) != data:
-                    raise IoError("SYSTEM fresh PhysicalDrive NT read-back 불일치", winerr=23)
-                return {"ok": True, "method": "SYSTEM fresh-PhysicalDrive NtWriteFile"}
-            except IoError as exc:
-                failures.append(f"SYSTEM fresh-PhysicalDrive NtWriteFile: {exc}")
-
-            try:
-                dev = WindowsPhysicalDevice.__new__(WindowsPhysicalDevice)
-                dev._handle = fresh
-                dev.sector_size = sector_size
-                dev._size = 0
-                dev._read_at = lambda off, length: _read_win32(int(fresh), off, length)
-                dev._scsi_write10(absolute_offset, data)
-                return {"ok": True, "method": "SYSTEM SCSI WRITE(10)"}
-            except IoError as exc:
-                failures.append(f"SYSTEM SCSI WRITE(10): {exc}")
-        finally:
-            if fresh:
-                kernel32.CloseHandle(fresh)
-
-        return {"ok": False, "error": " | ".join(failures[-10:]), "failures": failures}
+        return {
+            "ok": False,
+            "error": " | ".join(failures[-10:]),
+            "failures": failures,
+        }
     finally:
         for handle in handles:
             try:
