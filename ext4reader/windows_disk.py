@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from ctypes import wintypes
 
 try:
@@ -2599,13 +2600,23 @@ class WindowsPhysicalDevice(BlockDevice):
                 "Windows storage stack 우회: UsbDk direct-USB BOT 백엔드로 전환 %s",
                 self.path,
             )
-        except Exception:
+        except Exception as usb_exc:
             if backend is not None:
                 try:
                     backend.close()
                 except Exception:
                     pass
-            self._restore_windows_after_usbdk_failure()
+            LOG.warning("UsbDk direct-USB backend 활성화 실패: %s", usb_exc)
+            try:
+                self._restore_windows_after_usbdk_failure()
+            except Exception as restore_exc:
+                raise IoError(
+                    "UsbDk direct-USB 활성화 실패: "
+                    + str(usb_exc)
+                    + " | Windows storage 복구 실패: "
+                    + str(restore_exc),
+                    winerr=getattr(usb_exc, "winerr", 5) or 5,
+                ) from usb_exc
             raise
 
     def _write_unbuffered_physical(self, offset: int, data: bytes) -> None:
