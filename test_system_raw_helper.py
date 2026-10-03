@@ -1,5 +1,7 @@
 import base64
 import hashlib
+import os
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -36,6 +38,58 @@ class SystemRawHelperTests(unittest.TestCase):
             '--raw-helper-request '
             '"C:\\ProgramData\\Ext4Reader\\RawHelper\\raw-1.json"',
         )
+
+    def test_system_helper_exe_uses_verified_copy(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = os.path.join(td, "Ext4Reader.exe")
+            out = os.path.join(td, "helper")
+            os.mkdir(out)
+            with open(source, "wb") as fp:
+                fp.write(b"fake-pyinstaller-image")
+
+            with patch.object(helper, "_program_data_dir", return_value=out):
+                copied = helper._system_helper_exe(source)
+
+            self.assertNotEqual(os.path.normcase(copied), os.path.normcase(source))
+            with open(copied, "rb") as fp:
+                self.assertEqual(fp.read(), b"fake-pyinstaller-image")
+
+    def test_execute_uses_fresh_system_physicaldrive_after_duplicated_handles_fail(self):
+        import ext4reader.windows_disk as wd
+
+        req = self.make_request()
+        data = base64.b64decode(req["data_b64"])
+        devno = wd.STORAGE_DEVICE_NUMBER()
+        devno.DeviceType = 7
+        devno.DeviceNumber = 1
+        devno.PartitionNumber = 0
+        raw_devno = bytes(devno)
+
+        def duplicate(pid, handle):
+            return 101 if handle == req["physical_handle"] else 102
+
+        def write_win32(handle, offset, payload):
+            if handle == 303:
+                return
+            raise IoError("duplicated denied", winerr=5)
+
+        with patch.object(helper, "_duplicate_handle", side_effect=duplicate), patch.object(
+            wd, "_query_storage", return_value=("", "Generic Reader", 7, True)
+        ), patch.object(
+            wd, "_ioctl", return_value=raw_devno
+        ), patch.object(
+            wd, "_open_handle", return_value=303
+        ), patch.object(
+            helper, "_write_win32", side_effect=write_win32
+        ), patch.object(
+            helper, "_write_nt", side_effect=IoError("nt denied", winerr=5)
+        ), patch.object(
+            helper, "_read_win32", return_value=data
+        ):
+            result = helper._execute_request(req)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["method"], "SYSTEM fresh-PhysicalDrive WriteFile")
 
     def test_execute_rejects_absolute_relative_offset_mismatch_before_handle_use(self):
         req = self.make_request()

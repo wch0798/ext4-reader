@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -39,6 +40,23 @@ def _program_data_dir() -> str:
 
 def _task_run_command(exe: str, request_path: str) -> str:
     return f'"{exe}" --raw-helper-request "{request_path}"'
+
+
+def _system_helper_exe(source_exe: str) -> str:
+    """Run SYSTEM work from a verified copy, not the live PyInstaller image.
+
+    This avoids a second one-file PyInstaller process reopening the exact EXE
+    that the GUI may still lazily import modules from.
+    """
+    source = os.path.abspath(source_exe)
+    with open(source, "rb") as fp:
+        digest = hashlib.sha256(fp.read()).hexdigest()[:16]
+    target = os.path.join(_program_data_dir(), f"Ext4Reader-System-{digest}.exe")
+    if not os.path.isfile(target) or os.path.getsize(target) != os.path.getsize(source):
+        tmp = target + ".tmp"
+        shutil.copy2(source, tmp)
+        os.replace(tmp, target)
+    return target
 
 
 def _run_hidden(args: list[str], timeout: float = 15.0) -> subprocess.CompletedProcess:
@@ -112,7 +130,7 @@ def run_system_raw_write(
     with open(request_path, "w", encoding="utf-8") as fp:
         json.dump(request, fp, ensure_ascii=False)
 
-    exe = os.path.abspath(app_exe())
+    exe = _system_helper_exe(os.path.abspath(app_exe()))
     task_run = _task_run_command(exe, request_path)
     LOG.warning(
         "SYSTEM raw helper 시작 path=%s offset=%s len=%s volume_handle=%s",
@@ -334,9 +352,16 @@ def _read_win32(handle: int, offset: int, length: int) -> bytes:
 
 def _execute_request(req: dict) -> dict:
     from ext4reader.windows_disk import (
+        IOCTL_STORAGE_GET_DEVICE_NUMBER,
+        STORAGE_DEVICE_NUMBER,
+        WindowsPhysicalDevice,
         _enable_storage_privileges,
+        _ioctl,
+        _nt_open_raw_handle,
+        _open_handle,
         _query_storage,
         kernel32,
+        ntdll,
     )
 
     path = str(req.get("physical_path") or "")
@@ -388,6 +413,13 @@ def _execute_request(req: dict) -> dict:
         except IoError as exc:
             failures.append(str(exc))
 
+    parent_dev_raw = _ioctl(
+        wintypes.HANDLE(physical_dup),
+        IOCTL_STORAGE_GET_DEVICE_NUMBER,
+        out_cb=ctypes.sizeof(STORAGE_DEVICE_NUMBER),
+    )
+    parent_dev = STORAGE_DEVICE_NUMBER.from_buffer_copy(parent_dev_raw)
+
     try:
         methods: list[tuple[str, int, int, callable]] = []
         if volume_dup is not None:
@@ -413,9 +445,74 @@ def _execute_request(req: dict) -> dict:
             except IoError as exc:
                 failures.append(f"{name}: {exc}")
 
+        # A duplicated handle preserves the parent's original file object.
+        # Create a fresh PhysicalDrive file object as LocalSystem so drivers
+        # that make their access decision at IRP_MJ_CREATE see SYSTEM itself.
+        fresh = None
+        try:
+            fresh = _open_handle(path, True)
+            fresh_raw = _ioctl(
+                fresh,
+                IOCTL_STORAGE_GET_DEVICE_NUMBER,
+                out_cb=ctypes.sizeof(STORAGE_DEVICE_NUMBER),
+            )
+            fresh_dev = STORAGE_DEVICE_NUMBER.from_buffer_copy(fresh_raw)
+            if (
+                int(fresh_dev.DeviceType) != int(parent_dev.DeviceType)
+                or int(fresh_dev.DeviceNumber) != int(parent_dev.DeviceNumber)
+            ):
+                raise IoError("SYSTEM fresh PhysicalDrive 장치 번호 불일치", winerr=5)
+
+            _vendor2, _product2, _bus2, removable2 = _query_storage(fresh)
+            if not removable2:
+                raise IoError(
+                    "SYSTEM fresh PhysicalDrive가 removable 장치가 아닙니다.",
+                    winerr=5,
+                )
+
+            for name, writer in [
+                ("SYSTEM fresh-PhysicalDrive WriteFile", _write_win32),
+                ("SYSTEM fresh-PhysicalDrive NtWriteFile(on Win32 handle)", _write_nt),
+            ]:
+                try:
+                    writer(int(fresh), absolute_offset, data)
+                    if _read_win32(int(fresh), absolute_offset, len(data)) != data:
+                        raise IoError(f"{name} read-back 불일치", winerr=23)
+                    return {"ok": True, "method": name}
+                except IoError as exc:
+                    failures.append(f"{name}: {exc}")
+
+            nt_handle = None
+            try:
+                nt_handle = _nt_open_raw_handle(path)
+                _write_nt(int(nt_handle.value), absolute_offset, data)
+                if _read_win32(int(fresh), absolute_offset, len(data)) != data:
+                    raise IoError("SYSTEM fresh NT read-back 불일치", winerr=23)
+                return {"ok": True, "method": "SYSTEM fresh-PhysicalDrive NtOpenFile/NtWriteFile"}
+            except IoError as exc:
+                failures.append(f"SYSTEM fresh NtOpenFile/NtWriteFile: {exc}")
+            finally:
+                if nt_handle is not None:
+                    ntdll.NtClose(nt_handle)
+
+            try:
+                dev = WindowsPhysicalDevice.__new__(WindowsPhysicalDevice)
+                dev._handle = fresh
+                dev.sector_size = sector_size
+                dev._read_at = lambda off, length: _read_win32(int(fresh), off, length)
+                dev._scsi_write10(absolute_offset, data)
+                return {"ok": True, "method": "SYSTEM fresh SCSI WRITE(10)"}
+            except IoError as exc:
+                failures.append(f"SYSTEM fresh SCSI WRITE(10): {exc}")
+        except IoError as exc:
+            failures.append(f"SYSTEM fresh PhysicalDrive open/verify: {exc}")
+        finally:
+            if fresh is not None:
+                kernel32.CloseHandle(fresh)
+
         return {
             "ok": False,
-            "error": " | ".join(failures[-10:]),
+            "error": " | ".join(failures[-12:]),
             "failures": failures,
         }
     finally:
