@@ -529,7 +529,14 @@ class App(tk.Tk):
         if kind == "vol":
             disk, vinfo = payload
             key = self._vol_key("disk", disk.path, vinfo)
-            opener = lambda writable: WindowsPhysicalDevice(disk.path, disk.sector_size, writable=writable)
+            opener = lambda writable: WindowsPhysicalDevice(
+                disk.path,
+                disk.sector_size,
+                writable=writable,
+                partition_number=vinfo.partition_index,
+                partition_offset=vinfo.offset,
+                partition_size=vinfo.size,
+            )
             src = disk.path
         elif kind == "imgvol":
             path, vinfo = payload

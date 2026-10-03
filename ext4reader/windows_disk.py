@@ -252,6 +252,14 @@ def restart_as_admin(hwnd=None) -> tuple[bool, str]:
 
 
 @dataclass
+class _LockedVolume:
+    handle: int
+    name: str
+    partition_number: int
+    locked: bool
+
+
+@dataclass
 class DiskInfo:
     index: int
     path: str
@@ -376,11 +384,18 @@ def _allow_extended_io(handle) -> None:
         pass
 
 
-def _lock_volumes_for_disk(disk_index: int) -> list:
-    """Lock/dismount Windows volumes on this physical disk so EXT4 writes are not blocked."""
+def _lock_volumes_for_disk(disk_index: int) -> list[_LockedVolume]:
+    """Lock/dismount Windows volumes on this disk and keep their handles open.
+
+    Windows Vista+ blocks raw PhysicalDrive writes that overlap a mounted
+    volume unless that volume is explicitly locked/dismounted.  We also keep
+    the matching RAW volume handle so writes inside the selected partition can
+    be issued through the volume handle itself, which Windows permits for RAW
+    filesystems.
+    """
     from ext4reader.debuglog import LOG
 
-    locked = []
+    locked: list[_LockedVolume] = []
     name = ctypes.create_unicode_buffer(260)
     find = kernel32.FindFirstVolumeW(name, 260)
     if find == INVALID_HANDLE_VALUE or find is None:
@@ -402,16 +417,37 @@ def _lock_volumes_for_disk(disk_index: int) -> list:
                     raw = _ioctl(handle, IOCTL_STORAGE_GET_DEVICE_NUMBER, out_cb=ctypes.sizeof(STORAGE_DEVICE_NUMBER))
                     num = STORAGE_DEVICE_NUMBER.from_buffer_copy(raw)
                     if num.DeviceNumber == disk_index:
+                        lock_ok = False
                         try:
                             _ioctl(handle, FSCTL_LOCK_VOLUME)
+                            lock_ok = True
+                            LOG.info(
+                                "Windows 볼륨 잠금 성공 %s (PhysicalDrive%s part=%s)",
+                                vol,
+                                disk_index,
+                                num.PartitionNumber,
+                            )
                         except OSError as exc:
-                            LOG.info("볼륨 잠금 실패 %s: %s", vol, exc)
+                            LOG.warning("볼륨 잠금 실패 %s: %s", vol, exc)
                         try:
                             _ioctl(handle, FSCTL_DISMOUNT_VOLUME)
-                            LOG.info("Windows 볼륨 분리 %s (PhysicalDrive%s part=%s)", vol, disk_index, num.PartitionNumber)
+                            LOG.info(
+                                "Windows 볼륨 분리 %s (PhysicalDrive%s part=%s)",
+                                vol,
+                                disk_index,
+                                num.PartitionNumber,
+                            )
                         except OSError as exc:
-                            LOG.info("볼륨 분리 실패 %s: %s", vol, exc)
-                        locked.append(handle)
+                            LOG.warning("볼륨 분리 실패 %s: %s", vol, exc)
+                        _allow_extended_io(handle)
+                        locked.append(
+                            _LockedVolume(
+                                handle=int(handle),
+                                name=vol,
+                                partition_number=int(num.PartitionNumber),
+                                locked=lock_ok,
+                            )
+                        )
                         handle = None
                 except OSError:
                     pass
@@ -494,7 +530,15 @@ def list_physical_disks() -> list[DiskInfo]:
 
 
 class WindowsPhysicalDevice(BlockDevice):
-    def __init__(self, path: str, sector_size: int = 512, writable: bool = False):
+    def __init__(
+        self,
+        path: str,
+        sector_size: int = 512,
+        writable: bool = False,
+        partition_number: int | None = None,
+        partition_offset: int = 0,
+        partition_size: int = 0,
+    ):
         from ext4reader.debuglog import LOG
 
         self.path = path
@@ -503,12 +547,46 @@ class WindowsPhysicalDevice(BlockDevice):
         self._io_lock = threading.RLock()
         self._closed = False
         self._stop_ka = threading.Event()
-        self._volume_locks: list = []
-        LOG.info("디스크 열기 %s writable=%s sector=%s", path, writable, self.sector_size)
+        self._volume_locks: list[_LockedVolume] = []
+        self._partition_number = partition_number
+        self._partition_offset = int(partition_offset or 0)
+        self._partition_size = int(partition_size or 0)
+        self._partition_volume: _LockedVolume | None = None
+        LOG.info(
+            "디스크 열기 %s writable=%s sector=%s part=%s part_offset=%s part_size=%s",
+            path,
+            writable,
+            self.sector_size,
+            partition_number,
+            self._partition_offset,
+            self._partition_size,
+        )
         if writable:
             idx = _physical_index(path)
             if idx is not None:
                 self._volume_locks = _lock_volumes_for_disk(idx)
+                if partition_number is not None:
+                    self._partition_volume = next(
+                        (
+                            item
+                            for item in self._volume_locks
+                            if item.partition_number == int(partition_number)
+                        ),
+                        None,
+                    )
+                    if self._partition_volume is not None:
+                        LOG.info(
+                            "파티션 직접 쓰기용 Windows 볼륨 핸들 선택 %s part=%s locked=%s",
+                            self._partition_volume.name,
+                            self._partition_volume.partition_number,
+                            self._partition_volume.locked,
+                        )
+                    else:
+                        LOG.warning(
+                            "PhysicalDrive%s part=%s 에 해당하는 Windows 볼륨 핸들을 찾지 못했습니다.",
+                            idx,
+                            partition_number,
+                        )
         self._handle = _open_handle(path, writable)
         self._use_overlapped = True
         self._size, geo_ss = _query_geometry(self._handle)
@@ -563,12 +641,22 @@ class WindowsPhysicalDevice(BlockDevice):
         if self._writable:
             idx = _physical_index(self.path)
             if idx is not None:
-                for h in self._volume_locks:
+                for item in self._volume_locks:
                     try:
-                        kernel32.CloseHandle(h)
+                        kernel32.CloseHandle(item.handle)
                     except Exception:
                         pass
                 self._volume_locks = _lock_volumes_for_disk(idx)
+                self._partition_volume = None
+                if self._partition_number is not None:
+                    self._partition_volume = next(
+                        (
+                            item
+                            for item in self._volume_locks
+                            if item.partition_number == int(self._partition_number)
+                        ),
+                        None,
+                    )
         self._handle = _open_handle(self.path, self._writable)
         self._use_overlapped = True
         self._size, geo_ss = _query_geometry(self._handle)
@@ -681,6 +769,43 @@ class WindowsPhysicalDevice(BlockDevice):
         if not ok or done.value != len(data):
             raise IoError(f"{offset}에서 쓰기 실패 (Win32 {err})", winerr=err)
 
+    def _write_volume_seek(self, item: _LockedVolume, offset: int, data: bytes) -> None:
+        """Write relative to a locked/dismounted volume handle."""
+        kernel32.SetLastError(0)
+        new_pos = ctypes.c_longlong(0)
+        ok = kernel32.SetFilePointerEx(
+            item.handle,
+            offset,
+            ctypes.byref(new_pos),
+            FILE_BEGIN,
+        )
+        if not ok:
+            err = ctypes.get_last_error()
+            raise IoError(
+                f"{item.name} 볼륨 오프셋 {offset} 이동 실패 (Win32 {err})",
+                winerr=err,
+            )
+        done = wintypes.DWORD(0)
+        buf = (ctypes.c_char * len(data)).from_buffer_copy(data)
+        kernel32.SetLastError(0)
+        ok = kernel32.WriteFile(item.handle, buf, len(data), ctypes.byref(done), None)
+        err = ctypes.get_last_error()
+        if not ok or done.value != len(data):
+            raise IoError(
+                f"{item.name} 볼륨 오프셋 {offset} 쓰기 실패 (Win32 {err})",
+                winerr=err,
+            )
+
+    def _partition_write_target(self, offset: int, length: int) -> tuple[_LockedVolume, int] | None:
+        item = self._partition_volume
+        if item is None or length <= 0:
+            return None
+        start = self._partition_offset
+        end = start + self._partition_size if self._partition_size else self._size
+        if offset < start or offset + length > end:
+            return None
+        return item, offset - start
+
     def _write_at(self, offset: int, data: bytes) -> None:
         if not data:
             return
@@ -718,7 +843,14 @@ class WindowsPhysicalDevice(BlockDevice):
         pos = 0
         while pos < len(data):
             n = min(IO_CHUNK, len(data) - pos)
-            self._write_at(offset + pos, data[pos : pos + n])
+            absolute = offset + pos
+            chunk = data[pos : pos + n]
+            target = self._partition_write_target(absolute, len(chunk))
+            if target is not None:
+                item, relative = target
+                self._write_volume_seek(item, relative, chunk)
+            else:
+                self._write_at(absolute, chunk)
             pos += n
 
     def _raw_read(self, offset: int, length: int) -> bytes:
@@ -743,9 +875,9 @@ class WindowsPhysicalDevice(BlockDevice):
                 kernel32.CloseHandle(self._handle)
             except Exception:
                 pass
-            for h in self._volume_locks:
+            for item in self._volume_locks:
                 try:
-                    kernel32.CloseHandle(h)
+                    kernel32.CloseHandle(item.handle)
                 except Exception:
                     pass
             self._volume_locks = []
