@@ -2160,18 +2160,10 @@ class WindowsPhysicalDevice(BlockDevice):
                 pass
             self._nt_handle = None
 
-        old = self._handle
-        try:
-            kernel32.CloseHandle(old)
-        except Exception:
-            pass
-        self._handle = _open_handle(self.path, True)
+        # Keep the current PhysicalDrive file object alive. If it is still
+        # denied after the global disk state changes, the LocalSystem stage
+        # below will create a genuinely fresh file object.
         self._use_overlapped = False
-        size, sector = _query_geometry(self._handle)
-        if size:
-            self._size = size
-        if sector:
-            self.sector_size = sector
         LOG.warning(
             "전체 디스크 OFFLINE 모드 채택: PhysicalDrive-only I/O size=%s sector=%s",
             self._size,
