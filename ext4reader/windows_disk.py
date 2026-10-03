@@ -49,6 +49,12 @@ SCSI_IOCTL_DATA_OUT = 0
 SCSI_STATUS_GOOD = 0x00
 SCSI_WRITE10 = 0x2A
 
+TOKEN_QUERY = 0x0008
+TOKEN_ADJUST_PRIVILEGES = 0x0020
+SE_PRIVILEGE_ENABLED = 0x00000002
+ERROR_NOT_ALL_ASSIGNED = 1300
+SE_MANAGE_VOLUME_NAME = "SeManageVolumePrivilege"
+
 BUS_NAMES = {
     0: "알 수 없음",
     1: "SCSI",
@@ -81,6 +87,8 @@ BUS_KIND = {
 
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+
 
 kernel32.CreateFileW.argtypes = [
     wintypes.LPCWSTR,
@@ -161,6 +169,52 @@ kernel32.FindVolumeClose.argtypes = [wintypes.HANDLE]
 kernel32.FindVolumeClose.restype = wintypes.BOOL
 kernel32.QueryDosDeviceW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
 kernel32.QueryDosDeviceW.restype = wintypes.DWORD
+
+class _LUID(ctypes.Structure):
+    _fields_ = [
+        ("LowPart", wintypes.DWORD),
+        ("HighPart", ctypes.c_long),
+    ]
+
+
+class _LUID_AND_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [
+        ("Luid", _LUID),
+        ("Attributes", wintypes.DWORD),
+    ]
+
+
+class _TOKEN_PRIVILEGES_ONE(ctypes.Structure):
+    _fields_ = [
+        ("PrivilegeCount", wintypes.DWORD),
+        ("Privileges", _LUID_AND_ATTRIBUTES * 1),
+    ]
+
+
+kernel32.GetCurrentProcess.argtypes = []
+kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+advapi32.OpenProcessToken.argtypes = [
+    wintypes.HANDLE,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.HANDLE),
+]
+advapi32.OpenProcessToken.restype = wintypes.BOOL
+advapi32.LookupPrivilegeValueW.argtypes = [
+    wintypes.LPCWSTR,
+    wintypes.LPCWSTR,
+    ctypes.POINTER(_LUID),
+]
+advapi32.LookupPrivilegeValueW.restype = wintypes.BOOL
+advapi32.AdjustTokenPrivileges.argtypes = [
+    wintypes.HANDLE,
+    wintypes.BOOL,
+    ctypes.POINTER(_TOKEN_PRIVILEGES_ONE),
+    wintypes.DWORD,
+    wintypes.LPVOID,
+    wintypes.LPVOID,
+]
+advapi32.AdjustTokenPrivileges.restype = wintypes.BOOL
+
 
 
 class _UNICODE_STRING(ctypes.Structure):
@@ -562,6 +616,59 @@ def _allow_extended_io(handle) -> None:
         _ioctl(handle, FSCTL_ALLOW_EXTENDED_DASD_IO)
     except OSError:
         pass
+
+def _enable_privilege(name: str) -> tuple[bool, int]:
+    """Enable one privilege already assigned to the current process token."""
+    token = wintypes.HANDLE()
+    kernel32.SetLastError(0)
+    if not advapi32.OpenProcessToken(
+        kernel32.GetCurrentProcess(),
+        TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
+        ctypes.byref(token),
+    ):
+        return False, ctypes.get_last_error()
+
+    try:
+        luid = _LUID()
+        kernel32.SetLastError(0)
+        if not advapi32.LookupPrivilegeValueW(None, name, ctypes.byref(luid)):
+            return False, ctypes.get_last_error()
+
+        tp = _TOKEN_PRIVILEGES_ONE()
+        tp.PrivilegeCount = 1
+        tp.Privileges[0].Luid = luid
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED
+
+        kernel32.SetLastError(0)
+        if not advapi32.AdjustTokenPrivileges(
+            token,
+            False,
+            ctypes.byref(tp),
+            0,
+            None,
+            None,
+        ):
+            return False, ctypes.get_last_error()
+
+        err = ctypes.get_last_error()
+        if err == ERROR_NOT_ALL_ASSIGNED:
+            return False, err
+        return True, 0
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def _enable_storage_privileges() -> bool:
+    """Enable privileges required by Windows volume/disk maintenance paths."""
+    from ext4reader.debuglog import LOG
+
+    ok, err = _enable_privilege(SE_MANAGE_VOLUME_NAME)
+    if ok:
+        LOG.info("%s 활성화 성공", SE_MANAGE_VOLUME_NAME)
+        return True
+    LOG.warning("%s 활성화 실패 (Win32 %s)", SE_MANAGE_VOLUME_NAME, err)
+    return False
+
 
 
 def _take_volume_offline(handle, name: str) -> bool:
@@ -975,6 +1082,7 @@ class WindowsPhysicalDevice(BlockDevice):
             self._partition_size,
         )
         if writable:
+            _enable_storage_privileges()
             idx = _physical_index(path)
             if idx is not None:
                 self._volume_locks = _lock_volumes_for_disk(idx)
@@ -1100,6 +1208,7 @@ class WindowsPhysicalDevice(BlockDevice):
                 pass
             self._nt_handle = None
         if self._writable:
+            _enable_storage_privileges()
             idx = _physical_index(self.path)
             if idx is not None:
                 for item in self._volume_locks:
