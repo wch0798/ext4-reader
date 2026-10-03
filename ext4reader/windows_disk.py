@@ -148,6 +148,8 @@ kernel32.FindNextVolumeW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.
 kernel32.FindNextVolumeW.restype = wintypes.BOOL
 kernel32.FindVolumeClose.argtypes = [wintypes.HANDLE]
 kernel32.FindVolumeClose.restype = wintypes.BOOL
+kernel32.QueryDosDeviceW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+kernel32.QueryDosDeviceW.restype = wintypes.DWORD
 
 
 class STORAGE_DEVICE_NUMBER(ctypes.Structure):
@@ -542,6 +544,78 @@ def _open_handle(path: str, writable: bool):
     return handle
 
 
+def _open_hidden_volume_alias(disk_index: int, partition_number: int) -> _LockedVolume | None:
+    """Find a matching HarddiskVolumeN DOS device even when FindFirstVolume omits it."""
+    from ext4reader.debuglog import LOG
+
+    buf = ctypes.create_unicode_buffer(65536)
+    n = kernel32.QueryDosDeviceW(None, buf, len(buf))
+    if not n:
+        LOG.warning("QueryDosDeviceW 전체 열거 실패 (Win32 %s)", ctypes.get_last_error())
+        return None
+
+    names = [x for x in buf[:n].split("\x00") if x.startswith("HarddiskVolume")]
+    for name in names:
+        path = rf"\\.\{name}"
+        handle = kernel32.CreateFileW(
+            path,
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            0,
+            None,
+        )
+        if handle == INVALID_HANDLE_VALUE or handle is None:
+            continue
+        keep = False
+        try:
+            raw = _ioctl(
+                handle,
+                IOCTL_STORAGE_GET_DEVICE_NUMBER,
+                out_cb=ctypes.sizeof(STORAGE_DEVICE_NUMBER),
+            )
+            num = STORAGE_DEVICE_NUMBER.from_buffer_copy(raw)
+            if int(num.DeviceNumber) != int(disk_index) or int(num.PartitionNumber) != int(partition_number):
+                continue
+
+            writable_ok, writable_err = _is_writable_ioctl(handle)
+            LOG.info(
+                "숨은 볼륨 별칭 발견 %s -> PhysicalDrive%s part=%s writable=%s err=%s",
+                path,
+                disk_index,
+                partition_number,
+                writable_ok,
+                writable_err,
+            )
+            lock_ok = False
+            try:
+                _ioctl(handle, FSCTL_LOCK_VOLUME)
+                lock_ok = True
+                LOG.info("숨은 볼륨 잠금 성공 %s", path)
+            except OSError as exc:
+                LOG.info("숨은 볼륨 잠금 생략/실패 %s: %s", path, exc)
+            try:
+                _ioctl(handle, FSCTL_DISMOUNT_VOLUME)
+                LOG.info("숨은 볼륨 분리 성공 %s", path)
+            except OSError as exc:
+                LOG.info("숨은 볼륨 분리 생략/실패 %s: %s", path, exc)
+            _allow_extended_io(handle)
+            keep = True
+            return _LockedVolume(
+                handle=int(handle),
+                name=path,
+                partition_number=int(partition_number),
+                locked=lock_ok,
+            )
+        except OSError:
+            pass
+        finally:
+            if not keep:
+                kernel32.CloseHandle(handle)
+    return None
+
+
 def _open_partition_device(disk_index: int, partition_number: int) -> _LockedVolume | None:
     """Open a partition DASD handle when Mount Manager exposes no Volume GUID."""
     from ext4reader.debuglog import LOG
@@ -728,20 +802,34 @@ class WindowsPhysicalDevice(BlockDevice):
                     else:
                         LOG.warning(
                             "PhysicalDrive%s part=%s 에 해당하는 Volume{GUID} 핸들을 찾지 못했습니다. "
-                            "파티션 장치를 직접 엽니다.",
+                            "숨은 HarddiskVolume 별칭을 찾습니다.",
                             idx,
                             partition_number,
                         )
-                        direct = _open_partition_device(idx, int(partition_number))
-                        if direct is not None:
-                            self._volume_locks.append(direct)
-                            self._partition_volume = direct
+                        hidden = _open_hidden_volume_alias(idx, int(partition_number))
+                        if hidden is not None:
+                            self._volume_locks.append(hidden)
+                            self._partition_volume = hidden
                             LOG.info(
-                                "파티션 직접 쓰기용 장치 핸들 선택 %s part=%s locked=%s",
-                                direct.name,
-                                direct.partition_number,
-                                direct.locked,
+                                "파티션 직접 쓰기용 숨은 볼륨 핸들 선택 %s part=%s locked=%s",
+                                hidden.name,
+                                hidden.partition_number,
+                                hidden.locked,
                             )
+                        else:
+                            LOG.warning(
+                                "숨은 HarddiskVolume 별칭도 없어 파티션 DASD를 직접 엽니다."
+                            )
+                            direct = _open_partition_device(idx, int(partition_number))
+                            if direct is not None:
+                                self._volume_locks.append(direct)
+                                self._partition_volume = direct
+                                LOG.info(
+                                    "파티션 직접 쓰기용 장치 핸들 선택 %s part=%s locked=%s",
+                                    direct.name,
+                                    direct.partition_number,
+                                    direct.locked,
+                                )
         self._handle = _open_handle(path, writable)
         if writable:
             writable_ok, writable_err = _is_writable_ioctl(self._handle)
@@ -827,6 +915,11 @@ class WindowsPhysicalDevice(BlockDevice):
                         ),
                         None,
                     )
+                    if self._partition_volume is None:
+                        hidden = _open_hidden_volume_alias(idx, int(self._partition_number))
+                        if hidden is not None:
+                            self._volume_locks.append(hidden)
+                            self._partition_volume = hidden
                     if self._partition_volume is None:
                         direct = _open_partition_device(idx, int(self._partition_number))
                         if direct is not None:
