@@ -16,6 +16,7 @@ from ext4reader.debuglog import LOG, setup_logging
 from ext4reader.dnd import DropTarget
 from ext4reader.fuse_mount import (
     MountSession,
+    _ensure_fuse,
     cleanup_stale_mounts,
     explain_fuse_error,
     free_drive_letters,
@@ -596,6 +597,11 @@ class App(tk.Tk):
                 is_admin(),
                 letter,
             )
+            # PyInstaller one-file builds load Python modules from the EXE
+            # archive. Load the FUSE runtime before spawning any LocalSystem
+            # helper so read-only fallback never needs a late archive import.
+            _ensure_fuse()
+            LOG.info("FUSE 런타임 사전 로드 완료")
             dev = opener(writable)
             vol = Ext4Volume(dev, vinfo.offset, vinfo.size, owns_device=True)
             LOG.info(
