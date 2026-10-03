@@ -261,8 +261,11 @@ class _JournalLog:
             return
         if len(block) < 0x14:
             raise JournalRecoveryError("JBD2 commit 블록이 너무 짧습니다.")
-        if block[0x0C] != JBD2_CRC32C_CHKSUM or block[0x0D] != 4:
-            raise JournalRecoveryError("JBD2 commit checksum 헤더가 올바르지 않습니다.")
+
+        # For JBD2 checksum v2/v3 Linux deliberately stores h_chksum_type=0
+        # and h_chksum_size=0 in commit_header, then places the CRC32C in
+        # h_chksum[0] (offset 0x10).  The type/size fields are used by the
+        # legacy v1 transaction checksum path, not by v2/v3.
         provided = struct.unpack_from(">I", block, 0x10)[0]
         tmp = bytearray(block)
         struct.pack_into(">I", tmp, 0x10, 0)
