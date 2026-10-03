@@ -8,6 +8,11 @@ import subprocess
 import sys
 import threading
 from ctypes import wintypes
+
+try:
+    import winreg
+except ImportError:  # pragma: no cover - non-Windows import safety
+    winreg = None
 from dataclasses import dataclass
 
 from ext4reader.io_backend import IO_CHUNK, BlockDevice, IoError
@@ -40,6 +45,8 @@ IOCTL_STORAGE_CHECK_VERIFY2 = 0x002D0800
 STALE_HANDLE_ERRORS = {6, 31, 995, 1167}  # invalid handle / gen fail / aborted / unplugged
 
 IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = 0x000700A0
+IOCTL_DISK_GET_PARTITION_INFO_EX = 0x00070048
+IOCTL_DISK_GET_DISK_ATTRIBUTES = 0x000700F0
 IOCTL_DISK_IS_WRITABLE = 0x00070024
 IOCTL_STORAGE_QUERY_PROPERTY = 0x002D1400
 IOCTL_SCSI_PASS_THROUGH = 0x0004D004
@@ -54,6 +61,13 @@ TOKEN_ADJUST_PRIVILEGES = 0x0020
 SE_PRIVILEGE_ENABLED = 0x00000002
 ERROR_NOT_ALL_ASSIGNED = 1300
 SE_MANAGE_VOLUME_NAME = "SeManageVolumePrivilege"
+
+DISK_ATTRIBUTE_OFFLINE = 0x0000000000000001
+DISK_ATTRIBUTE_READ_ONLY = 0x0000000000000002
+PARTITION_STYLE_GPT = 1
+GPT_ATTRIBUTE_READ_ONLY = 0x1000000000000000
+GPT_ATTRIBUTE_HIDDEN = 0x4000000000000000
+GPT_ATTRIBUTE_NO_DRIVE_LETTER = 0x8000000000000000
 
 BUS_NAMES = {
     0: "알 수 없음",
@@ -670,6 +684,144 @@ def _enable_storage_privileges() -> bool:
     return False
 
 
+def _read_reg_dword(root, path: str, name: str) -> int | None:
+    if winreg is None:
+        return None
+    try:
+        with winreg.OpenKey(root, path, 0, winreg.KEY_READ) as key:
+            value, _ = winreg.QueryValueEx(key, name)
+            return int(value)
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return None
+
+
+def _windows_write_policy_blockers() -> list[str]:
+    """Return Windows policies/settings that explicitly deny removable writes."""
+    if winreg is None:
+        return []
+
+    disk_class = r"{53f5630d-b6bf-11d0-94f2-00a0c91efb8b}"
+    checks = [
+        (
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Policies\Microsoft\Windows\RemovableStorageDevices",
+            "Deny_All",
+            "컴퓨터 정책: 모든 이동식 저장장치 액세스 거부",
+        ),
+        (
+            winreg.HKEY_CURRENT_USER,
+            r"SOFTWARE\Policies\Microsoft\Windows\RemovableStorageDevices",
+            "Deny_All",
+            "사용자 정책: 모든 이동식 저장장치 액세스 거부",
+        ),
+        (
+            winreg.HKEY_LOCAL_MACHINE,
+            rf"SOFTWARE\Policies\Microsoft\Windows\RemovableStorageDevices\{disk_class}",
+            "Deny_Write",
+            "컴퓨터 정책: 이동식 디스크 쓰기 액세스 거부",
+        ),
+        (
+            winreg.HKEY_CURRENT_USER,
+            rf"SOFTWARE\Policies\Microsoft\Windows\RemovableStorageDevices\{disk_class}",
+            "Deny_Write",
+            "사용자 정책: 이동식 디스크 쓰기 액세스 거부",
+        ),
+        (
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Policies\Microsoft\FVE",
+            "RDVDenyWriteAccess",
+            "BitLocker 정책: 보호되지 않은 이동식 드라이브 쓰기 거부",
+        ),
+        (
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Policies\Microsoft\FVE",
+            "RDVDenyWriteAccess",
+            "BitLocker 정책(호환 경로): 이동식 드라이브 쓰기 거부",
+        ),
+        (
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\StorageDevicePolicies",
+            "WriteProtect",
+            "시스템 설정: 이동식 저장장치 쓰기 보호",
+        ),
+    ]
+    blockers: list[str] = []
+    for root, path, name, label in checks:
+        value = _read_reg_dword(root, path, name)
+        if value == 1:
+            blockers.append(f"{label} [{name}=1]")
+    return blockers
+
+
+def _query_disk_attributes(handle) -> tuple[int | None, int]:
+    try:
+        raw = _ioctl(handle, IOCTL_DISK_GET_DISK_ATTRIBUTES, out_cb=16)
+    except OSError as exc:
+        return None, int(exc.args[0]) if exc.args else 0
+    if len(raw) < 16:
+        return None, 13
+    return int.from_bytes(raw[8:16], "little"), 0
+
+
+def _query_partition_gpt_attributes(handle) -> tuple[int | None, int]:
+    """Return GPT partition attributes, or None for non-GPT/unavailable."""
+    try:
+        raw = _ioctl(handle, IOCTL_DISK_GET_PARTITION_INFO_EX, out_cb=160)
+    except OSError as exc:
+        return None, int(exc.args[0]) if exc.args else 0
+    if len(raw) < 72:
+        return None, 13
+    style = int.from_bytes(raw[0:4], "little")
+    if style != PARTITION_STYLE_GPT:
+        return None, 0
+    # PARTITION_INFORMATION_EX union starts at offset 32; GPT Attributes is
+    # after PartitionType GUID (16) + PartitionId GUID (16).
+    return int.from_bytes(raw[64:72], "little"), 0
+
+
+def _log_write_environment(disk_handle=None, partition_handle=None) -> list[str]:
+    from ext4reader.debuglog import LOG
+
+    blockers = _windows_write_policy_blockers()
+    if blockers:
+        for blocker in blockers:
+            LOG.warning("Windows 쓰기 차단 정책 감지: %s", blocker)
+    else:
+        LOG.info("Windows 이동식 저장장치 쓰기 차단 정책: 감지되지 않음")
+
+    if disk_handle is not None:
+        attrs, err = _query_disk_attributes(disk_handle)
+        if attrs is None:
+            LOG.info("디스크 속성 조회 불가 Win32=%s", err)
+        else:
+            LOG.info(
+                "디스크 속성 attrs=0x%016X offline=%s readonly=%s",
+                attrs,
+                bool(attrs & DISK_ATTRIBUTE_OFFLINE),
+                bool(attrs & DISK_ATTRIBUTE_READ_ONLY),
+            )
+            if attrs & DISK_ATTRIBUTE_READ_ONLY:
+                blockers.append("디스크 자체가 READ_ONLY 속성입니다.")
+
+    if partition_handle is not None:
+        attrs, err = _query_partition_gpt_attributes(partition_handle)
+        if attrs is None:
+            if err:
+                LOG.info("GPT 파티션 속성 조회 불가 Win32=%s", err)
+        else:
+            LOG.info(
+                "GPT 파티션 속성 attrs=0x%016X readonly=%s hidden=%s no_drive_letter=%s",
+                attrs,
+                bool(attrs & GPT_ATTRIBUTE_READ_ONLY),
+                bool(attrs & GPT_ATTRIBUTE_HIDDEN),
+                bool(attrs & GPT_ATTRIBUTE_NO_DRIVE_LETTER),
+            )
+            if attrs & GPT_ATTRIBUTE_READ_ONLY:
+                blockers.append("GPT 파티션에 READ_ONLY 속성이 설정되어 있습니다.")
+
+    return blockers
+
+
 
 def _take_volume_offline(handle, name: str) -> bool:
     """Keep a dismounted volume from being automatically remounted.
@@ -1072,6 +1224,7 @@ class WindowsPhysicalDevice(BlockDevice):
         self._partition_size = int(partition_size or 0)
         self._partition_volume: _LockedVolume | None = None
         self._nt_handle = None
+        self._write_blockers: list[str] = []
         LOG.info(
             "디스크 열기 %s writable=%s sector=%s part=%s part_offset=%s part_size=%s",
             path,
@@ -1135,6 +1288,10 @@ class WindowsPhysicalDevice(BlockDevice):
                                 )
         self._handle = _open_handle(path, writable)
         if writable:
+            self._write_blockers = _log_write_environment(
+                self._handle,
+                self._partition_volume.handle if self._partition_volume is not None else None,
+            )
             writable_ok, writable_err = _is_writable_ioctl(self._handle)
             if writable_ok:
                 LOG.info("물리 디스크 IOCTL_DISK_IS_WRITABLE: 쓰기 가능")
@@ -1618,7 +1775,18 @@ class WindowsPhysicalDevice(BlockDevice):
                 nt_exc,
             )
 
-        self._scsi_write10(absolute, data)
+        try:
+            self._scsi_write10(absolute, data)
+        except IoError as scsi_exc:
+            blockers = list(self._write_blockers)
+            if blockers:
+                detail = " / ".join(blockers)
+                raise IoError(
+                    "Windows가 저장장치 쓰기를 정책/속성으로 차단하고 있습니다: "
+                    f"{detail}",
+                    winerr=5,
+                ) from scsi_exc
+            raise
 
     def _write_volume_seek(self, item: _LockedVolume, offset: int, data: bytes) -> None:
         """Write relative to a locked/dismounted volume handle."""
