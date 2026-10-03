@@ -22,6 +22,14 @@ INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 FILE_BEGIN = 0
 FILE_ATTRIBUTE_NORMAL = 0x00000080
 FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+
+# Native NT file I/O flags. Rufus' Windows extfs backend uses NtOpenFile /
+# NtWriteFile on raw devices, which avoids extra Win32 file-api translation.
+FILE_READ_DATA = 0x00000001
+FILE_WRITE_DATA = 0x00000002
+SYNCHRONIZE = 0x00100000
+OBJ_CASE_INSENSITIVE = 0x00000040
+FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
 FSCTL_LOCK_VOLUME = 0x00090018
 FSCTL_DISMOUNT_VOLUME = 0x00090020
 FSCTL_ALLOW_EXTENDED_DASD_IO = 0x00090083
@@ -151,6 +159,129 @@ kernel32.FindVolumeClose.argtypes = [wintypes.HANDLE]
 kernel32.FindVolumeClose.restype = wintypes.BOOL
 kernel32.QueryDosDeviceW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
 kernel32.QueryDosDeviceW.restype = wintypes.DWORD
+
+
+class _UNICODE_STRING(ctypes.Structure):
+    _fields_ = [
+        ("Length", wintypes.USHORT),
+        ("MaximumLength", wintypes.USHORT),
+        ("Buffer", wintypes.LPWSTR),
+    ]
+
+
+class _OBJECT_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [
+        ("Length", wintypes.ULONG),
+        ("RootDirectory", wintypes.HANDLE),
+        ("ObjectName", ctypes.POINTER(_UNICODE_STRING)),
+        ("Attributes", wintypes.ULONG),
+        ("SecurityDescriptor", wintypes.LPVOID),
+        ("SecurityQualityOfService", wintypes.LPVOID),
+    ]
+
+
+class _IO_STATUS_BLOCK_U(ctypes.Union):
+    _fields_ = [
+        ("Status", ctypes.c_long),
+        ("Pointer", ctypes.c_void_p),
+    ]
+
+
+class _IO_STATUS_BLOCK(ctypes.Structure):
+    _fields_ = [
+        ("u", _IO_STATUS_BLOCK_U),
+        ("Information", ctypes.c_size_t),
+    ]
+
+
+ntdll = ctypes.WinDLL("ntdll")
+ntdll.NtOpenFile.argtypes = [
+    ctypes.POINTER(wintypes.HANDLE),
+    wintypes.DWORD,
+    ctypes.POINTER(_OBJECT_ATTRIBUTES),
+    ctypes.POINTER(_IO_STATUS_BLOCK),
+    wintypes.ULONG,
+    wintypes.ULONG,
+]
+ntdll.NtOpenFile.restype = ctypes.c_long
+ntdll.NtWriteFile.argtypes = [
+    wintypes.HANDLE,
+    wintypes.HANDLE,
+    wintypes.LPVOID,
+    wintypes.LPVOID,
+    ctypes.POINTER(_IO_STATUS_BLOCK),
+    wintypes.LPVOID,
+    wintypes.ULONG,
+    ctypes.POINTER(ctypes.c_longlong),
+    wintypes.LPVOID,
+]
+ntdll.NtWriteFile.restype = ctypes.c_long
+ntdll.NtFlushBuffersFile.argtypes = [
+    wintypes.HANDLE,
+    ctypes.POINTER(_IO_STATUS_BLOCK),
+]
+ntdll.NtFlushBuffersFile.restype = ctypes.c_long
+ntdll.NtClose.argtypes = [wintypes.HANDLE]
+ntdll.NtClose.restype = ctypes.c_long
+ntdll.RtlNtStatusToDosError.argtypes = [ctypes.c_long]
+ntdll.RtlNtStatusToDosError.restype = wintypes.ULONG
+
+
+def _nt_success(status: int) -> bool:
+    return int(status) >= 0
+
+
+def _nt_status_hex(status: int) -> str:
+    return f"0x{(int(status) & 0xFFFFFFFF):08X}"
+
+
+def _nt_native_path(path: str) -> str:
+    """Convert a Win32 raw-device path into an NT object-manager path."""
+    if path.startswith("\\\\.\\"):
+        return "\\??\\" + path[4:]
+    globalroot = "\\\\?\\GLOBALROOT"
+    if path.startswith(globalroot):
+        return path[len(globalroot):]
+    if path.startswith("\\\\?\\"):
+        return "\\??\\" + path[4:]
+    return path
+
+
+def _nt_open_raw_handle(path: str):
+    """Open an existing raw device with NtOpenFile, mirroring Rufus extfs I/O."""
+    native = _nt_native_path(path)
+    name_buf = ctypes.create_unicode_buffer(native)
+    name = _UNICODE_STRING()
+    name.Length = len(native.encode("utf-16-le"))
+    name.MaximumLength = name.Length + 2
+    name.Buffer = ctypes.cast(name_buf, wintypes.LPWSTR)
+
+    attrs = _OBJECT_ATTRIBUTES()
+    attrs.Length = ctypes.sizeof(_OBJECT_ATTRIBUTES)
+    attrs.RootDirectory = None
+    attrs.ObjectName = ctypes.pointer(name)
+    attrs.Attributes = OBJ_CASE_INSENSITIVE
+    attrs.SecurityDescriptor = None
+    attrs.SecurityQualityOfService = None
+
+    iosb = _IO_STATUS_BLOCK()
+    handle = wintypes.HANDLE()
+    desired = SYNCHRONIZE | FILE_READ_DATA | FILE_WRITE_DATA
+    status = ntdll.NtOpenFile(
+        ctypes.byref(handle),
+        desired,
+        ctypes.byref(attrs),
+        ctypes.byref(iosb),
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_SYNCHRONOUS_IO_NONALERT,
+    )
+    if not _nt_success(status):
+        dos = int(ntdll.RtlNtStatusToDosError(status))
+        raise IoError(
+            f"NtOpenFile {native} 실패 NTSTATUS={_nt_status_hex(status)} (Win32 {dos})",
+            winerr=dos,
+        )
+    return handle
 
 
 class STORAGE_DEVICE_NUMBER(ctypes.Structure):
@@ -790,6 +921,7 @@ class WindowsPhysicalDevice(BlockDevice):
         self._partition_offset = int(partition_offset or 0)
         self._partition_size = int(partition_size or 0)
         self._partition_volume: _LockedVolume | None = None
+        self._nt_handle = None
         LOG.info(
             "디스크 열기 %s writable=%s sector=%s part=%s part_offset=%s part_size=%s",
             path,
@@ -918,6 +1050,12 @@ class WindowsPhysicalDevice(BlockDevice):
             kernel32.CloseHandle(old)
         except Exception:
             pass
+        if self._nt_handle is not None:
+            try:
+                ntdll.NtClose(self._nt_handle)
+            except Exception:
+                pass
+            self._nt_handle = None
         if self._writable:
             idx = _physical_index(self.path)
             if idx is not None:
@@ -1058,6 +1196,56 @@ class WindowsPhysicalDevice(BlockDevice):
         err = ctypes.get_last_error()
         if not ok or done.value != len(data):
             raise IoError(f"{offset}에서 쓰기 실패 (Win32 {err})", winerr=err)
+
+
+    def _nt_write_at(self, absolute_offset: int, data: bytes) -> None:
+        """Raw write through NtOpenFile/NtWriteFile and verify by read-back."""
+        from ext4reader.debuglog import LOG
+
+        if self._nt_handle is None:
+            self._nt_handle = _nt_open_raw_handle(self.path)
+            LOG.info("Native NT RAW 핸들 열기 성공 path=%s", _nt_native_path(self.path))
+
+        iosb = _IO_STATUS_BLOCK()
+        offset = ctypes.c_longlong(int(absolute_offset))
+        buf = (ctypes.c_char * len(data)).from_buffer_copy(data)
+        status = ntdll.NtWriteFile(
+            self._nt_handle,
+            None,
+            None,
+            None,
+            ctypes.byref(iosb),
+            buf,
+            len(data),
+            ctypes.byref(offset),
+            None,
+        )
+        if not _nt_success(status):
+            dos = int(ntdll.RtlNtStatusToDosError(status))
+            raise IoError(
+                "NtWriteFile 실패 "
+                f"offset={absolute_offset} len={len(data)} "
+                f"NTSTATUS={_nt_status_hex(status)} (Win32 {dos})",
+                winerr=dos,
+            )
+        if int(iosb.Information) != len(data):
+            raise IoError(
+                f"NtWriteFile 짧은 쓰기 offset={absolute_offset} "
+                f"{int(iosb.Information)}/{len(data)}",
+                winerr=23,
+            )
+
+        verify = self._read_at(absolute_offset, len(data))
+        if verify != data:
+            raise IoError(
+                f"NtWriteFile read-back 검증 실패 offset={absolute_offset} len={len(data)}",
+                winerr=23,
+            )
+        LOG.warning(
+            "Win32 raw write 우회: NtWriteFile 성공 offset=%s len=%s",
+            absolute_offset,
+            len(data),
+        )
 
     def _scsi_write10_direct(self, absolute_offset: int, data: bytes) -> None:
         """Send SCSI WRITE(10) with IOCTL_SCSI_PASS_THROUGH_DIRECT."""
@@ -1261,8 +1449,17 @@ class WindowsPhysicalDevice(BlockDevice):
             return
         except IoError as phys_exc:
             LOG.warning(
-                "잠금 후 PhysicalDrive 쓰기도 실패: %s; SCSI fallback 시도",
+                "잠금 후 PhysicalDrive Win32 쓰기 실패: %s; Native NT write 시도",
                 phys_exc,
+            )
+
+        try:
+            self._nt_write_at(absolute, data)
+            return
+        except IoError as nt_exc:
+            LOG.warning(
+                "Native NT write도 실패: %s; SCSI fallback 시도",
+                nt_exc,
             )
 
         self._scsi_write10(absolute, data)
@@ -1367,6 +1564,15 @@ class WindowsPhysicalDevice(BlockDevice):
             kernel32.FlushFileBuffers(self._handle)
             if self._partition_volume is not None:
                 kernel32.FlushFileBuffers(self._partition_volume.handle)
+            if self._nt_handle is not None:
+                iosb = _IO_STATUS_BLOCK()
+                status = ntdll.NtFlushBuffersFile(self._nt_handle, ctypes.byref(iosb))
+                if not _nt_success(status):
+                    from ext4reader.debuglog import LOG
+                    LOG.warning(
+                        "Native NT flush 실패 NTSTATUS=%s",
+                        _nt_status_hex(status),
+                    )
 
     def close(self) -> None:
         self._stop_ka.set()
@@ -1378,6 +1584,12 @@ class WindowsPhysicalDevice(BlockDevice):
                 kernel32.CloseHandle(self._handle)
             except Exception:
                 pass
+            if self._nt_handle is not None:
+                try:
+                    ntdll.NtClose(self._nt_handle)
+                except Exception:
+                    pass
+                self._nt_handle = None
             for item in self._volume_locks:
                 try:
                     kernel32.CloseHandle(item.handle)
