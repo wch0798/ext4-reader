@@ -878,10 +878,10 @@ def _volume_alias_candidates() -> list[tuple[str, str | None, str | None]]:
     out: list[tuple[str, str | None, str | None]] = []
     for name in guids:
         target = _dos_device_target(name)
-        out.append((r"\\?\\" + name, _volume_guid_for_fve(name), target))
+        out.append(("\\\\?\\" + name, _volume_guid_for_fve(name), target))
     for name in hard:
         target = _dos_device_target(name)
-        out.append((r"\\.\\" + name, guid_by_target.get(target) or None, target))
+        out.append(("\\\\.\\" + name, guid_by_target.get(target) or None, target))
     return out
 
 
@@ -1401,7 +1401,7 @@ class WindowsPhysicalDevice(BlockDevice):
                     else:
                         LOG.warning(
                             "PhysicalDrive%s part=%s 에 해당하는 Volume{GUID} 핸들을 찾지 못했습니다. "
-                            "숨은 HarddiskVolume 별칭을 찾습니다.",
+                            "숨은 Volume{GUID}/HarddiskVolume 별칭을 찾습니다.",
                             idx,
                             partition_number,
                         )
@@ -1410,14 +1410,15 @@ class WindowsPhysicalDevice(BlockDevice):
                             self._volume_locks.append(hidden)
                             self._partition_volume = hidden
                             LOG.info(
-                                "파티션 직접 쓰기용 숨은 볼륨 핸들 선택 %s part=%s locked=%s",
+                                "파티션 직접 쓰기용 호환 볼륨 핸들 선택 %s part=%s locked=%s fve_raw=%s",
                                 hidden.name,
                                 hidden.partition_number,
                                 hidden.locked,
+                                hidden.fve_raw,
                             )
                         else:
                             LOG.warning(
-                                "숨은 HarddiskVolume 별칭도 없어 파티션 DASD를 직접 엽니다."
+                                "Volume GUID/HarddiskVolume 별칭도 없어 파티션 DASD를 직접 엽니다."
                             )
                             direct = _open_partition_device(idx, int(partition_number))
                             if direct is not None:
