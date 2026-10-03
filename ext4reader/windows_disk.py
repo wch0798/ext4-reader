@@ -2086,6 +2086,76 @@ class WindowsPhysicalDevice(BlockDevice):
             winerr=5,
         )
 
+    def _prepare_system_helper_handle(self) -> None:
+        """Reopen PhysicalDrive with write sharing for a fresh SYSTEM open.
+
+        The normal raw handle intentionally prefers FILE_SHARE_READ only. That
+        prevents a second writer from opening the same PhysicalDrive, including
+        a LocalSystem helper. Once every administrator write path has failed,
+        keep the matching volume lock but reopen only the PhysicalDrive with
+        FILE_SHARE_READ|FILE_SHARE_WRITE so SYSTEM can create a fresh file
+        object under its own security context.
+        """
+        from ext4reader.debuglog import LOG
+
+        old = self._handle
+        old_size = int(self._size or 0)
+        old_sector = int(self.sector_size or 512)
+
+        if self._nt_handle is not None:
+            try:
+                ntdll.NtClose(self._nt_handle)
+            except Exception:
+                pass
+            self._nt_handle = None
+
+        try:
+            kernel32.CloseHandle(old)
+        except Exception:
+            pass
+
+        handle = kernel32.CreateFileW(
+            self.path,
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        if handle == INVALID_HANDLE_VALUE or handle is None:
+            err = ctypes.get_last_error()
+            self._handle = _open_handle(self.path, True)
+            raise IoError(
+                f"LocalSystem 준비용 PhysicalDrive 재오픈 실패 (Win32 {err})",
+                winerr=err,
+            )
+
+        self._handle = handle
+        _allow_extended_io(handle)
+        size, sector = _query_geometry(handle)
+        _vendor, _product, _bus, removable = _query_storage(handle)
+        if not removable:
+            kernel32.CloseHandle(handle)
+            self._handle = _open_handle(self.path, True)
+            raise IoError(
+                "LocalSystem helper는 removable 저장장치에만 허용됩니다.",
+                winerr=5,
+            )
+        if old_size and size and int(size) != old_size:
+            kernel32.CloseHandle(handle)
+            self._handle = _open_handle(self.path, True)
+            raise IoError("LocalSystem 준비 중 디스크 크기가 변경되었습니다.", winerr=1167)
+
+        self._size = int(size or old_size)
+        self.sector_size = int(sector or old_sector)
+        self._use_overlapped = False
+        LOG.warning(
+            "LocalSystem fresh-open 준비: PhysicalDrive share=READ|WRITE size=%s sector=%s",
+            self._size,
+            self.sector_size,
+        )
+
     def _fallback_after_volume_access_denied(self, offset: int, data: bytes) -> None:
         """Retry through PhysicalDrive after the matching volume is locked.
 
@@ -2148,6 +2218,7 @@ class WindowsPhysicalDevice(BlockDevice):
             )
             from ext4reader.system_raw_helper import run_system_raw_write
 
+            self._prepare_system_helper_handle()
             item = self._partition_volume
             result = run_system_raw_write(
                 physical_path=self.path,
