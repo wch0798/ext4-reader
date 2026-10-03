@@ -462,9 +462,10 @@ def recover_journal(vol: "Ext4Volume") -> ReplayStats:
     log = _JournalLog(vol)
     if log.info.start == 0:
         if vol.sb.needs_recovery:
-            _clear_ext4_recovery_flag(vol)
-            vol.dev.flush()
-            vol.reload_metadata()
+            raise JournalRecoveryError(
+                "EXT4 RECOVER 플래그가 남아 있지만 JBD2 s_start=0입니다. "
+                "s_start만으로 clean 여부를 확정할 수 없어 자동 복구를 중단합니다."
+            )
         return ReplayStats(0, 0, 0, log.info.sequence)
 
     transactions, next_sequence, _head = log.scan_transactions()
