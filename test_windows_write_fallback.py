@@ -170,6 +170,87 @@ class WriteFallbackTests(unittest.TestCase):
 
         self.assertEqual(calls, [(4755456, payload)])
 
+    def test_volume_access_denied_tries_native_nt_on_same_handle_first(self):
+        import ext4reader.windows_disk as wd
+
+        dev = self.make_dev()
+        calls = []
+        item = _LockedVolume(
+            handle=321,
+            name=r"\\.\HarddiskVolume27",
+            partition_number=1,
+            locked=True,
+            offline=False,
+        )
+
+        class FakeKernel32:
+            def SetLastError(self, value):
+                wd.ctypes.set_last_error(value)
+
+            def SetFilePointerEx(self, handle, offset, new_pos, origin):
+                return True
+
+            def WriteFile(self, handle, buf, length, done, overlapped):
+                wd.ctypes.set_last_error(5)
+                return False
+
+        dev._nt_write_volume_handle = lambda vol, offset, data: calls.append(
+            ("native-volume", vol.handle, offset, bytes(data))
+        )
+        dev._fallback_after_volume_access_denied = lambda offset, data: calls.append(
+            ("fallback", offset, bytes(data))
+        )
+
+        payload = b"n" * 4096
+        with patch.object(wd, "kernel32", FakeKernel32()):
+            dev._write_volume_seek(item, 4755456, payload)
+
+        self.assertEqual(
+            calls,
+            [("native-volume", 321, 4755456, payload)],
+        )
+
+    def test_volume_native_nt_failure_continues_to_other_raw_paths(self):
+        import ext4reader.windows_disk as wd
+
+        dev = self.make_dev()
+        calls = []
+        item = _LockedVolume(
+            handle=322,
+            name=r"\\.\HarddiskVolume27",
+            partition_number=1,
+            locked=True,
+            offline=False,
+        )
+
+        class FakeKernel32:
+            def SetLastError(self, value):
+                wd.ctypes.set_last_error(value)
+
+            def SetFilePointerEx(self, handle, offset, new_pos, origin):
+                return True
+
+            def WriteFile(self, handle, buf, length, done, overlapped):
+                wd.ctypes.set_last_error(5)
+                return False
+
+        def native_fail(vol, offset, data):
+            calls.append(("native-volume", offset))
+            raise IoError("native volume denied", winerr=5)
+
+        dev._nt_write_volume_handle = native_fail
+        dev._fallback_after_volume_access_denied = lambda offset, data: calls.append(
+            ("fallback", offset)
+        )
+
+        with patch.object(wd, "kernel32", FakeKernel32()):
+            dev._write_volume_seek(item, 4755456, b"f" * 4096)
+
+        self.assertEqual(
+            calls,
+            [("native-volume", 4755456), ("fallback", 4755456)],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -383,6 +464,43 @@ class ReaderCompatibilityTests(unittest.TestCase):
         )
         self.assertIsNone(wd._volume_guid_for_fve("\\\\.\\HarddiskVolume27"))
 
+    def test_hidden_volume_fve_candidates_include_globalroot_and_nt_target(self):
+        import ext4reader.windows_disk as wd
+
+        values = wd._fve_raw_candidates(
+            r"\\.\HarddiskVolume27",
+            None,
+            r"\Device\HarddiskVolume27",
+        )
+
+        self.assertIn(r"\\?\GLOBALROOT\Device\HarddiskVolume27", values)
+        self.assertIn(r"\Device\HarddiskVolume27", values)
+        self.assertIn(r"\\.\HarddiskVolume27", values)
+
+    def test_hidden_volume_fve_tries_multiple_identifiers_until_one_works(self):
+        import ext4reader.windows_disk as wd
+
+        calls = []
+
+        def fake_access(name, enabled):
+            calls.append((name, enabled))
+            return (name == r"\\?\GLOBALROOT\Device\HarddiskVolume27", 0 if name == r"\\?\GLOBALROOT\Device\HarddiskVolume27" else 0x80070057)
+
+        with patch.object(wd, "_FveEnableRawAccessW", object()), patch.object(
+            wd, "_fve_raw_access", side_effect=fake_access
+        ):
+            selected = wd._try_enable_fve_raw_access(
+                r"\\.\HarddiskVolume27",
+                None,
+                r"\Device\HarddiskVolume27",
+            )
+
+        self.assertEqual(
+            selected,
+            r"\\?\GLOBALROOT\Device\HarddiskVolume27",
+        )
+        self.assertEqual(calls[0][1], True)
+
     def test_fve_raw_access_success_and_hresult(self):
         import ext4reader.windows_disk as wd
 
@@ -411,6 +529,7 @@ class ReaderCompatibilityTests(unittest.TestCase):
     def test_release_disables_fve_raw_access_after_closing_volume(self):
         import ext4reader.windows_disk as wd
 
+        hidden_fve_name = r"\\?\GLOBALROOT\Device\HarddiskVolume27"
         item = _LockedVolume(
             handle=91,
             name="\\\\.\\HarddiskVolume27",
@@ -418,6 +537,7 @@ class ReaderCompatibilityTests(unittest.TestCase):
             locked=True,
             offline=False,
             volume_guid=self.VOLUME_GUID,
+            fve_name=hidden_fve_name,
             fve_raw=True,
         )
         calls = []
@@ -430,7 +550,7 @@ class ReaderCompatibilityTests(unittest.TestCase):
 
         self.assertEqual(calls[0], ("online", 91))
         self.assertEqual(calls[1], ("close", 91))
-        self.assertEqual(calls[2], ("fve", self.VOLUME_GUID, False))
+        self.assertEqual(calls[2], ("fve", hidden_fve_name, False))
         self.assertFalse(item.fve_raw)
 
     def test_bus_names_cover_usb_sd_and_mmc_readers(self):
