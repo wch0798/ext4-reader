@@ -21,6 +21,7 @@ class UsbDkParsingTests(unittest.TestCase):
         self.assertEqual(ident.pid, 0x0177)
         self.assertEqual(ident.device_id, r"USB\VID_0BDA&PID_0177")
         self.assertEqual(ident.instance_id, "20121112761000000")
+        self.assertEqual(ident.lun, 0)
 
     def test_parse_bulk_only_endpoints(self):
         config = bytes([9, 2, 32, 0, 1, 1, 0, 0x80, 50])
@@ -80,6 +81,7 @@ class UsbDkBotTests(unittest.TestCase):
         dev._closed = False
         dev.bulk_in = 0x81
         dev.bulk_out = 0x02
+        dev.lun = 0
         dev.sector_size = 512
         dev.size = 1024 * 1024
         dev.partition_offset = 4096
