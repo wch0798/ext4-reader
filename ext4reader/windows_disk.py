@@ -29,6 +29,7 @@ IOCTL_STORAGE_CHECK_VERIFY2 = 0x002D0800
 STALE_HANDLE_ERRORS = {6, 31, 995, 1167}  # invalid handle / gen fail / aborted / unplugged
 
 IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = 0x000700A0
+IOCTL_DISK_IS_WRITABLE = 0x00070024
 IOCTL_STORAGE_QUERY_PROPERTY = 0x002D1400
 
 BUS_NAMES = {
@@ -384,6 +385,25 @@ def _allow_extended_io(handle) -> None:
         pass
 
 
+def _is_writable_ioctl(handle) -> tuple[bool, int]:
+    """Ask the storage stack whether writes are allowed on this device."""
+    returned = wintypes.DWORD(0)
+    kernel32.SetLastError(0)
+    ok = kernel32.DeviceIoControl(
+        handle,
+        IOCTL_DISK_IS_WRITABLE,
+        None,
+        0,
+        None,
+        0,
+        ctypes.byref(returned),
+        None,
+    )
+    if ok:
+        return True, 0
+    return False, ctypes.get_last_error()
+
+
 def _lock_volumes_for_disk(disk_index: int) -> list[_LockedVolume]:
     """Lock/dismount Windows volumes on this disk and keep their handles open.
 
@@ -481,56 +501,86 @@ def _open_handle(path: str, writable: bool):
 
 
 def _open_partition_device(disk_index: int, partition_number: int) -> _LockedVolume | None:
-    """Open the partition PDO directly when Mount Manager exposes no Volume{GUID}.
-
-    Linux/ext4 partitions often have no drive letter and, on some Windows
-    systems, are not returned by FindFirstVolumeW at all.  disk.sys still
-    exposes the partition device as
-    \\?\GLOBALROOT\Device\HarddiskN\PartitionM, which can be opened as a
-    direct-access volume/partition handle.
-    """
+    """Open a partition DASD handle when Mount Manager exposes no Volume GUID."""
     from ext4reader.debuglog import LOG
 
-    path = rf"\\?\GLOBALROOT\Device\Harddisk{disk_index}\Partition{partition_number}"
-    handle = kernel32.CreateFileW(
-        path,
-        GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        None,
-        OPEN_EXISTING,
-        0,
-        None,
-    )
-    if handle == INVALID_HANDLE_VALUE or handle is None:
-        err = ctypes.get_last_error()
-        LOG.warning("파티션 장치 직접 열기 실패 %s (Win32 %s)", path, err)
-        return None
+    # The Win32 DASD alias is preferable. GLOBALROOT is retained as a fallback
+    # because device naming differs across Windows/storage drivers.
+    candidates = [
+        rf"\\.\Harddisk{disk_index}Partition{partition_number}",
+        rf"\\?\GLOBALROOT\Device\Harddisk{disk_index}\Partition{partition_number}",
+    ]
+    last_err = 0
 
-    lock_ok = False
-    try:
-        try:
-            _ioctl(handle, FSCTL_LOCK_VOLUME)
-            lock_ok = True
-            LOG.info("파티션 장치 잠금 성공 %s", path)
-        except OSError as exc:
-            # RAW/unknown filesystems may have no mounted filesystem to lock.
-            LOG.info("파티션 장치 잠금 생략/실패 %s: %s", path, exc)
-        try:
-            _ioctl(handle, FSCTL_DISMOUNT_VOLUME)
-            LOG.info("파티션 장치 분리 성공 %s", path)
-        except OSError as exc:
-            LOG.info("파티션 장치 분리 생략/실패 %s: %s", path, exc)
-        _allow_extended_io(handle)
-        return _LockedVolume(
-            handle=int(handle),
-            name=path,
-            partition_number=int(partition_number),
-            locked=lock_ok,
+    for path in candidates:
+        handle = kernel32.CreateFileW(
+            path,
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            0,
+            None,
         )
-    except Exception:
-        kernel32.CloseHandle(handle)
-        raise
+        if handle == INVALID_HANDLE_VALUE or handle is None:
+            last_err = ctypes.get_last_error()
+            LOG.warning("파티션 DASD 열기 실패 %s (Win32 %s)", path, last_err)
+            continue
 
+        try:
+            writable_ok, writable_err = _is_writable_ioctl(handle)
+            if writable_ok:
+                LOG.info("파티션 DASD 쓰기 가능 확인 %s", path)
+            else:
+                LOG.warning(
+                    "파티션 DASD IOCTL_DISK_IS_WRITABLE 실패 %s (Win32 %s)",
+                    path,
+                    writable_err,
+                )
+
+            lock_ok = False
+            try:
+                _ioctl(handle, FSCTL_LOCK_VOLUME)
+                lock_ok = True
+                LOG.info("파티션 장치 잠금 성공 %s", path)
+            except OSError as exc:
+                LOG.info("파티션 장치 잠금 생략/실패 %s: %s", path, exc)
+            try:
+                _ioctl(handle, FSCTL_DISMOUNT_VOLUME)
+                LOG.info("파티션 장치 분리 성공 %s", path)
+            except OSError as exc:
+                LOG.info("파티션 장치 분리 생략/실패 %s: %s", path, exc)
+            _allow_extended_io(handle)
+
+            # ERROR_WRITE_PROTECT (19) is decisive: retrying another alias will
+            # not bypass a hardware/media or partition read-only condition.
+            if not writable_ok and writable_err == 19:
+                kernel32.CloseHandle(handle)
+                raise IoError(
+                    f"{path} 는 Windows에서 쓰기 금지 상태입니다. "
+                    "SD 어댑터 LOCK 스위치 또는 디스크/파티션 읽기 전용 속성을 확인하세요. (Win32 19)",
+                    winerr=19,
+                )
+
+            return _LockedVolume(
+                handle=int(handle),
+                name=path,
+                partition_number=int(partition_number),
+                locked=lock_ok,
+            )
+        except IoError:
+            raise
+        except Exception:
+            kernel32.CloseHandle(handle)
+            raise
+
+    LOG.warning(
+        "파티션 DASD를 열 수 없습니다 PhysicalDrive%s part=%s (마지막 Win32 %s)",
+        disk_index,
+        partition_number,
+        last_err,
+    )
+    return None
 
 def list_physical_disks() -> list[DiskInfo]:
     disks: list[DiskInfo] = []
@@ -651,6 +701,21 @@ class WindowsPhysicalDevice(BlockDevice):
                                 direct.locked,
                             )
         self._handle = _open_handle(path, writable)
+        if writable:
+            writable_ok, writable_err = _is_writable_ioctl(self._handle)
+            if writable_ok:
+                LOG.info("물리 디스크 IOCTL_DISK_IS_WRITABLE: 쓰기 가능")
+            else:
+                LOG.warning(
+                    "물리 디스크 IOCTL_DISK_IS_WRITABLE 실패 (Win32 %s)",
+                    writable_err,
+                )
+                if writable_err == 19:
+                    raise IoError(
+                        "저장장치가 Windows에서 쓰기 금지 상태입니다. "
+                        "SD 어댑터 LOCK 스위치 또는 디스크 읽기 전용 속성을 확인하세요. (Win32 19)",
+                        winerr=19,
+                    )
         self._use_overlapped = True
         self._size, geo_ss = _query_geometry(self._handle)
         if geo_ss:
