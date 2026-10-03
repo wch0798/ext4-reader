@@ -23,28 +23,76 @@ class Bitmap:
     def clear(self, i: int) -> None:
         self.data[i >> 3] &= ~(1 << (i & 7))
 
+    def _skip_set(self, i: int, limit: int) -> int:
+        data = self.data
+        n = min(self.nbits, limit)
+        while i < n and self.test(i):
+            if (i & 7) == 0 and i + 8 <= n and data[i >> 3] == 0xFF:
+                i += 8
+                while i + 8 <= n and data[i >> 3] == 0xFF:
+                    i += 8
+                continue
+            i += 1
+        return i
+
+    def _skip_clear(self, i: int, limit: int) -> int:
+        data = self.data
+        n = min(self.nbits, limit)
+        while i < n and not self.test(i):
+            if (i & 7) == 0 and i + 8 <= n and data[i >> 3] == 0:
+                i += 8
+                while i + 8 <= n and data[i >> 3] == 0:
+                    i += 8
+                continue
+            i += 1
+        return i
+
+    def _find_run_from(self, first: int, last_start: int, count: int) -> int:
+        n = self.nbits
+        i = first
+        while i < last_start:
+            if self.test(i):
+                nxt = self._skip_set(i, last_start)
+                if nxt <= i:
+                    break
+                i = nxt
+                continue
+            free_end = self._skip_clear(i, n)
+            if free_end - i >= count:
+                return i
+            if free_end <= i:
+                break
+            i = free_end
+        return -1
+
     def find_run(self, count: int, hint: int = 0) -> int:
         n = self.nbits
-        if count <= 0:
+        if count <= 0 or count > n:
             return -1
-        start = hint
-        for _wrap in range(2):
-            i = start
-            while i < n:
-                if self.test(i):
-                    i += 1
-                    continue
-                run = 1
-                while run < count and i + run < n and not self.test(i + run):
-                    run += 1
-                if run >= count:
-                    return i
-                i += run
-            start = 0
+        if hint < 0 or hint >= n:
+            hint = 0
+        bit = self._find_run_from(hint, n, count)
+        if bit >= 0:
+            return bit
+        if hint:
+            return self._find_run_from(0, hint, count)
         return -1
 
     def find_one(self, hint: int = 0) -> int:
         return self.find_run(1, hint)
+
+    def find_last_clear(self) -> int:
+        """Highest free bit. Metadata blocks use this so the append cursor stays put."""
+        data = self.data
+        i = self.nbits - 1
+        while i >= 0:
+            if (i & 7) == 7 and data[i >> 3] == 0xFF:
+                i -= 8
+                continue
+            if not self.test(i):
+                return i
+            i -= 1
+        return -1
 
     def mark_run(self, start: int, count: int) -> None:
         for i in range(start, start + count):
@@ -135,28 +183,52 @@ def _init_inode_bitmap(vol, gd: GroupDesc) -> Bitmap:
 
 
 def read_block_bitmap(vol, gd: GroupDesc) -> Bitmap:
+    cache = getattr(vol, "_block_bm_cache", None)
+    if cache is not None and gd.group in cache:
+        return cache[gd.group]
     start, end = group_block_range(vol, gd.group)
     nbits = end - start
     if gd.flags & C.BG_BLOCK_UNINIT:
-        return _init_block_bitmap(vol, gd)
-    raw = bytearray(vol.read_block(gd.block_bitmap))
-    return Bitmap(raw, nbits)
+        bm = _init_block_bitmap(vol, gd)
+    else:
+        bm = Bitmap(bytearray(vol.read_block(gd.block_bitmap)), nbits)
+    if cache is not None:
+        cache[gd.group] = bm
+    return bm
 
 
 def read_inode_bitmap(vol, gd: GroupDesc) -> Bitmap:
+    cache = getattr(vol, "_inode_bm_cache", None)
+    if cache is not None and gd.group in cache:
+        return cache[gd.group]
     if gd.flags & C.BG_INODE_UNINIT:
-        return _init_inode_bitmap(vol, gd)
-    raw = bytearray(vol.read_block(gd.inode_bitmap))
-    return Bitmap(raw, vol.sb.inodes_per_group)
+        bm = _init_inode_bitmap(vol, gd)
+    else:
+        bm = Bitmap(bytearray(vol.read_block(gd.inode_bitmap)), vol.sb.inodes_per_group)
+    if cache is not None:
+        cache[gd.group] = bm
+    return bm
 
 
 def write_block_bitmap(vol, gd: GroupDesc, bm: Bitmap) -> None:
     apply_bitmap_csum(vol, gd, "block", bm)
+    cache = getattr(vol, "_block_bm_cache", None)
+    dirty = getattr(vol, "_dirty_block_bm", None)
+    if cache is not None and dirty is not None:
+        cache[gd.group] = bm
+        dirty.add(gd.group)
+        return
     vol.write_block(gd.block_bitmap, bytes(bm.data[: vol.sb.block_size]).ljust(vol.sb.block_size, b"\x00"))
 
 
 def write_inode_bitmap(vol, gd: GroupDesc, bm: Bitmap) -> None:
     apply_bitmap_csum(vol, gd, "inode", bm)
+    cache = getattr(vol, "_inode_bm_cache", None)
+    dirty = getattr(vol, "_dirty_inode_bm", None)
+    if cache is not None and dirty is not None:
+        cache[gd.group] = bm
+        dirty.add(gd.group)
+        return
     vol.write_block(gd.inode_bitmap, bytes(bm.data[: vol.sb.block_size]).ljust(vol.sb.block_size, b"\x00"))
 
 
@@ -164,14 +236,19 @@ class AllocError(RuntimeError):
     pass
 
 
-def alloc_blocks(vol, count: int, prefer_group: int | None = None) -> list[int]:
+def alloc_blocks(vol, count: int, prefer_group: int | None = None, *, metadata: bool = False) -> list[int]:
     if count <= 0:
         return []
     ng = vol.sb.groups_count
-    order = list(range(ng))
-    if prefer_group is not None:
-        prefer_group %= ng
-        order = list(range(prefer_group, ng)) + list(range(prefer_group))
+    if metadata:
+        # Extent index blocks come from the end of the disk. Taking them from
+        # the append cursor splits every large sequential write into 1MB extents.
+        order = list(range(ng - 1, -1, -1))
+    else:
+        order = list(range(ng))
+        if prefer_group is not None:
+            prefer_group %= ng
+            order = list(range(prefer_group, ng)) + list(range(prefer_group))
     remaining = count
     out: list[int] = []
     for g in order:
@@ -182,25 +259,43 @@ def alloc_blocks(vol, count: int, prefer_group: int | None = None) -> list[int]:
             continue
         bm = read_block_bitmap(vol, gd)
         start, _end = group_block_range(vol, g)
+        hints = getattr(vol, "_alloc_hint", None)
+        allocated_here = False
         # greedy: largest possible run then smaller
         while remaining > 0 and gd.free_blocks > 0:
-            want = min(remaining, gd.free_blocks, C.EXT_UNINIT_MAX_LEN)
-            bit = bm.find_run(want)
-            got = want
-            if bit < 0:
-                bit = bm.find_one()
-                got = 1
+            if metadata:
+                bit = bm.find_last_clear()
                 if bit < 0:
                     break
-                # extend
-                while got < remaining and bit + got < bm.nbits and not bm.test(bit + got):
-                    got += 1
+                got = 1
+            else:
+                want = min(remaining, gd.free_blocks, C.EXT_UNINIT_MAX_LEN)
+                hint = hints.get(g, 0) if hints is not None else 0
+                bit = -1
+                got = want
+                if hint and bm._skip_clear(hint, hint + want) == hint + want:
+                    bit = hint
+                else:
+                    bit = bm.find_run(want)
+                if bit < 0:
+                    bit = bm.find_one()
+                    got = 1
+                    if bit < 0:
+                        break
+                    # extend
+                    while got < remaining and bit + got < bm.nbits and not bm.test(bit + got):
+                        got += 1
             bm.mark_run(bit, got)
             gd.free_blocks -= got
             vol.sb.free_blocks_count -= got
             for i in range(got):
                 out.append(start + bit + i)
             remaining -= got
+            allocated_here = True
+            if hints is not None and not metadata:
+                hints[g] = bit + got
+        if not allocated_here:
+            continue
         write_block_bitmap(vol, gd, bm)
         update_group_desc_fields(vol.sb, gd)
         vol.dirty_groups.add(g)
@@ -263,6 +358,51 @@ def free_blocks(vol, blocks: list[int]) -> None:
                 bm.clear(bit)
                 gd.free_blocks += 1
                 vol.sb.free_blocks_count += 1
+        write_block_bitmap(vol, gd, bm)
+        update_group_desc_fields(vol.sb, gd)
+        vol.dirty_groups.add(g)
+        vol.dirty_super = True
+
+
+def free_phys_runs(vol, runs: list[tuple[int, int]]) -> None:
+    """Free physical block runs without building a list of every block."""
+    by_group: dict[int, list[tuple[int, int]]] = {}
+    for phys, length in runs:
+        if length <= 0:
+            continue
+        end = phys + length
+        cursor = phys
+        while cursor < end:
+            if cursor < vol.sb.first_data_block:
+                cursor += 1
+                continue
+            g = (cursor - vol.sb.first_data_block) // vol.sb.blocks_per_group
+            _start, gend = group_block_range(vol, g)
+            run_end = min(end, gend)
+            by_group.setdefault(g, []).append((cursor, run_end - cursor))
+            cursor = run_end
+    for g, pieces in by_group.items():
+        gd = vol.groups[g]
+        bm = read_block_bitmap(vol, gd)
+        start, _ = group_block_range(vol, g)
+        freed = 0
+        for b, length in pieces:
+            bit = b - start
+            for i in range(length):
+                idx = bit + i
+                if 0 <= idx < bm.nbits and bm.test(idx):
+                    bm.clear(idx)
+                    freed += 1
+        if not freed:
+            continue
+        gd.free_blocks += freed
+        vol.sb.free_blocks_count += freed
+        hints = getattr(vol, "_alloc_hint", None)
+        if hints is not None:
+            first_bit = min(b - start for b, _n in pieces)
+            prev = hints.get(g)
+            if prev is None or first_bit < prev:
+                hints[g] = max(0, first_bit)
         write_block_bitmap(vol, gd, bm)
         update_group_desc_fields(vol.sb, gd)
         vol.dirty_groups.add(g)

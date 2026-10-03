@@ -31,6 +31,40 @@ from ext4reader.writer import (
 )
 
 
+_RECYCLE_INI = (
+    b"[.ShellClassInfo]\r\n"
+    b"CLSID={645FF040-5081-101B-9F08-00AA002F954E}\r\n"
+    b"LocalizedResourceName=@%SystemRoot%\\system32\\shell32.dll,-8964\r\n"
+)
+
+
+def recycle_repair_targets(path: str) -> tuple[str, str] | None:
+    """Paths under an existing ``$RECYCLE.BIN`` that Explorer expects to exist."""
+    parts = [p for p in path.replace("\\", "/").split("/") if p]
+    if not parts or parts[0].upper() != "$RECYCLE.BIN":
+        return None
+    bin_dir = "/" + parts[0]
+    sid_dir = ""
+    if len(parts) >= 2 and parts[1].upper().startswith("S-1-"):
+        sid_dir = bin_dir + "/" + parts[1]
+    return bin_dir, sid_dir
+
+
+def _brief_args(args: tuple) -> str:
+    parts: list[str] = []
+    for arg in args:
+        if isinstance(arg, memoryview):
+            parts.append(f"<memoryview {len(arg)}>")
+        elif isinstance(arg, (bytes, bytearray)):
+            parts.append(f"<{type(arg).__name__} {len(arg)}>")
+        else:
+            text = repr(arg)
+            if len(text) > 160:
+                text = text[:160] + "…"
+            parts.append(text)
+    return "(" + ", ".join(parts) + ")"
+
+
 def find_fsptool() -> str | None:
     dll = find_winfsp_dll()
     if not dll:
@@ -224,6 +258,49 @@ class Ext4FuseOps:
         self._lock = threading.RLock()
         self._logged: set[tuple] = set()
         self._stop = threading.Event()
+        self._path_ino: dict[str, int] = {}
+        self._ra: tuple | None = None
+        self._wb: list | None = None
+
+    def _node(self, path: str):
+        ino = self._path_ino.get(path)
+        if ino:
+            try:
+                return self.vol.read_inode(ino)
+            except Exception:
+                self._path_ino.pop(path, None)
+        node = lookup_path(self.vol, path)
+        self._path_ino[path] = node.ino
+        if len(self._path_ino) > 8192:
+            self._path_ino.clear()
+            self._path_ino[path] = node.ino
+        return node
+
+    def _visible_size(self, node) -> int:
+        size = node.size
+        wb = self._wb
+        if wb and wb[0] == node.ino:
+            end = wb[1] + len(wb[2])
+            if end > size:
+                size = end
+        return size
+
+    def _wb_flush(self) -> None:
+        wb = self._wb
+        if not wb:
+            return
+        ino, off, buf = wb
+        if not buf:
+            self._wb = None
+            return
+        node = self.vol.read_inode(ino)
+        write_range(self.vol, node, off, bytes(buf), flush=False)
+        self._wb = None
+
+    def _drop_paths(self) -> None:
+        self._wb_flush()
+        self._path_ino.clear()
+        self._ra = None
 
     def _ro(self) -> None:
         if self.read_only:
@@ -261,7 +338,7 @@ class Ext4FuseOps:
                 self._check_stop()
                 return fn(*args)
         except FileNotFoundError as exc:
-            LOG.debug("ENOENT %s %s", getattr(fn, "__name__", fn), args)
+            LOG.debug("ENOENT %s %s", getattr(fn, "__name__", fn), _brief_args(args))
             raise self._err(errno.ENOENT) from exc
         except PermissionError as exc:
             LOG.warning("EACCES %s %s: %s", getattr(fn, "__name__", fn), args, exc)
@@ -283,20 +360,20 @@ class Ext4FuseOps:
             key = (getattr(fn, "__name__", str(fn)), type(exc).__name__, str(exc)[:200])
             if key not in self._logged:
                 self._logged.add(key)
-                LOG.exception("디스크 I/O 실패 %s %s", getattr(fn, "__name__", fn), args)
+                LOG.exception("디스크 I/O 실패 %s %s", getattr(fn, "__name__", fn), _brief_args(args))
             raise self._err(errno.EIO) from exc
         except OSError as exc:
             from fuse import FuseOSError
 
             if isinstance(exc, FuseOSError):
                 raise
-            LOG.exception("OSError %s %s", getattr(fn, "__name__", fn), args)
+            LOG.exception("OSError %s %s", getattr(fn, "__name__", fn), _brief_args(args))
             raise self._err(getattr(exc, "errno", errno.EIO) or errno.EIO) from exc
         except Exception as exc:
             key = (getattr(fn, "__name__", str(fn)), type(exc).__name__, str(exc)[:200])
             if key not in self._logged:
                 self._logged.add(key)
-                LOG.exception("FUSE 처리 실패 %s %s", getattr(fn, "__name__", fn), args)
+                LOG.exception("FUSE 처리 실패 %s %s", getattr(fn, "__name__", fn), _brief_args(args))
             raise self._err(errno.EIO) from exc
 
     def init(self, path):
@@ -308,8 +385,59 @@ class Ext4FuseOps:
     def getattr(self, path, fh=None):
         return self._wrap(self._getattr, self._fuse_path(path))
 
+    def _ensure_recycle_ini(self, dir_path: str) -> None:
+        ini_path = dir_path.rstrip("/") + "/desktop.ini"
+        try:
+            node = lookup_path(self.vol, ini_path)
+        except FileNotFoundError:
+            parent, name = lookup_parent(self.vol, ini_path)
+            node = create_empty_file(self.vol, parent, name, 0o644)
+            self._drop_paths()
+            write_range(self.vol, node, 0, _RECYCLE_INI, flush=True)
+            return
+        if node.is_dir or node.size > 4096:
+            return
+        data = read_range(self.vol, node, 0, node.size) if node.size else b""
+        folded = data.upper().replace(b"\x00", b"")
+        if b"645FF040-5081-101B-9F08-00AA002F954E" in folded:
+            return
+        node = self.vol.read_inode(node.ino)
+        write_range(self.vol, node, 0, _RECYCLE_INI, flush=True)
+        if node.size != len(_RECYCLE_INI):
+            set_file_size(self.vol, self.vol.read_inode(node.ino), len(_RECYCLE_INI))
+
+    def _materialize_recycle(self, path: str) -> None:
+        if self.read_only:
+            return
+        targets = recycle_repair_targets(path)
+        if targets is None:
+            return
+        bin_dir, sid_dir = targets
+        try:
+            bin_node = lookup_path(self.vol, bin_dir)
+        except FileNotFoundError:
+            return
+        if not bin_node.is_dir:
+            return
+        self._ensure_recycle_ini(bin_dir)
+        if not sid_dir:
+            return
+        try:
+            sid_node = lookup_path(self.vol, sid_dir)
+        except FileNotFoundError:
+            parent, name = lookup_parent(self.vol, sid_dir)
+            mkdir(self.vol, parent, name)
+            self._drop_paths()
+            sid_node = lookup_path(self.vol, sid_dir)
+        if sid_node.is_dir:
+            self._ensure_recycle_ini(sid_dir)
+
     def _getattr(self, path):
-        node = lookup_path(self.vol, path)
+        try:
+            self._materialize_recycle(path)
+        except Exception:
+            LOG.exception("휴지통 항목 준비 실패 %s", path)
+        node = self._node(path)
         mode = int(node.mode)
         if not stat.S_IFMT(mode):
             mode |= stat.S_IFDIR if node.is_dir else stat.S_IFREG
@@ -323,19 +451,19 @@ class Ext4FuseOps:
             "st_nlink": min(nlink, 65535),
             "st_uid": node.uid,
             "st_gid": node.gid,
-            "st_size": node.size,
+            "st_size": self._visible_size(node),
             "st_atime": node.atime or 0,
             "st_mtime": node.mtime or 0,
             "st_ctime": node.ctime or 0,
             "st_blocks": node.blocks,
-            "st_blksize": self.vol.sb.block_size,
+            "st_blksize": max(self.vol.sb.block_size, 65536),
         }
 
     def readdir(self, path, fh):
         return self._wrap(self._readdir, self._fuse_path(path))
 
     def _readdir(self, path):
-        node = lookup_path(self.vol, path)
+        node = self._node(path)
         if not node.is_dir:
             raise self._err(errno.ENOTDIR)
         names = [".", ".."]
@@ -355,7 +483,7 @@ class Ext4FuseOps:
         if self.read_only and writing:
             raise self._err(errno.EROFS)
         try:
-            node = lookup_path(self.vol, path)
+            node = self._node(path)
         except FileNotFoundError:
             if not creat:
                 raise
@@ -366,6 +494,7 @@ class Ext4FuseOps:
         if trunc:
             if node.is_dir:
                 raise self._err(errno.EISDIR)
+            self._discard_wb(node.ino)
             set_file_size(self.vol, node, 0)
         return 0
 
@@ -375,8 +504,18 @@ class Ext4FuseOps:
             return self.mkdir(path, mode)
         return self.create(path, mode)
 
+    def _discard_wb(self, ino: int) -> None:
+        if self._wb and self._wb[0] == ino:
+            self._wb = None
+            self._ra = None
+        elif self._wb:
+            self._wb_flush()
+            self._ra = None
+        else:
+            self._ra = None
+
     def _lookup(self, path):
-        return lookup_path(self.vol, path)
+        return self._node(path)
 
     def opendir(self, path):
         self._wrap(self._lookup, self._fuse_path(path))
@@ -390,12 +529,15 @@ class Ext4FuseOps:
         try:
             node = lookup_path(self.vol, path)
         except FileNotFoundError:
+            self._drop_paths()
             parent, name = lookup_parent(self.vol, path)
             create_empty_file(self.vol, parent, name, mode & 0o777)
             return 0
         if node.is_dir:
             raise self._err(errno.EISDIR)
-        set_file_size(self.vol, node, 0)
+        self._discard_wb(node.ino)
+        self._drop_paths()
+        set_file_size(self.vol, self.vol.read_inode(node.ino), 0)
         return 0
 
     def mkdir(self, path, mode):
@@ -409,6 +551,7 @@ class Ext4FuseOps:
                 return 0
             raise self._err(errno.EEXIST)
         except FileNotFoundError:
+            self._drop_paths()
             parent, name = lookup_parent(self.vol, path)
             mkdir(self.vol, parent, name)
 
@@ -421,52 +564,101 @@ class Ext4FuseOps:
         return self._wrap(self._unlink, self._fuse_path(path))
 
     def _unlink(self, path):
+        self._drop_paths()
         parent, name = lookup_parent(self.vol, path)
         unlink_checked(self.vol, parent, name)
 
     def rename(self, old, new):
         self._ro()
-        return self._wrap(move_entry, self.vol, self._fuse_path(old), self._fuse_path(new), True)
+        return self._wrap(self._rename, self._fuse_path(old), self._fuse_path(new))
+
+    def _rename(self, old, new):
+        self._drop_paths()
+        move_entry(self.vol, old, new, True)
 
     def read(self, path, size, offset, fh):
         return self._wrap(self._read, self._fuse_path(path), size, offset)
 
     def _read(self, path, size, offset):
-        node = lookup_path(self.vol, path)
-        return read_range(self.vol, node, offset, size)
+        node = self._node(path)
+        if self._wb and self._wb[0] == node.ino:
+            self._wb_flush()
+            node = self.vol.read_inode(node.ino)
+        if size <= 0 or offset >= node.size:
+            return b""
+        ra = self._ra
+        if ra and ra[0] == node.ino and ra[1] <= offset and offset + size <= ra[1] + len(ra[2]):
+            rel = offset - ra[1]
+            return ra[2][rel : rel + size]
+        need = min(size, node.size - offset)
+        fetch = need
+        if need < 1024 * 1024:
+            fetch = min(1024 * 1024, node.size - offset)
+        data = read_range(self.vol, node, offset, fetch)
+        if fetch > need and len(data) > need:
+            self._ra = (node.ino, offset, data)
+            return data[:need]
+        self._ra = None
+        return data
 
     def write(self, path, data, offset, fh):
         self._ro()
         return self._wrap(self._write, self._fuse_path(path), data, offset)
 
     def _write(self, path, data, offset):
-        node = lookup_path(self.vol, path)
-        return write_range(self.vol, node, offset, data, flush=False)
+        self._ra = None
+        node = self._node(path)
+        if isinstance(data, memoryview):
+            data = data.tobytes()
+        elif not isinstance(data, bytes):
+            data = bytes(data)
+        wb = self._wb
+        if (
+            wb
+            and wb[0] == node.ino
+            and wb[1] + len(wb[2]) == offset
+            and len(wb[2]) + len(data) <= 1024 * 1024
+        ):
+            wb[2].extend(data)
+            return len(data)
+        self._wb_flush()
+        if len(data) >= 1024 * 1024:
+            node = self.vol.read_inode(node.ino)
+            return write_range(self.vol, node, offset, data, flush=False)
+        self._wb = [node.ino, offset, bytearray(data)]
+        return len(data)
 
     def truncate(self, path, length, fh=None):
         self._ro()
         return self._wrap(self._truncate, self._fuse_path(path), length)
 
     def _truncate(self, path, length):
-        node = lookup_path(self.vol, path)
-        set_file_size(self.vol, node, length)
+        node = self._node(path)
+        self._discard_wb(node.ino)
+        set_file_size(self.vol, self.vol.read_inode(node.ino), length)
 
     def flush(self, path, fh):
         with self._lock:
-            self.vol.flush_metadata()
+            self._wb_flush()
+            self.vol.commit_metadata(sync=False)
         return 0
 
     def fsync(self, path, datasync, fh):
         with self._lock:
-            self.vol.flush_metadata()
+            self._wb_flush()
+            self.vol.commit_metadata(sync=True)
         return 0
 
     def release(self, path, fh):
         with self._lock:
             try:
-                self.vol.flush_metadata()
+                self._wb_flush()
             except Exception:
-                pass
+                LOG.exception("파일 닫기 전 쓰기 반영 실패")
+            try:
+                self.vol.commit_metadata(sync=True)
+            except Exception:
+                LOG.exception("파일 닫기 전 디스크 반영 실패")
         return 0
 
     def chmod(self, path, mode):
@@ -479,7 +671,7 @@ class Ext4FuseOps:
         return self._wrap(self._utimens, self._fuse_path(path), times)
 
     def _utimens(self, path, times):
-        node = lookup_path(self.vol, path)
+        node = self._node(path)
         if times:
             node.set_atime_mtime(int(times[0]), int(times[1]))
         else:
@@ -495,7 +687,8 @@ class Ext4FuseOps:
 
     def fsyncdir(self, path, datasync, fh):
         with self._lock:
-            self.vol.flush_metadata()
+            self._wb_flush()
+            self.vol.commit_metadata(sync=True)
         return 0
 
     def statfs(self, path):
@@ -867,6 +1060,8 @@ def _run_fuse(ops, letter: str, label: str, read_only: bool, session: MountSessi
     bound._stop = session.stop
     session.ops = bound
     mountpoint = _fuse_mountpoint(letter)
+    bs = bound.vol.sb.block_size
+    sector = 4096 if bs >= 4096 else 512
     kwargs = {
         "foreground": True,
         "nothreads": True,
@@ -876,6 +1071,12 @@ def _run_fuse(ops, letter: str, label: str, read_only: bool, session: MountSessi
         "volname": _safe_volname(label),
         "fsname": "fuse",
         "FileSecurity": "D:P(A;;FA;;;WD)",
+        # 64KB clusters let Windows ask for larger reads and writes.
+        "SectorSize": sector,
+        "SectorsPerAllocationUnit": 65536 // sector,
+        "FileInfoTimeout": 2000,
+        "DirInfoTimeout": 2000,
+        "VolumeInfoTimeout": 2000,
     }
     LOG.info(
         "FUSE 시작 mount=%s fuse_mp=%s volname=%s ro=%s kwargs=%s",

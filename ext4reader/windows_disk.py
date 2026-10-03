@@ -10,7 +10,7 @@ import threading
 from ctypes import wintypes
 from dataclasses import dataclass
 
-from ext4reader.io_backend import BlockDevice, IoError
+from ext4reader.io_backend import IO_CHUNK, BlockDevice, IoError
 
 GENERIC_READ = 0x80000000
 GENERIC_WRITE = 0x40000000
@@ -112,6 +112,27 @@ kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 kernel32.CloseHandle.restype = wintypes.BOOL
 kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
 kernel32.FlushFileBuffers.restype = wintypes.BOOL
+kernel32.GetOverlappedResult.argtypes = [
+    wintypes.HANDLE,
+    wintypes.LPVOID,
+    ctypes.POINTER(wintypes.DWORD),
+    wintypes.BOOL,
+]
+kernel32.GetOverlappedResult.restype = wintypes.BOOL
+
+# Synchronous handle + OVERLAPPED offset: one call, file pointer stays put.
+class _OVERLAPPED(ctypes.Structure):
+    _fields_ = [
+        ("Internal", ctypes.c_void_p),
+        ("InternalHigh", ctypes.c_void_p),
+        ("Offset", wintypes.DWORD),
+        ("OffsetHigh", wintypes.DWORD),
+        ("hEvent", wintypes.HANDLE),
+    ]
+
+
+ERROR_IO_PENDING = 997
+ERROR_INVALID_PARAMETER = 87
 kernel32.SetLastError.argtypes = [wintypes.DWORD]
 kernel32.SetLastError.restype = None
 kernel32.FindFirstVolumeW.argtypes = [wintypes.LPWSTR, wintypes.DWORD]
@@ -489,6 +510,7 @@ class WindowsPhysicalDevice(BlockDevice):
             if idx is not None:
                 self._volume_locks = _lock_volumes_for_disk(idx)
         self._handle = _open_handle(path, writable)
+        self._use_overlapped = True
         self._size, geo_ss = _query_geometry(self._handle)
         if geo_ss:
             self.sector_size = geo_ss
@@ -548,6 +570,7 @@ class WindowsPhysicalDevice(BlockDevice):
                         pass
                 self._volume_locks = _lock_volumes_for_disk(idx)
         self._handle = _open_handle(self.path, self._writable)
+        self._use_overlapped = True
         self._size, geo_ss = _query_geometry(self._handle)
         if geo_ss:
             self.sector_size = geo_ss
@@ -579,29 +602,124 @@ class WindowsPhysicalDevice(BlockDevice):
             err = ctypes.get_last_error()
             raise IoError(f"오프셋 {offset} 이동 실패 (Win32 {err})", winerr=err)
 
-    def _raw_read_once(self, offset: int, length: int) -> bytes:
+    def _overlapped(self, offset: int) -> _OVERLAPPED:
+        ov = _OVERLAPPED()
+        ov.Offset = offset & 0xFFFFFFFF
+        ov.OffsetHigh = (offset >> 32) & 0xFFFFFFFF
+        return ov
+
+    def _finish_overlapped(self, ok: bool, ov: _OVERLAPPED, done: wintypes.DWORD, what: str) -> None:
+        if ok:
+            return
+        err = ctypes.get_last_error()
+        if err == ERROR_IO_PENDING:
+            ok = kernel32.GetOverlappedResult(self._handle, ctypes.byref(ov), ctypes.byref(done), True)
+            if ok:
+                return
+            err = ctypes.get_last_error()
+        if err == ERROR_INVALID_PARAMETER:
+            self._use_overlapped = False
+        raise IoError(f"{self.path} {what} 실패 (Win32 {err})", winerr=err)
+
+    def _read_seek(self, offset: int, length: int) -> bytes:
         self._seek(offset)
-        buf = ctypes.create_string_buffer(length)
+        buf = bytearray(length)
         done = wintypes.DWORD(0)
         kernel32.SetLastError(0)
-        ok = kernel32.ReadFile(self._handle, buf, length, ctypes.byref(done), None)
+        ok = kernel32.ReadFile(
+            self._handle,
+            (ctypes.c_char * length).from_buffer(buf),
+            length,
+            ctypes.byref(done),
+            None,
+        )
         if not ok:
             err = ctypes.get_last_error()
             raise IoError(
                 f"{self.path} 오프셋 {offset}에서 {length}바이트 읽기 실패 (Win32 {err})",
                 winerr=err,
             )
-        return buf.raw[: done.value] + b"\x00" * max(0, length - done.value)
+        got = int(done.value)
+        if got < length:
+            buf[got:] = b"\x00" * (length - got)
+        return bytes(buf)
 
-    def _raw_write_once(self, offset: int, data: bytes) -> None:
+    def _read_at(self, offset: int, length: int) -> bytes:
+        if length <= 0:
+            return b""
+        if not self._use_overlapped:
+            return self._read_seek(offset, length)
+        buf = bytearray(length)
+        ov = self._overlapped(offset)
+        done = wintypes.DWORD(0)
+        kernel32.SetLastError(0)
+        ok = kernel32.ReadFile(
+            self._handle,
+            (ctypes.c_char * length).from_buffer(buf),
+            length,
+            ctypes.byref(done),
+            ctypes.byref(ov),
+        )
+        try:
+            self._finish_overlapped(bool(ok), ov, done, f"오프셋 {offset} 읽기")
+        except IoError:
+            if not self._use_overlapped:
+                return self._read_seek(offset, length)
+            raise
+        got = int(done.value)
+        if got < length:
+            buf[got:] = b"\x00" * (length - got)
+        return bytes(buf)
+
+    def _write_seek(self, offset: int, data: bytes) -> None:
         self._seek(offset)
         done = wintypes.DWORD(0)
-        buf = ctypes.create_string_buffer(data, len(data))
+        buf = (ctypes.c_char * len(data)).from_buffer_copy(data)
         kernel32.SetLastError(0)
         ok = kernel32.WriteFile(self._handle, buf, len(data), ctypes.byref(done), None)
         err = ctypes.get_last_error()
         if not ok or done.value != len(data):
             raise IoError(f"{offset}에서 쓰기 실패 (Win32 {err})", winerr=err)
+
+    def _write_at(self, offset: int, data: bytes) -> None:
+        if not data:
+            return
+        if not self._use_overlapped:
+            self._write_seek(offset, data)
+            return
+        ov = self._overlapped(offset)
+        done = wintypes.DWORD(0)
+        buf = (ctypes.c_char * len(data)).from_buffer_copy(data)
+        kernel32.SetLastError(0)
+        ok = kernel32.WriteFile(self._handle, buf, len(data), ctypes.byref(done), ctypes.byref(ov))
+        try:
+            self._finish_overlapped(bool(ok), ov, done, f"오프셋 {offset} 쓰기")
+        except IoError:
+            if not self._use_overlapped:
+                self._write_seek(offset, data)
+                return
+            raise
+        if done.value != len(data):
+            err = ctypes.get_last_error()
+            raise IoError(f"{offset}에서 쓰기 실패 (Win32 {err}, {done.value}/{len(data)})", winerr=err)
+
+    def _raw_read_once(self, offset: int, length: int) -> bytes:
+        if length <= IO_CHUNK:
+            return self._read_at(offset, length)
+        parts: list[bytes] = []
+        pos = 0
+        while pos < length:
+            n = min(IO_CHUNK, length - pos)
+            parts.append(self._read_at(offset + pos, n))
+            pos += n
+        return b"".join(parts)
+
+    def _raw_write_once(self, offset: int, data: bytes) -> None:
+        pos = 0
+        while pos < len(data):
+            n = min(IO_CHUNK, len(data) - pos)
+            self._write_at(offset + pos, data[pos : pos + n])
+            pos += n
 
     def _raw_read(self, offset: int, length: int) -> bytes:
         return self._retry(lambda: self._raw_read_once(offset, length))
