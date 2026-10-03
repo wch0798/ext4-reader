@@ -14,6 +14,9 @@ class WriteFallbackTests(unittest.TestCase):
         dev._partition_size = 1023869452288
         dev._size = 1023871549440
         dev._write_blockers = []
+        dev._write_locked_partition_device = lambda offset, data: (_ for _ in ()).throw(
+            IoError("partition access denied", winerr=5)
+        )
         return dev
 
     def test_physicaldrive_retry_uses_absolute_offset_and_stops_on_success(self):
