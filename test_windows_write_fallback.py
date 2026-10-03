@@ -368,45 +368,42 @@ class WindowsWritePolicyTests(unittest.TestCase):
 
 
 class ReaderCompatibilityTests(unittest.TestCase):
+    VOLUME_GUID = "\\\\?\\Volume{01234567-89ab-cdef-0123-456789abcdef}\\"
+
     def test_volume_guid_normalization_for_fve(self):
         import ext4reader.windows_disk as wd
 
         self.assertEqual(
             wd._volume_guid_for_fve("Volume{01234567-89ab-cdef-0123-456789abcdef}"),
-            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\",
+            self.VOLUME_GUID,
         )
         self.assertEqual(
-            wd._volume_guid_for_fve(r"\\.\Volume{01234567-89ab-cdef-0123-456789abcdef}"),
-            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\",
+            wd._volume_guid_for_fve("\\\\.\\Volume{01234567-89ab-cdef-0123-456789abcdef}"),
+            self.VOLUME_GUID,
         )
-        self.assertIsNone(wd._volume_guid_for_fve(r"\\.\HarddiskVolume27"))
+        self.assertIsNone(wd._volume_guid_for_fve("\\\\.\\HarddiskVolume27"))
 
     def test_fve_raw_access_success_and_hresult(self):
         import ext4reader.windows_disk as wd
 
         calls = []
+
         def fake_fve(name, enabled):
             calls.append((name, bool(enabled)))
             return 0
 
         with patch.object(wd, "_FveEnableRawAccessW", fake_fve):
-            ok, hr = wd._fve_raw_access(
-                r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\",
-                True,
-            )
+            ok, hr = wd._fve_raw_access(self.VOLUME_GUID, True)
 
         self.assertTrue(ok)
         self.assertEqual(hr, 0)
-        self.assertEqual(calls[0][1], True)
+        self.assertEqual(calls, [(self.VOLUME_GUID, True)])
 
     def test_fve_raw_access_reports_access_denied_hresult(self):
         import ext4reader.windows_disk as wd
 
         with patch.object(wd, "_FveEnableRawAccessW", lambda name, enabled: -2147024891):
-            ok, hr = wd._fve_raw_access(
-                r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\",
-                True,
-            )
+            ok, hr = wd._fve_raw_access(self.VOLUME_GUID, True)
 
         self.assertFalse(ok)
         self.assertEqual(hr, 0x80070005)
@@ -416,11 +413,11 @@ class ReaderCompatibilityTests(unittest.TestCase):
 
         item = _LockedVolume(
             handle=91,
-            name=r"\\.\HarddiskVolume27",
+            name="\\\\.\\HarddiskVolume27",
             partition_number=1,
             locked=True,
             offline=False,
-            volume_guid=r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\",
+            volume_guid=self.VOLUME_GUID,
             fve_raw=True,
         )
         calls = []
@@ -433,8 +430,7 @@ class ReaderCompatibilityTests(unittest.TestCase):
 
         self.assertEqual(calls[0], ("online", 91))
         self.assertEqual(calls[1], ("close", 91))
-        self.assertEqual(calls[2][0], "fve")
-        self.assertFalse(calls[2][2])
+        self.assertEqual(calls[2], ("fve", self.VOLUME_GUID, False))
         self.assertFalse(item.fve_raw)
 
     def test_bus_names_cover_usb_sd_and_mmc_readers(self):
@@ -443,3 +439,4 @@ class ReaderCompatibilityTests(unittest.TestCase):
         self.assertEqual(wd.BUS_NAMES[7], "USB")
         self.assertEqual(wd.BUS_NAMES[12], "SD")
         self.assertEqual(wd.BUS_NAMES[13], "MMC")
+
