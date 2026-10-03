@@ -6,6 +6,16 @@ from ext4reader.host import project_root, relaunch_as_host
 
 
 def run() -> None:
+    if "--raw-helper-request" in sys.argv:
+        try:
+            idx = sys.argv.index("--raw-helper-request")
+            request_path = sys.argv[idx + 1]
+        except (ValueError, IndexError):
+            raise SystemExit(2)
+        from ext4reader.system_raw_helper import run_helper_request
+
+        raise SystemExit(run_helper_request(request_path))
+
     try:
         os.chdir(project_root())
     except OSError:

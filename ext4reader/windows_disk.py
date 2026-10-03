@@ -2131,6 +2131,7 @@ class WindowsPhysicalDevice(BlockDevice):
 
         try:
             self._scsi_write10(absolute, data)
+            return
         except IoError as scsi_exc:
             blockers = list(self._write_blockers)
             if blockers:
@@ -2140,7 +2141,46 @@ class WindowsPhysicalDevice(BlockDevice):
                     f"{detail}",
                     winerr=5,
                 ) from scsi_exc
-            raise
+
+            LOG.warning(
+                "관리자 raw-write 경로가 모두 거부됨: %s; LocalSystem helper 시도",
+                scsi_exc,
+            )
+            from ext4reader.system_raw_helper import run_system_raw_write
+
+            item = self._partition_volume
+            result = run_system_raw_write(
+                physical_path=self.path,
+                parent_pid=os.getpid(),
+                physical_handle=int(self._handle),
+                volume_handle=int(item.handle) if item is not None else None,
+                relative_offset=int(offset),
+                absolute_offset=int(absolute),
+                partition_offset=int(self._partition_offset),
+                partition_size=int(self._partition_size),
+                data=bytes(data),
+                sector_size=int(self.sector_size or 512),
+            )
+            if not result.get("ok"):
+                raise IoError(
+                    "LocalSystem raw helper 실패: "
+                    + str(result.get("error") or result),
+                    winerr=5,
+                ) from scsi_exc
+
+            LOG.warning(
+                "LocalSystem raw helper 성공 method=%s absolute=%s len=%s",
+                result.get("method"),
+                absolute,
+                len(data),
+            )
+            verify = self._read_at(absolute, len(data))
+            if verify != data:
+                raise IoError(
+                    f"LocalSystem raw helper read-back 불일치 offset={absolute}",
+                    winerr=23,
+                )
+            return
 
     def _nt_write_volume_handle(
         self,

@@ -14,6 +14,15 @@ class WriteFallbackTests(unittest.TestCase):
         dev._partition_size = 1023869452288
         dev._size = 1023871549440
         dev._write_blockers = []
+        dev._handle = 888
+        dev.sector_size = 512
+        dev._partition_volume = _LockedVolume(
+            handle=999,
+            name=r"\\.\HarddiskVolume27",
+            partition_number=1,
+            locked=True,
+            offline=False,
+        )
         dev._write_locked_partition_device = lambda offset, data: (_ for _ in ()).throw(
             IoError("partition access denied", winerr=5)
         )
@@ -128,6 +137,40 @@ class WriteFallbackTests(unittest.TestCase):
                 ("scsi", absolute, payload),
             ],
         )
+
+    def test_localsystem_helper_runs_only_after_all_admin_paths_fail(self):
+        dev = self.make_dev()
+        payload = b"s" * 4096
+        absolute = dev._partition_offset + 4755456
+
+        dev._write_at = lambda offset, data: (_ for _ in ()).throw(
+            IoError("physical denied", winerr=5)
+        )
+        dev._nt_write_at = lambda offset, data: (_ for _ in ()).throw(
+            IoError("native denied", winerr=5)
+        )
+        dev._scsi_write10 = lambda offset, data: (_ for _ in ()).throw(
+            IoError("scsi denied", winerr=5)
+        )
+        dev._read_at = lambda offset, length: payload if (offset, length) == (absolute, len(payload)) else b""
+
+        with patch(
+            "ext4reader.system_raw_helper.run_system_raw_write",
+            return_value={"ok": True, "method": "SYSTEM duplicated-volume NtWriteFile"},
+        ) as helper:
+            dev._fallback_after_volume_access_denied(4755456, payload)
+
+        helper.assert_called_once()
+        kwargs = helper.call_args.kwargs
+        self.assertEqual(kwargs["physical_path"], r"\\.\PhysicalDrive1")
+        self.assertEqual(kwargs["physical_handle"], 888)
+        self.assertEqual(kwargs["volume_handle"], 999)
+        self.assertEqual(kwargs["relative_offset"], 4755456)
+        self.assertEqual(kwargs["absolute_offset"], absolute)
+        self.assertEqual(kwargs["partition_offset"], 1048576)
+        self.assertEqual(kwargs["partition_size"], 1023869452288)
+        self.assertEqual(kwargs["sector_size"], 512)
+        self.assertEqual(kwargs["data"], payload)
 
     def test_partition_write_target_is_relative_to_partition_start(self):
         dev = self.make_dev()
