@@ -8,6 +8,8 @@ from ext4reader.windows_disk import WindowsPhysicalDevice, _LockedVolume
 class WriteFallbackTests(unittest.TestCase):
     def make_dev(self):
         dev = WindowsPhysicalDevice.__new__(WindowsPhysicalDevice)
+        dev.path = r"\\.\PhysicalDrive1"
+        dev._partition_number = 1
         dev._partition_offset = 1048576
         dev._partition_size = 1023869452288
         dev._size = 1023871549440
@@ -27,6 +29,15 @@ class WriteFallbackTests(unittest.TestCase):
         def scsi(offset, data):
             calls.append(("scsi", offset, bytes(data)))
 
+        dev._write_locked_partition_device = lambda offset, data: (_ for _ in ()).throw(
+            IoError("partition access denied", winerr=5)
+        )
+        dev._write_locked_partition_device = lambda offset, data: (_ for _ in ()).throw(
+            IoError("partition access denied", winerr=5)
+        )
+        dev._write_locked_partition_device = lambda offset, data: (_ for _ in ()).throw(
+            IoError("partition access denied", winerr=5)
+        )
         dev._write_at = write_at
         dev._nt_write_at = nt_write
         dev._scsi_write10 = scsi
@@ -38,6 +49,26 @@ class WriteFallbackTests(unittest.TestCase):
             calls,
             [("physical", 1048576 + 4755456, payload)],
         )
+
+    def test_locked_partition_device_is_first_fallback_and_stops_on_success(self):
+        dev = self.make_dev()
+        calls = []
+
+        def part_write(offset, data):
+            calls.append(("partition", offset, bytes(data)))
+
+        def write_at(offset, data):
+            calls.append(("physical", offset, bytes(data)))
+
+        dev._write_locked_partition_device = part_write
+        dev._write_at = write_at
+        dev._nt_write_at = lambda offset, data: calls.append(("nt", offset, bytes(data)))
+        dev._scsi_write10 = lambda offset, data: calls.append(("scsi", offset, bytes(data)))
+
+        payload = b"p" * 4096
+        dev._fallback_after_volume_access_denied(4755456, payload)
+
+        self.assertEqual(calls, [("partition", 4755456, payload)])
 
     def test_native_nt_runs_after_physicaldrive_retry_fails(self):
         dev = self.make_dev()
@@ -324,6 +355,9 @@ class WindowsWritePolicyTests(unittest.TestCase):
         dev = WriteFallbackTests().make_dev()
         dev._write_blockers = ["컴퓨터 정책: 이동식 디스크 쓰기 액세스 거부 [Deny_Write=1]"]
 
+        dev._write_locked_partition_device = lambda offset, data: (_ for _ in ()).throw(
+            IoError("partition", winerr=5)
+        )
         dev._write_at = lambda offset, data: (_ for _ in ()).throw(IoError("win32", winerr=5))
         dev._nt_write_at = lambda offset, data: (_ for _ in ()).throw(IoError("nt", winerr=5))
         dev._scsi_write10 = lambda offset, data: (_ for _ in ()).throw(IoError("scsi", winerr=5))
