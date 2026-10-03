@@ -55,6 +55,48 @@ class SystemRawHelperTests(unittest.TestCase):
             with open(copied, "rb") as fp:
                 self.assertEqual(fp.read(), b"fake-pyinstaller-image")
 
+    def test_execute_uses_system_unbuffered_before_normal_fresh_write(self):
+        import ext4reader.windows_disk as wd
+
+        req = self.make_request()
+        devno = wd.STORAGE_DEVICE_NUMBER()
+        devno.DeviceType = 7
+        devno.DeviceNumber = 1
+        devno.PartitionNumber = 0
+        raw_devno = bytes(devno)
+        calls = []
+
+        def duplicate(pid, handle):
+            return 101 if handle == req["physical_handle"] else 102
+
+        def unbuffered(path, offset, data, sector, **kwargs):
+            calls.append((path, offset, len(data), sector, kwargs))
+            return 512, 4096
+
+        with patch.object(helper, "_duplicate_handle", side_effect=duplicate), patch.object(
+            wd, "_query_storage", return_value=("", "Generic Reader", 7, True)
+        ), patch.object(
+            wd, "_ioctl", return_value=raw_devno
+        ), patch.object(
+            helper, "_write_win32", side_effect=IoError("duplicated denied", winerr=5)
+        ), patch.object(
+            helper, "_write_nt", side_effect=IoError("duplicated nt denied", winerr=5)
+        ), patch.object(
+            wd, "_write_unbuffered_raw_path", side_effect=unbuffered
+        ):
+            result = helper._execute_request(req)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["method"], "SYSTEM fresh-PhysicalDrive NO_BUFFERING")
+        self.assertFalse(result["disk_offline"])
+        self.assertEqual(result["logical_sector"], 512)
+        self.assertEqual(result["physical_sector"], 4096)
+        self.assertEqual(calls[0][0], r"\\.\PhysicalDrive1")
+        self.assertEqual(calls[0][1], 5804032)
+        self.assertEqual(calls[0][3], 512)
+        self.assertEqual(calls[0][4]["expected_device_number"], 1)
+        self.assertEqual(calls[0][4]["expected_device_type"], 7)
+
     def test_execute_uses_fresh_system_physicaldrive_after_duplicated_handles_fail(self):
         import ext4reader.windows_disk as wd
 
@@ -80,6 +122,10 @@ class SystemRawHelperTests(unittest.TestCase):
             wd, "_ioctl", return_value=raw_devno
         ), patch.object(
             wd, "_open_handle", return_value=303
+        ), patch.object(
+            wd,
+            "_write_unbuffered_raw_path",
+            side_effect=IoError("unbuffered denied", winerr=5),
         ), patch.object(
             helper, "_write_win32", side_effect=write_win32
         ), patch.object(
@@ -125,6 +171,10 @@ class SystemRawHelperTests(unittest.TestCase):
             wd, "_open_handle", return_value=303
         ), patch.object(
             wd, "_set_disk_offline_state", side_effect=set_offline
+        ), patch.object(
+            wd,
+            "_write_unbuffered_raw_path",
+            side_effect=IoError("unbuffered denied", winerr=5),
         ), patch.object(
             helper, "_write_win32", side_effect=write_win32
         ), patch.object(
