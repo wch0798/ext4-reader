@@ -278,7 +278,9 @@ class Ext4Volume:
             LOG.info("저널 재생 필요 s_start=%s recover_flag=%s", s_start, self.sb.needs_recovery)
             return True
         if self.sb.needs_recovery:
-            LOG.info("RECOVER 플래그는 있으나 저널이 비어 있습니다 (s_start=0). 쓰기를 막을 필요는 없습니다.")
+            # JBD2 문서상 s_start == 0만으로 journal이 clean하다고 단정할 수 없다.
+            LOG.warning("RECOVER 플래그가 남아 있지만 JBD2 s_start=0입니다. 안전을 위해 복구 필요로 취급합니다.")
+            return True
         return False
 
     def recover_pending_journal(self):
@@ -314,6 +316,8 @@ class Ext4Volume:
             reasons.append("META_BG 레이아웃은 쓰기를 지원하지 않습니다.")
         if unknown & C.EXT4_FEATURE_INCOMPAT_MMP:
             reasons.append("다중 마운트 보호(MMP)가 켜져 있습니다.")
+        if self.sb.state & C.EXT4_ERROR_FS:
+            reasons.append("EXT4 슈퍼블록에 파일시스템 오류 상태가 기록되어 있습니다.")
         if self.sb.feature_ro_compat & C.EXT4_FEATURE_RO_COMPAT_BIGALLOC:
             reasons.append("bigalloc 파일시스템은 쓰기를 지원하지 않습니다.")
         if self.sb.feature_ro_compat & C.EXT4_FEATURE_RO_COMPAT_READONLY:
