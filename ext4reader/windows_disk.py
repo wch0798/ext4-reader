@@ -33,6 +33,8 @@ FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
 FSCTL_LOCK_VOLUME = 0x00090018
 FSCTL_DISMOUNT_VOLUME = 0x00090020
 FSCTL_ALLOW_EXTENDED_DASD_IO = 0x00090083
+IOCTL_VOLUME_ONLINE = 0x0056C008
+IOCTL_VOLUME_OFFLINE = 0x0056C00C
 IOCTL_STORAGE_GET_DEVICE_NUMBER = 0x002D1080
 IOCTL_STORAGE_CHECK_VERIFY2 = 0x002D0800
 STALE_HANDLE_ERRORS = {6, 31, 995, 1167}  # invalid handle / gen fail / aborted / unplugged
@@ -434,6 +436,7 @@ class _LockedVolume:
     name: str
     partition_number: int
     locked: bool
+    offline: bool = False
 
 
 @dataclass
@@ -561,6 +564,37 @@ def _allow_extended_io(handle) -> None:
         pass
 
 
+def _take_volume_offline(handle, name: str) -> bool:
+    """Keep a dismounted volume from being automatically remounted.
+
+    Microsoft documents that IOCTL_VOLUME_OFFLINE must follow a successful
+    dismount and that taking a volume offline does not block I/O sent to the
+    underlying physical disk.
+    """
+    from ext4reader.debuglog import LOG
+
+    try:
+        _ioctl(handle, IOCTL_VOLUME_OFFLINE)
+        LOG.info("볼륨 오프라인 성공 %s", name)
+        return True
+    except OSError as exc:
+        LOG.warning("볼륨 오프라인 실패 %s: %s", name, exc)
+        return False
+
+
+def _bring_volume_online(item: _LockedVolume) -> None:
+    if not item.offline:
+        return
+    from ext4reader.debuglog import LOG
+
+    try:
+        _ioctl(item.handle, IOCTL_VOLUME_ONLINE)
+        item.offline = False
+        LOG.info("볼륨 온라인 복원 %s", item.name)
+    except OSError as exc:
+        LOG.warning("볼륨 온라인 복원 실패 %s: %s", item.name, exc)
+
+
 def _is_writable_ioctl(handle) -> tuple[bool, int]:
     """Ask the storage stack whether writes are allowed on this device."""
     returned = wintypes.DWORD(0)
@@ -625,8 +659,10 @@ def _lock_volumes_for_disk(disk_index: int) -> list[_LockedVolume]:
                             )
                         except OSError as exc:
                             LOG.warning("볼륨 잠금 실패 %s: %s", vol, exc)
+                        dismount_ok = False
                         try:
                             _ioctl(handle, FSCTL_DISMOUNT_VOLUME)
+                            dismount_ok = True
                             LOG.info(
                                 "Windows 볼륨 분리 %s (PhysicalDrive%s part=%s)",
                                 vol,
@@ -635,6 +671,7 @@ def _lock_volumes_for_disk(disk_index: int) -> list[_LockedVolume]:
                             )
                         except OSError as exc:
                             LOG.warning("볼륨 분리 실패 %s: %s", vol, exc)
+                        offline_ok = _take_volume_offline(handle, vol) if dismount_ok else False
                         _allow_extended_io(handle)
                         locked.append(
                             _LockedVolume(
@@ -642,6 +679,7 @@ def _lock_volumes_for_disk(disk_index: int) -> list[_LockedVolume]:
                                 name=vol,
                                 partition_number=int(num.PartitionNumber),
                                 locked=lock_ok,
+                                offline=offline_ok,
                             )
                         )
                         handle = None
@@ -746,11 +784,14 @@ def _open_hidden_volume_alias(disk_index: int, partition_number: int) -> _Locked
                 LOG.info("숨은 볼륨 잠금 성공 %s", path)
             except OSError as exc:
                 LOG.info("숨은 볼륨 잠금 생략/실패 %s: %s", path, exc)
+            dismount_ok = False
             try:
                 _ioctl(handle, FSCTL_DISMOUNT_VOLUME)
+                dismount_ok = True
                 LOG.info("숨은 볼륨 분리 성공 %s", path)
             except OSError as exc:
                 LOG.info("숨은 볼륨 분리 생략/실패 %s: %s", path, exc)
+            offline_ok = _take_volume_offline(handle, path) if dismount_ok else False
             _allow_extended_io(handle)
             keep = True
             return _LockedVolume(
@@ -758,6 +799,7 @@ def _open_hidden_volume_alias(disk_index: int, partition_number: int) -> _Locked
                 name=path,
                 partition_number=int(partition_number),
                 locked=lock_ok,
+                offline=offline_ok,
             )
         except OSError:
             pass
@@ -834,6 +876,7 @@ def _open_partition_device(disk_index: int, partition_number: int) -> _LockedVol
                 name=path,
                 partition_number=int(partition_number),
                 locked=lock_ok,
+                offline=False,
             )
         except IoError:
             raise
@@ -1060,6 +1103,10 @@ class WindowsPhysicalDevice(BlockDevice):
             idx = _physical_index(self.path)
             if idx is not None:
                 for item in self._volume_locks:
+                    try:
+                        _bring_volume_online(item)
+                    except Exception:
+                        pass
                     try:
                         kernel32.CloseHandle(item.handle)
                     except Exception:
@@ -1466,6 +1513,15 @@ class WindowsPhysicalDevice(BlockDevice):
 
     def _write_volume_seek(self, item: _LockedVolume, offset: int, data: bytes) -> None:
         """Write relative to a locked/dismounted volume handle."""
+        if item.offline:
+            from ext4reader.debuglog import LOG
+            LOG.info(
+                "오프라인 볼륨은 직접 쓰지 않고 PhysicalDrive 경로 사용 %s offset=%s",
+                item.name,
+                offset,
+            )
+            self._fallback_after_volume_access_denied(offset, data)
+            return
         kernel32.SetLastError(0)
         new_pos = ctypes.c_longlong(0)
         ok = kernel32.SetFilePointerEx(
@@ -1591,6 +1647,10 @@ class WindowsPhysicalDevice(BlockDevice):
                     pass
                 self._nt_handle = None
             for item in self._volume_locks:
+                try:
+                    _bring_volume_online(item)
+                except Exception:
+                    pass
                 try:
                     kernel32.CloseHandle(item.handle)
                 except Exception:
