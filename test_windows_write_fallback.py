@@ -20,10 +20,14 @@ class WriteFallbackTests(unittest.TestCase):
         def write_at(offset, data):
             calls.append(("physical", offset, bytes(data)))
 
+        def nt_write(offset, data):
+            calls.append(("nt", offset, bytes(data)))
+
         def scsi(offset, data):
             calls.append(("scsi", offset, bytes(data)))
 
         dev._write_at = write_at
+        dev._nt_write_at = nt_write
         dev._scsi_write10 = scsi
 
         payload = b"x" * 4096
@@ -34,7 +38,7 @@ class WriteFallbackTests(unittest.TestCase):
             [("physical", 1048576 + 4755456, payload)],
         )
 
-    def test_scsi_runs_only_after_physicaldrive_retry_fails(self):
+    def test_native_nt_runs_after_physicaldrive_retry_fails(self):
         dev = self.make_dev()
         calls = []
 
@@ -42,10 +46,14 @@ class WriteFallbackTests(unittest.TestCase):
             calls.append(("physical", offset, bytes(data)))
             raise IoError("access denied", winerr=5)
 
+        def nt_write(offset, data):
+            calls.append(("nt", offset, bytes(data)))
+
         def scsi(offset, data):
             calls.append(("scsi", offset, bytes(data)))
 
         dev._write_at = write_at
+        dev._nt_write_at = nt_write
         dev._scsi_write10 = scsi
 
         payload = b"y" * 4096
@@ -56,6 +64,38 @@ class WriteFallbackTests(unittest.TestCase):
             calls,
             [
                 ("physical", absolute, payload),
+                ("nt", absolute, payload),
+            ],
+        )
+
+    def test_scsi_runs_only_after_physical_and_native_nt_fail(self):
+        dev = self.make_dev()
+        calls = []
+
+        def write_at(offset, data):
+            calls.append(("physical", offset, bytes(data)))
+            raise IoError("access denied", winerr=5)
+
+        def nt_write(offset, data):
+            calls.append(("nt", offset, bytes(data)))
+            raise IoError("nt access denied", winerr=5)
+
+        def scsi(offset, data):
+            calls.append(("scsi", offset, bytes(data)))
+
+        dev._write_at = write_at
+        dev._nt_write_at = nt_write
+        dev._scsi_write10 = scsi
+
+        payload = b"z" * 4096
+        dev._fallback_after_volume_access_denied(4755456, payload)
+
+        absolute = 1048576 + 4755456
+        self.assertEqual(
+            calls,
+            [
+                ("physical", absolute, payload),
+                ("nt", absolute, payload),
                 ("scsi", absolute, payload),
             ],
         )
@@ -130,4 +170,20 @@ class RawOpenTests(unittest.TestCase):
         self.assertEqual(
             calls[1],
             (wd.FILE_SHARE_READ | wd.FILE_SHARE_WRITE, wd.FILE_ATTRIBUTE_NORMAL),
+        )
+
+
+class NativePathTests(unittest.TestCase):
+    def test_win32_physicaldrive_path_converts_to_nt_dos_device(self):
+        import ext4reader.windows_disk as wd
+        self.assertEqual(
+            wd._nt_native_path(r"\\.\PhysicalDrive1"),
+            r"\??\PhysicalDrive1",
+        )
+
+    def test_globalroot_path_converts_to_device_path(self):
+        import ext4reader.windows_disk as wd
+        self.assertEqual(
+            wd._nt_native_path(r"\\?\GLOBALROOT\Device\HarddiskVolume26"),
+            r"\Device\HarddiskVolume26",
         )
