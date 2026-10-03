@@ -31,6 +31,11 @@ STALE_HANDLE_ERRORS = {6, 31, 995, 1167}  # invalid handle / gen fail / aborted 
 IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = 0x000700A0
 IOCTL_DISK_IS_WRITABLE = 0x00070024
 IOCTL_STORAGE_QUERY_PROPERTY = 0x002D1400
+IOCTL_SCSI_PASS_THROUGH = 0x0004D004
+
+SCSI_IOCTL_DATA_OUT = 0
+SCSI_STATUS_GOOD = 0x00
+SCSI_WRITE10 = 0x2A
 
 BUS_NAMES = {
     0: "알 수 없음",
@@ -149,6 +154,24 @@ class STORAGE_DEVICE_NUMBER(ctypes.Structure):
         ("DeviceType", wintypes.DWORD),
         ("DeviceNumber", wintypes.DWORD),
         ("PartitionNumber", wintypes.DWORD),
+    ]
+
+
+class SCSI_PASS_THROUGH(ctypes.Structure):
+    _fields_ = [
+        ("Length", wintypes.USHORT),
+        ("ScsiStatus", ctypes.c_ubyte),
+        ("PathId", ctypes.c_ubyte),
+        ("TargetId", ctypes.c_ubyte),
+        ("Lun", ctypes.c_ubyte),
+        ("CdbLength", ctypes.c_ubyte),
+        ("SenseInfoLength", ctypes.c_ubyte),
+        ("DataIn", ctypes.c_ubyte),
+        ("DataTransferLength", wintypes.DWORD),
+        ("TimeOutValue", wintypes.DWORD),
+        ("DataBufferOffset", ctypes.c_size_t),
+        ("SenseInfoOffset", wintypes.DWORD),
+        ("Cdb", ctypes.c_ubyte * 16),
     ]
 
 
@@ -902,6 +925,99 @@ class WindowsPhysicalDevice(BlockDevice):
         if not ok or done.value != len(data):
             raise IoError(f"{offset}에서 쓰기 실패 (Win32 {err})", winerr=err)
 
+    def _scsi_write10(self, absolute_offset: int, data: bytes) -> None:
+        """Fallback raw write using SCSI WRITE(10) through the disk class driver.
+
+        This path is only used after the normal locked partition WriteFile path
+        returns ERROR_ACCESS_DENIED.  It is useful for USB mass-storage/card
+        readers where Windows opens and locks the partition DASD handle but the
+        filesystem/raw-volume layer still rejects WriteFile.
+        """
+        from ext4reader.debuglog import LOG
+
+        ss = int(self.sector_size or 512)
+        if absolute_offset < 0 or absolute_offset % ss or len(data) % ss:
+            raise IoError(
+                f"SCSI fallback 정렬 오류 offset={absolute_offset} len={len(data)} sector={ss}",
+                winerr=87,
+            )
+        lba = absolute_offset // ss
+        blocks = len(data) // ss
+        if lba > 0xFFFFFFFF or blocks <= 0 or blocks > 0xFFFF:
+            raise IoError(
+                f"SCSI WRITE(10) 범위 초과 lba={lba} blocks={blocks}",
+                winerr=87,
+            )
+
+        sense_len = 32
+        hdr_len = ctypes.sizeof(SCSI_PASS_THROUGH)
+        sense_off = hdr_len
+        data_off = (sense_off + sense_len + 15) & ~15
+        total = data_off + len(data)
+        packet = ctypes.create_string_buffer(total)
+        spt = SCSI_PASS_THROUGH.from_buffer(packet)
+        spt.Length = hdr_len
+        spt.CdbLength = 10
+        spt.SenseInfoLength = sense_len
+        spt.DataIn = SCSI_IOCTL_DATA_OUT
+        spt.DataTransferLength = len(data)
+        spt.TimeOutValue = 30
+        spt.DataBufferOffset = data_off
+        spt.SenseInfoOffset = sense_off
+        spt.Cdb[0] = SCSI_WRITE10
+        spt.Cdb[2] = (lba >> 24) & 0xFF
+        spt.Cdb[3] = (lba >> 16) & 0xFF
+        spt.Cdb[4] = (lba >> 8) & 0xFF
+        spt.Cdb[5] = lba & 0xFF
+        spt.Cdb[7] = (blocks >> 8) & 0xFF
+        spt.Cdb[8] = blocks & 0xFF
+        ctypes.memmove(ctypes.addressof(packet) + data_off, data, len(data))
+
+        returned = wintypes.DWORD(0)
+        kernel32.SetLastError(0)
+        ok = kernel32.DeviceIoControl(
+            self._handle,
+            IOCTL_SCSI_PASS_THROUGH,
+            packet,
+            total,
+            packet,
+            total,
+            ctypes.byref(returned),
+            None,
+        )
+        err = ctypes.get_last_error()
+        if not ok:
+            raise IoError(
+                f"SCSI WRITE(10) DeviceIoControl 실패 lba={lba} blocks={blocks} (Win32 {err})",
+                winerr=err,
+            )
+
+        spt2 = SCSI_PASS_THROUGH.from_buffer(packet)
+        if int(spt2.ScsiStatus) != SCSI_STATUS_GOOD:
+            sense = bytes(packet.raw[sense_off : sense_off + sense_len])
+            sense_key = sense[2] & 0x0F if len(sense) > 2 else 0
+            asc = sense[12] if len(sense) > 12 else 0
+            ascq = sense[13] if len(sense) > 13 else 0
+            raise IoError(
+                "SCSI WRITE(10) 장치 오류 "
+                f"status=0x{int(spt2.ScsiStatus):02X} sense=0x{sense_key:X}/0x{asc:02X}/0x{ascq:02X}",
+                winerr=5,
+            )
+
+        # Verify through the ordinary disk read path before recovery advances.
+        verify = self._read_at(absolute_offset, len(data))
+        if verify != data:
+            raise IoError(
+                f"SCSI WRITE(10) 검증 실패 offset={absolute_offset} len={len(data)}",
+                winerr=23,
+            )
+        LOG.warning(
+            "WriteFile Win32 5 우회: SCSI WRITE(10) 성공 offset=%s lba=%s blocks=%s",
+            absolute_offset,
+            lba,
+            blocks,
+        )
+
     def _write_volume_seek(self, item: _LockedVolume, offset: int, data: bytes) -> None:
         """Write relative to a locked/dismounted volume handle."""
         kernel32.SetLastError(0)
@@ -924,6 +1040,10 @@ class WindowsPhysicalDevice(BlockDevice):
         ok = kernel32.WriteFile(item.handle, buf, len(data), ctypes.byref(done), None)
         err = ctypes.get_last_error()
         if not ok or done.value != len(data):
+            if err == 5:
+                absolute = self._partition_offset + offset
+                self._scsi_write10(absolute, data)
+                return
             raise IoError(
                 f"{item.name} 볼륨 오프셋 {offset} 쓰기 실패 (Win32 {err})",
                 winerr=err,
