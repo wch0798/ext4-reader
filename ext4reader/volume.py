@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import struct
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 
 from ext4reader import constants as C
@@ -71,6 +72,20 @@ class Ext4Volume:
             LOG.info("casefold 볼륨 — 파일 이름 대소문자는 구분하지 않습니다. 쓰기는 가능합니다.")
         self.dirty_groups: set[int] = set()
         self.dirty_super = False
+        self._data_dirty = False
+        self._block_cache: OrderedDict[int, bytes] = OrderedDict()
+        self._block_cache_cap = 2048
+        self._inode_cache: OrderedDict[int, bytes] = OrderedDict()
+        self._inode_cache_cap = 4096
+        self._extent_cache: OrderedDict[int, tuple[bytes, list]] = OrderedDict()
+        self._extent_cache_cap = 512
+        self._block_bm_cache: dict = {}
+        self._inode_bm_cache: dict = {}
+        self._dirty_block_bm: set[int] = set()
+        self._dirty_inode_bm: set[int] = set()
+        self._alloc_hint: dict[int, int] = {}
+        self._dir_list: dict = {}
+        self._dir_index: dict = {}
         self._load_groups()
 
     def _load_groups(self) -> None:
@@ -87,12 +102,47 @@ class Ext4Volume:
         return self.dev.read(self.part_offset + fs_offset, length)
 
     def write_bytes(self, fs_offset: int, data: bytes) -> None:
+        if not data:
+            return
+        bs = self.sb.block_size
+        first = fs_offset // bs
+        last = (fs_offset + len(data) - 1) // bs
+        self._invalidate_block_cache(first, last)
+        self._data_dirty = True
         self.dev.write(self.part_offset + fs_offset, data)
+
+    def _cache_block(self, phys: int, data: bytes) -> None:
+        cache = self._block_cache
+        cache[phys] = data
+        cache.move_to_end(phys)
+        while len(cache) > self._block_cache_cap:
+            cache.popitem(last=False)
+
+    def _invalidate_block_cache(self, first: int, last: int) -> None:
+        cache = self._block_cache
+        if not cache or last < first:
+            return
+        if last - first + 1 > len(cache):
+            for key in [k for k in cache if first <= k <= last]:
+                del cache[key]
+            return
+        for phys in range(first, last + 1):
+            cache.pop(phys, None)
+
+    def drop_dir_cache(self, ino: int) -> None:
+        self._dir_list.pop(ino, None)
+        self._dir_index.pop(ino, None)
 
     def read_block(self, phys: int) -> bytes:
         if phys < 0 or phys >= self.sb.blocks_count:
             raise Ext4Error(f"블록 번호가 범위를 벗어났습니다: {phys}")
-        return self.read_bytes(phys * self.sb.block_size, self.sb.block_size)
+        hit = self._block_cache.get(phys)
+        if hit is not None:
+            self._block_cache.move_to_end(phys)
+            return hit
+        data = self.read_bytes(phys * self.sb.block_size, self.sb.block_size)
+        self._cache_block(phys, data)
+        return data
 
     def write_block(self, phys: int, data: bytes) -> None:
         if len(data) != self.sb.block_size:
@@ -101,6 +151,7 @@ class Ext4Volume:
             else:
                 data = data[: self.sb.block_size]
         self.write_bytes(phys * self.sb.block_size, data)
+        self._cache_block(phys, data if isinstance(data, bytes) else bytes(data))
 
     def _inode_loc(self, ino: int) -> tuple[int, int]:
         if ino < 1 or ino > self.sb.inodes_count:
@@ -111,20 +162,61 @@ class Ext4Volume:
         offset = gd.inode_table * self.sb.block_size + index * self.sb.inode_size
         return g, offset
 
+    def _remember_inode(self, ino: int, raw: bytes) -> None:
+        self._inode_cache[ino] = raw
+        self._inode_cache.move_to_end(ino)
+        while len(self._inode_cache) > self._inode_cache_cap:
+            self._inode_cache.popitem(last=False)
+
     def read_inode(self, ino: int) -> Inode:
+        cached = self._inode_cache.get(ino)
+        if cached is not None:
+            self._inode_cache.move_to_end(ino)
+            return parse_inode(self.sb, ino, cached)
         _g, off = self._inode_loc(ino)
-        raw = self.read_bytes(off, self.sb.inode_size)
+        raw = bytes(self.read_bytes(off, self.sb.inode_size))
+        self._remember_inode(ino, raw)
         return parse_inode(self.sb, ino, raw)
 
     def write_inode(self, inode: Inode) -> None:
+        if inode.blocks > 0xFFFFFFFF and not (
+            self.sb.feature_ro_compat & C.EXT4_FEATURE_RO_COMPAT_HUGE_FILE
+        ):
+            self.sb.feature_ro_compat |= C.EXT4_FEATURE_RO_COMPAT_HUGE_FILE
+            struct.pack_into("<I", self.sb.raw, 0x64, self.sb.feature_ro_compat)
+            self.dirty_super = True
         inode.apply_checksum(self.sb)
+        raw = bytes(inode.raw[: self.sb.inode_size])
+        self._remember_inode(inode.ino, raw)
+        self._extent_cache.pop(inode.ino, None)
+        self.drop_dir_cache(inode.ino)
         _g, off = self._inode_loc(inode.ino)
-        self.write_bytes(off, bytes(inode.raw[: self.sb.inode_size]))
+        self.write_bytes(off, raw)
 
-    def flush_metadata(self) -> None:
+    def _store_dirty_bitmaps(self) -> None:
+        bs = self.sb.block_size
+        for g in sorted(self._dirty_block_bm):
+            bm = self._block_bm_cache.get(g)
+            if bm is not None:
+                blob = bytes(bm.data[:bs]).ljust(bs, b"\x00")
+                self.write_block(self.groups[g].block_bitmap, blob)
+            self._dirty_block_bm.discard(g)
+        for g in sorted(self._dirty_inode_bm):
+            bm = self._inode_bm_cache.get(g)
+            if bm is not None:
+                blob = bytes(bm.data[:bs]).ljust(bs, b"\x00")
+                self.write_block(self.groups[g].inode_bitmap, blob)
+            self._dirty_inode_bm.discard(g)
+
+    def commit_metadata(self, sync: bool = True) -> None:
+        """Write dirty bitmaps, group descriptors and the superblock.
+
+        ``sync`` waits until the device cache is on media. Copying a large file
+        calls this very often; waiting every time is what makes USB/SD feel stuck.
+        """
+        self._store_dirty_bitmaps()
         if self.dirty_groups:
             gdt_block = self.sb.first_data_block + 1
-            # rewrite dirty descriptors in place
             for g in sorted(self.dirty_groups):
                 gd = self.groups[g]
                 update_group_desc_fields(self.sb, gd)
@@ -136,7 +228,12 @@ class Ext4Volume:
             self.sb.write_checksum()
             self.write_bytes(1024, bytes(self.sb.raw[:1024]))
             self.dirty_super = False
-        self.dev.flush()
+        if sync and self._data_dirty:
+            self.dev.flush()
+            self._data_dirty = False
+
+    def flush_metadata(self) -> None:
+        self.commit_metadata(sync=True)
 
     def journal_start(self) -> int | None:
         if not self.sb.has_journal or not self.sb.journal_inum:

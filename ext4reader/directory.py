@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from ext4reader import constants as C
 from ext4reader.crc32c import crc32c
-from ext4reader.extents import file_extents
+from ext4reader.extents import extent_at, file_extents, read_mapped
 from ext4reader.hashdir import dirhash
 from ext4reader.inode import Inode
 
@@ -69,12 +69,10 @@ def parse_dirent_block(data: bytes, max_off: int | None = None) -> list[DirEntry
 
 
 def logical_to_phys(vol, inode: Inode, lblk: int) -> int | None:
-    for ex in file_extents(vol, inode):
-        if ex.uninitialized:
-            continue
-        if ex.logical <= lblk < ex.logical + ex.length:
-            return ex.physical + (lblk - ex.logical)
-    return None
+    ex = extent_at(file_extents(vol, inode), lblk)
+    if ex is None or ex.uninitialized:
+        return None
+    return ex.physical + (lblk - ex.logical)
 
 
 def dir_block_count(inode: Inode, block_size: int) -> int:
@@ -130,7 +128,29 @@ def _htree_leaves(vol, inode: Inode) -> list[int]:
     return leaves or [0]
 
 
+def _consume_lblocks(vol, inode: Inode, lblocks: list[int], consume) -> None:
+    bs = vol.sb.block_size
+    step = max(1, (8 * 1024 * 1024) // bs)
+    i = 0
+    n = len(lblocks)
+    while i < n:
+        start = lblocks[i]
+        j = i + 1
+        while j < n and j - i < step and lblocks[j] == start + (j - i):
+            j += 1
+        count = j - i
+        blob = read_mapped(vol, inode, start * bs, count * bs)
+        for k in range(count):
+            consume(blob[k * bs : (k + 1) * bs])
+        i = j
+
+
 def list_dir(vol, inode: Inode) -> list[DirEntry]:
+    cache = getattr(vol, "_dir_list", None)
+    if cache is not None:
+        hit = cache.get(inode.ino)
+        if hit is not None:
+            return list(hit)
     bs = vol.sb.block_size
     tail = _tail_size(vol)
     usable = bs - tail
@@ -147,15 +167,44 @@ def list_dir(vol, inode: Inode) -> list[DirEntry]:
 
     if inode.is_indexed:
         try:
-            for lblk in _htree_leaves(vol, inode):
-                consume(read_dir_lblock(vol, inode, lblk))
-            return out
+            _consume_lblocks(vol, inode, _htree_leaves(vol, inode), consume)
+            if cache is not None:
+                cache[inode.ino] = out
+            return list(out)
         except Exception:
-            pass
+            out.clear()
+            seen.clear()
     n = dir_block_count(inode, bs)
-    for lblk in range(n):
-        consume(read_dir_lblock(vol, inode, lblk))
-    return out
+    if n:
+        _consume_lblocks(vol, inode, list(range(n)), consume)
+    if cache is not None:
+        cache[inode.ino] = out
+        while len(cache) > 128:
+            cache.pop(next(iter(cache)))
+    return list(out)
+
+
+def lookup_dir_name(vol, inode: Inode, name: str) -> int | None:
+    if not inode.is_dir:
+        return None
+    index = getattr(vol, "_dir_index", None)
+    if index is None:
+        index = {}
+        vol._dir_index = index
+    hit = index.get(inode.ino)
+    if hit is None:
+        exact: dict[str, int] = {}
+        folded: dict[str, int] = {}
+        for e in list_dir(vol, inode):
+            exact.setdefault(e.name, e.inode)
+            folded.setdefault(e.name.lower(), e.inode)
+        hit = (exact, folded)
+        index[inode.ino] = hit
+    exact, folded = hit
+    found = exact.get(name)
+    if found is not None:
+        return found
+    return folded.get(name.lower())
 
 
 def _insert_into_block(block: bytearray, usable: int, ino: int, name: bytes, ftype: int) -> bool:
@@ -249,7 +298,7 @@ class DirError(RuntimeError):
 
 
 def add_dir_entry(vol, dir_inode: Inode, name: str, ino: int, ftype: int) -> Inode:
-    from ext4reader.extents import build_extent_tree, file_extents, Extent
+    from ext4reader.extents import Extent, build_extent_tree, discard_old_extent_indexes, file_extents
     from ext4reader.bitmap import alloc_blocks
 
     name_b = name.encode("utf-8")
@@ -264,6 +313,9 @@ def add_dir_entry(vol, dir_inode: Inode, name: str, ino: int, ftype: int) -> Ino
     usable = bs - tail
 
     def write_lblock(inode: Inode, lblk: int, data: bytearray) -> None:
+        drop = getattr(vol, "drop_dir_cache", None)
+        if drop is not None:
+            drop(inode.ino)
         _dir_csum_set(vol, inode, data)
         phys = logical_to_phys(vol, inode, lblk)
         if phys is None:
@@ -324,6 +376,7 @@ def add_dir_entry(vol, dir_inode: Inode, name: str, ino: int, ftype: int) -> Ino
             bs,
         )
         vol.write_inode(dir_inode)
+        discard_old_extent_indexes(vol, dir_inode)
         _dir_csum_set(vol, dir_inode, right_b)
         vol.write_block(new_phys, bytes(right_b))
         root = bytearray(read_dir_lblock(vol, dir_inode, 0))
@@ -361,6 +414,7 @@ def add_dir_entry(vol, dir_inode: Inode, name: str, ino: int, ftype: int) -> Ino
     dir_inode.set_size((next_l + 1) * bs)
     dir_inode.set_blocks(sum(e.length for e in new_exts), bs)
     vol.write_inode(dir_inode)
+    discard_old_extent_indexes(vol, dir_inode)
     _dir_csum_set(vol, dir_inode, buf)
     vol.write_block(new_phys, bytes(buf))
     return dir_inode

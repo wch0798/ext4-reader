@@ -124,10 +124,74 @@ def walk_indirect(vol, inode: Inode) -> list[Extent]:
     return extents
 
 
+def extent_at(extents: list[Extent], lblk: int) -> Extent | None:
+    lo = 0
+    hi = len(extents)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        ex = extents[mid]
+        if lblk < ex.logical:
+            hi = mid
+        elif lblk >= ex.logical + ex.length:
+            lo = mid + 1
+        else:
+            return ex
+    return None
+
+
 def file_extents(vol, inode: Inode) -> list[Extent]:
+    key = bytes(inode.i_block[:60]).ljust(60, b"\x00")
+    cache = getattr(vol, "_extent_cache", None)
+    if cache is not None:
+        hit = cache.get(inode.ino)
+        if hit is not None and hit[0] == key:
+            cache.move_to_end(inode.ino)
+            return hit[1]
     if inode.uses_extents or (inode.i_block[:2] == struct.pack("<H", C.EXT4_EXT_MAGIC)):
-        return walk_extents(vol, inode)
-    return walk_indirect(vol, inode)
+        exts = walk_extents(vol, inode)
+    else:
+        exts = walk_indirect(vol, inode)
+    exts.sort(key=lambda e: (e.logical, e.physical))
+    if cache is not None:
+        cache[inode.ino] = (key, exts)
+        cache.move_to_end(inode.ino)
+        cap = getattr(vol, "_extent_cache_cap", 512)
+        while len(cache) > cap:
+            cache.popitem(last=False)
+    return exts
+
+
+def read_mapped(vol, inode: Inode, offset: int, length: int) -> bytes:
+    """Read ``length`` bytes at file offset, holes and unwritten extents as zeros."""
+    if length <= 0:
+        return b""
+    from ext4reader.io_backend import IO_CHUNK
+
+    bs = vol.sb.block_size
+    out = bytearray(length)
+    end = offset + length
+    for ex in file_extents(vol, inode):
+        if ex.uninitialized or ex.length <= 0:
+            continue
+        ex_lo = ex.logical * bs
+        ex_hi = (ex.logical + ex.length) * bs
+        lo = offset if offset > ex_lo else ex_lo
+        hi = end if end < ex_hi else ex_hi
+        if lo >= hi:
+            continue
+        disk = ex.physical * bs + (lo - ex_lo)
+        dest = lo - offset
+        left = hi - lo
+        while left:
+            n = IO_CHUNK if left > IO_CHUNK else left
+            chunk = vol.read_bytes(disk, n)
+            out[dest : dest + len(chunk)] = chunk
+            if len(chunk) < n:
+                break
+            disk += n
+            dest += n
+            left -= n
+    return bytes(out)
 
 
 def extents_to_inode_body(extents: list[Extent]) -> bytes:
@@ -151,55 +215,143 @@ def extents_to_inode_body(extents: list[Extent]) -> bytes:
     return bytes(buf)
 
 
-def build_extent_tree(vol, inode: Inode, extents: list[Extent]) -> bytes:
-    """Return 60-byte i_block. Allocates index blocks if more than 4 extents."""
-    if len(extents) <= 4:
-        return extents_to_inode_body(extents)
-    bs = vol.sb.block_size
-    # one leaf block holds (bs-12-4)/12 extents roughly
-    tail = 4 if vol.sb.has_metadata_csum else 0
-    per_leaf = (bs - 12 - tail) // 12
-    if per_leaf < 2:
-        raise ValueError("블록이 너무 작아 extent 트리를 만들 수 없습니다.")
-    leaves: list[tuple[int, int]] = []  # (first_logical, phys_block)
+def _node_capacity(block_size: int, checksum: bool) -> int:
+    tail = 4 if checksum else 0
+    return (block_size - 12 - tail) // 12
+
+
+def _leaf_record(ex: Extent) -> bytes:
+    length = ex.length + (C.EXT_INIT_MAX_LEN if ex.uninitialized else 0)
+    return struct.pack(
+        "<IHHI",
+        ex.logical,
+        length,
+        (ex.physical >> 32) & 0xFFFF,
+        ex.physical & 0xFFFFFFFF,
+    )
+
+
+def _index_record(logical: int, phys: int) -> bytes:
+    return struct.pack("<IIHH", logical, phys & 0xFFFFFFFF, (phys >> 32) & 0xFFFF, 0)
+
+
+def _collect_index_blocks(vol, inode: Inode) -> list[int]:
+    """Physical blocks that hold the extent tree, not file data."""
+    data = inode.i_block
+    if len(data) < 12:
+        return []
+    magic, entries, _eh_max, depth = _header(data, 0)
+    if magic != C.EXT4_EXT_MAGIC or depth <= 0 or entries <= 0:
+        return []
+    out: list[int] = []
+    try:
+        _collect_index_node(vol, data, depth, entries, out, set())
+    except Exception:
+        return out
+    return out
+
+
+def _collect_index_node(vol, data: bytes, depth: int, entries: int, out: list[int], seen: set[int]) -> None:
+    if depth <= 0:
+        return
+    limit = max(0, (len(data) - 12) // 12)
+    count = entries if entries < limit else limit
+    for i in range(count):
+        _logical, phys = _idx(data, 12 + i * 12)
+        if phys <= 0 or phys in seen:
+            continue
+        seen.add(phys)
+        out.append(phys)
+        try:
+            block = vol.read_block(phys)
+        except Exception:
+            continue
+        if len(block) < 12:
+            continue
+        magic, ent, _mx, dep = _header(block, 0)
+        if magic != C.EXT4_EXT_MAGIC or ent <= 0:
+            continue
+        _collect_index_node(vol, block, dep, ent, out, seen)
+
+
+def discard_old_extent_indexes(vol, inode: Inode) -> None:
+    """Free index blocks left by the previous tree. Call after the new inode is stored."""
+    old = getattr(inode, "_extent_index_old", None)
+    if not old:
+        return
+    inode._extent_index_old = []
+    from ext4reader.bitmap import free_phys_runs
+
+    free_phys_runs(vol, [(block, 1) for block in old])
+
+
+def _write_extent_node(vol, inode: Inode, records: list[bytes], depth: int, cap: int, allocated: list[int]) -> int:
     from ext4reader.bitmap import alloc_blocks
 
-    idx = 0
-    allocated_index_blocks = 0
-    while idx < len(extents):
-        chunk = extents[idx : idx + per_leaf]
-        phys_list = alloc_blocks(vol, 1)
-        phys = phys_list[0]
-        block = bytearray(bs)
-        hdr = struct.pack("<HHHHI", C.EXT4_EXT_MAGIC, len(chunk), per_leaf, 0, 0)
-        block[0:12] = hdr
-        for i, ex in enumerate(chunk):
-            length = ex.length + (C.EXT_INIT_MAX_LEN if ex.uninitialized else 0)
-            rec = struct.pack(
-                "<IHHI",
-                ex.logical,
-                length,
-                (ex.physical >> 32) & 0xFFFF,
-                ex.physical & 0xFFFFFFFF,
-            )
-            block[12 + i * 12 : 24 + i * 12] = rec
-        _extent_block_csum(vol.sb, inode.ino, inode.generation, block)
-        vol.write_block(phys, bytes(block))
-        leaves.append((chunk[0].logical, phys))
-        allocated_index_blocks += 1
-        idx += len(chunk)
+    phys = alloc_blocks(vol, 1, metadata=True)[0]
+    allocated.append(phys)
+    bs = vol.sb.block_size
+    block = bytearray(bs)
+    block[0:12] = struct.pack("<HHHHI", C.EXT4_EXT_MAGIC, len(records), cap, depth, 0)
+    for i, rec in enumerate(records):
+        block[12 + i * 12 : 24 + i * 12] = rec
+    _extent_block_csum(vol.sb, inode.ino, inode.generation, block)
+    vol.write_block(phys, bytes(block))
+    return phys
 
-    if len(leaves) > 4:
-        raise ValueError("파일이 너무 조각나 있습니다. 연속 할당에 실패했습니다.")
 
-    body = bytearray(60)
-    hdr = struct.pack("<HHHHI", C.EXT4_EXT_MAGIC, len(leaves), 4, 1, 0)
-    body[0:12] = hdr
-    for i, (logical, phys) in enumerate(leaves):
-        rec = struct.pack("<IIHH", logical, phys & 0xFFFFFFFF, (phys >> 32) & 0xFFFF, 0)
-        body[12 + i * 12 : 24 + i * 12] = rec
-    inode.set_blocks(
-        (inode.blocks * 512) // vol.sb.block_size + allocated_index_blocks,
-        vol.sb.block_size,
-    )
-    return bytes(body)
+def build_extent_tree(vol, inode: Inode, extents: list[Extent]) -> bytes:
+    """Return 60-byte i_block. Grows a depth-2+ tree when one index level is not enough."""
+    old_index = _collect_index_blocks(vol, inode)
+    bs = vol.sb.block_size
+    allocated: list[int] = []
+    try:
+        if len(extents) <= 4:
+            body = extents_to_inode_body(extents)
+        else:
+            cap = _node_capacity(bs, vol.sb.has_metadata_csum)
+            if cap < 2:
+                raise ValueError("블록이 너무 작아 extent 트리를 만들 수 없습니다.")
+            nodes: list[tuple[int, int]] = []
+            idx = 0
+            while idx < len(extents):
+                chunk = extents[idx : idx + cap]
+                phys = _write_extent_node(vol, inode, [_leaf_record(ex) for ex in chunk], 0, cap, allocated)
+                nodes.append((chunk[0].logical, phys))
+                idx += len(chunk)
+            inode_depth = 1
+            while len(nodes) > 4:
+                packed: list[tuple[int, int]] = []
+                cursor = 0
+                while cursor < len(nodes):
+                    chunk = nodes[cursor : cursor + cap]
+                    phys = _write_extent_node(
+                        vol,
+                        inode,
+                        [_index_record(logical, phys) for logical, phys in chunk],
+                        inode_depth,
+                        cap,
+                        allocated,
+                    )
+                    packed.append((chunk[0][0], phys))
+                    cursor += len(chunk)
+                nodes = packed
+                inode_depth += 1
+            body_buf = bytearray(60)
+            body_buf[0:12] = struct.pack("<HHHHI", C.EXT4_EXT_MAGIC, len(nodes), 4, inode_depth, 0)
+            for i, (logical, phys) in enumerate(nodes):
+                body_buf[12 + i * 12 : 24 + i * 12] = _index_record(logical, phys)
+            inode.set_blocks((inode.blocks * 512) // bs + len(allocated), bs)
+            body = bytes(body_buf)
+    except Exception:
+        if allocated:
+            from ext4reader.bitmap import free_phys_runs
+
+            try:
+                free_phys_runs(vol, [(block, 1) for block in allocated])
+            except Exception:
+                pass
+        raise
+    keep = set(allocated)
+    inode._extent_index_old = [block for block in old_index if block not in keep]
+    return body

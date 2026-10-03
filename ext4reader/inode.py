@@ -98,9 +98,14 @@ class Inode:
         struct.pack_into("<H", self.raw, 0x1A, n & 0xFFFF)
 
     def set_blocks(self, fs_blocks: int, block_size: int) -> None:
-        # 512-byte units
+        # 512-byte units, 48-bit so a file is not capped at 2TiB.
         self.blocks = fs_blocks * (block_size // 512)
         struct.pack_into("<I", self.raw, 0x1C, self.blocks & 0xFFFFFFFF)
+        if len(self.raw) >= 0x76:
+            struct.pack_into("<H", self.raw, 0x74, (self.blocks >> 32) & 0xFFFF)
+        if self.flags & C.EXT4_HUGE_FILE_FL:
+            self.flags &= ~C.EXT4_HUGE_FILE_FL
+            struct.pack_into("<I", self.raw, 0x20, self.flags)
 
     def set_flags(self, flags: int) -> None:
         self.flags = flags
@@ -159,6 +164,15 @@ def parse_inode(sb: Superblock, ino: int, raw: bytes) -> Inode:
     fsize = _u32(buf, 0x04)
     if len(buf) >= 0x70:
         fsize |= _u32(buf, 0x6C) << 32
+    flags = _u32(buf, 0x20)
+    blocks = _u32(buf, 0x1C)
+    if (
+        len(buf) >= 0x76
+        and sb.feature_ro_compat & C.EXT4_FEATURE_RO_COMPAT_HUGE_FILE
+    ):
+        blocks |= _u16(buf, 0x74) << 32
+        if flags & C.EXT4_HUGE_FILE_FL:
+            blocks *= sb.block_size // 512
     extra = _u16(buf, 0x80) if len(buf) >= 0x82 else 0
     crtime = _u32(buf, 0x90) if extra >= 24 and len(buf) >= 0x94 else 0
     file_acl = _u32(buf, 0x68) if len(buf) >= 0x6C else 0
@@ -176,8 +190,8 @@ def parse_inode(sb: Superblock, ino: int, raw: bytes) -> Inode:
         mtime=_u32(buf, 0x10),
         dtime=_u32(buf, 0x14),
         links=_u16(buf, 0x1A),
-        blocks=_u32(buf, 0x1C),
-        flags=_u32(buf, 0x20),
+        blocks=blocks,
+        flags=flags,
         generation=_u32(buf, 0x64) if len(buf) >= 0x68 else 0,
         extra_isize=extra,
         crtime=crtime,

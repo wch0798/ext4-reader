@@ -8,15 +8,24 @@ from collections.abc import Callable
 from pathlib import Path
 
 from ext4reader import constants as C
-from ext4reader.bitmap import alloc_blocks, alloc_inode, free_blocks, free_inode
+from ext4reader.bitmap import AllocError, alloc_blocks, alloc_inode, free_inode, free_phys_runs
 from ext4reader.directory import (
     DirError,
     add_dir_entry,
     init_directory_block,
     list_dir,
+    lookup_dir_name,
     remove_dir_entry,
 )
-from ext4reader.extents import Extent, build_extent_tree, file_extents
+from ext4reader.extents import (
+    Extent,
+    build_extent_tree,
+    discard_old_extent_indexes,
+    extent_at,
+    file_extents,
+    read_mapped,
+)
+from ext4reader.io_backend import IO_CHUNK
 from ext4reader.inode import Inode, file_type_from_mode, new_inode_raw
 from ext4reader.volume import Ext4Error, Ext4Volume
 
@@ -26,25 +35,28 @@ ProgressCb = Callable[[int, int], None]
 def read_file_bytes(vol: Ext4Volume, inode: Inode, limit: int | None = None) -> bytes:
     if inode.is_lnk and inode.size <= 60:
         return inode.i_block[: inode.size]
-    chunks: list[bytes] = []
     remaining = inode.size if limit is None else min(inode.size, limit)
-    got = 0
-    bs = vol.sb.block_size
-    for ex in file_extents(vol, inode):
-        if got >= remaining:
-            break
-        for i in range(ex.length):
-            if got >= remaining:
-                break
-            take = min(bs, remaining - got)
-            if ex.uninitialized:
-                chunks.append(b"\x00" * take)
-            else:
-                block = vol.read_block(ex.physical + i)
-                chunks.append(block[:take])
-            got += take
-    data = b"".join(chunks)
-    return data[:remaining]
+    if remaining <= 0:
+        return b""
+    return read_mapped(vol, inode, 0, remaining)
+
+
+def _write_zeros(fp, length: int) -> None:
+    buf = b"\x00" * IO_CHUNK
+    left = length
+    while left > 0:
+        n = IO_CHUNK if left > IO_CHUNK else left
+        fp.write(buf if n == IO_CHUNK else buf[:n])
+        left -= n
+
+
+def _pwrite(vol: Ext4Volume, fs_off: int, data: bytes | memoryview) -> None:
+    mv = data if isinstance(data, memoryview) else memoryview(data)
+    pos = 0
+    while pos < len(mv):
+        n = IO_CHUNK if len(mv) - pos > IO_CHUNK else len(mv) - pos
+        vol.write_bytes(fs_off + pos, mv[pos : pos + n])
+        pos += n
 
 
 def extract_inode(
@@ -57,23 +69,48 @@ def extract_inode(
     done = 0
     bs = vol.sb.block_size
     os.makedirs(os.path.dirname(os.path.abspath(dest)) or ".", exist_ok=True)
-    with open(dest, "wb") as fp:
+    with open(dest, "wb", buffering=IO_CHUNK) as fp:
         if inode.size == 0:
             if progress:
                 progress(0, 0)
             return
+        cursor = 0
         for ex in file_extents(vol, inode):
-            for i in range(ex.length):
-                take = min(bs, total - done)
-                if take <= 0:
-                    break
-                if ex.uninitialized:
-                    fp.write(b"\x00" * take)
-                else:
-                    fp.write(vol.read_block(ex.physical + i)[:take])
-                done += take
+            if done >= total:
+                break
+            ex_off = ex.logical * bs
+            if ex_off > cursor and cursor < total:
+                gap = min(ex_off, total) - cursor
+                _write_zeros(fp, gap)
+                done += gap
+                cursor += gap
                 if progress:
                     progress(done, total)
+            if done >= total:
+                break
+            take = min(ex.length * bs, total - done)
+            if ex.uninitialized:
+                _write_zeros(fp, take)
+                done += take
+            else:
+                disk = ex.physical * bs
+                left = take
+                while left:
+                    n = IO_CHUNK if left > IO_CHUNK else left
+                    fp.write(vol.read_bytes(disk, n))
+                    disk += n
+                    left -= n
+                    done += n
+                    if progress and (done == total or n == IO_CHUNK):
+                        progress(done, total)
+            cursor = ex_off + take
+            if progress and done == total:
+                progress(done, total)
+        if done < total:
+            _write_zeros(fp, total - done)
+            done = total
+            if progress:
+                progress(done, total)
     try:
         os.utime(dest, (inode.atime or time.time(), inode.mtime or time.time()))
     except OSError:
@@ -117,26 +154,34 @@ def create_file(
     inode.set_links(1)
     if nblocks:
         phys = alloc_blocks(vol, nblocks, prefer)
-        written = 0
-        with open(source_path, "rb") as fp:
-            for i, pb in enumerate(phys):
-                chunk = fp.read(bs)
-                if len(chunk) < bs:
-                    chunk = chunk + b"\x00" * (bs - len(chunk))
-                vol.write_block(pb, chunk)
-                written = min(size, (i + 1) * bs)
+        with open(source_path, "rb", buffering=IO_CHUNK) as fp:
+            i = 0
+            while i < len(phys):
+                start = phys[i]
+                run = 1
+                while (
+                    i + run < len(phys)
+                    and phys[i + run] == start + run
+                    and run < C.EXT_UNINIT_MAX_LEN
+                ):
+                    run += 1
+                raw = fp.read(run * bs)
+                if len(raw) < run * bs:
+                    raw = raw + b"\x00" * (run * bs - len(raw))
+                _pwrite(vol, start * bs, raw)
+                i += run
                 if progress:
-                    progress(written, size)
+                    progress(min(size, i * bs), size)
         exts = _runs_from_blocks(phys)
-        body = build_extent_tree(vol, inode, exts)
-        inode.set_i_block(body)
         inode.set_blocks(nblocks, bs)
+        inode.set_i_block(build_extent_tree(vol, inode, exts))
     else:
         inode.set_blocks(0, bs)
         if progress:
             progress(0, 0)
     inode.set_times()
     vol.write_inode(inode)
+    discard_old_extent_indexes(vol, inode)
     parent = vol.read_inode(parent.ino)
     parent = add_dir_entry(vol, parent, name, ino, C.EXT4_FT_REG_FILE)
     parent.set_times()
@@ -159,6 +204,7 @@ def mkdir(vol: Ext4Volume, parent: Inode, name: str) -> Inode:
     inode.set_blocks(1, vol.sb.block_size)
     init_directory_block(vol, inode, parent.ino, phys)
     vol.write_inode(inode)
+    discard_old_extent_indexes(vol, inode)
     parent = vol.read_inode(parent.ino)
     parent = add_dir_entry(vol, parent, name, ino, C.EXT4_FT_DIR)
     parent.set_links(parent.links + 1)
@@ -198,12 +244,9 @@ def unlink(vol: Ext4Volume, parent: Inode, name: str) -> None:
     parent.set_times()
     vol.write_inode(parent)
 
-    blocks = []
-    for ex in file_extents(vol, child):
-        if not ex.uninitialized:
-            blocks.extend(range(ex.physical, ex.physical + ex.length))
-    if blocks:
-        free_blocks(vol, blocks)
+    runs = [(ex.physical, ex.length) for ex in file_extents(vol, child) if ex.length]
+    if runs:
+        free_phys_runs(vol, runs)
     # zero inode
     child.raw[:] = b"\x00" * len(child.raw)
     child.dtime = int(time.time())
@@ -305,20 +348,10 @@ def lookup_path(vol: Ext4Volume, path: str) -> Inode:
         node = vol.read_inode(ino)
         if not node.is_dir:
             raise FileNotFoundError(path)
-        match = None
-        for e in list_dir(vol, node):
-            if e.name == part:
-                match = e
-                break
-        if match is None:
-            lower = part.lower()
-            for e in list_dir(vol, node):
-                if e.name.lower() == lower:
-                    match = e
-                    break
-        if match is None:
+        child = lookup_dir_name(vol, node, part)
+        if child is None:
             raise FileNotFoundError(path)
-        ino = match.inode
+        ino = child
     return vol.read_inode(ino)
 
 
@@ -331,12 +364,104 @@ def lookup_parent(vol: Ext4Volume, path: str) -> tuple[Inode, str]:
 
 
 def lookup_phys(vol: Ext4Volume, inode: Inode, lblk: int) -> int | None:
-    for ex in file_extents(vol, inode):
-        if ex.logical <= lblk < ex.logical + ex.length:
-            if ex.uninitialized:
-                return None
-            return ex.physical + (lblk - ex.logical)
+    ex = extent_at(file_extents(vol, inode), lblk)
+    if ex is None or ex.uninitialized:
+        return None
+    return ex.physical + (lblk - ex.logical)
+
+
+def _merge_extents(extents: list[Extent]) -> list[Extent]:
+    if not extents:
+        return []
+    ordered = sorted(extents, key=lambda e: e.logical)
+    out: list[Extent] = [ordered[0]]
+    for ex in ordered[1:]:
+        prev = out[-1]
+        contiguous = (
+            prev.logical + prev.length == ex.logical
+            and prev.physical + prev.length == ex.physical
+            and prev.uninitialized == ex.uninitialized
+            and prev.length + ex.length <= C.EXT_UNINIT_MAX_LEN
+        )
+        if contiguous:
+            prev.length += ex.length
+        else:
+            out.append(ex)
+    return out
+
+
+def _successor_logical(extents: list[Extent], lblk: int) -> int | None:
+    lo = 0
+    hi = len(extents)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if extents[mid].logical <= lblk:
+            lo = mid + 1
+        else:
+            hi = mid
+    if lo < len(extents):
+        return extents[lo].logical
     return None
+
+
+def _add_runs(extents: list[Extent], logical: int, blocks: list[int], uninit: bool = False) -> list[Extent]:
+    i = 0
+    while i < len(blocks):
+        start = blocks[i]
+        run = 1
+        while i + run < len(blocks) and blocks[i + run] == start + run and run < C.EXT_UNINIT_MAX_LEN:
+            run += 1
+        extents.append(Extent(logical, run, start, uninit))
+        logical += run
+        i += run
+    return _merge_extents(extents)
+
+
+def _initialize_range(extents: list[Extent], logical: int, nblocks: int) -> list[Extent]:
+    if nblocks <= 0:
+        return extents
+    end = logical + nblocks
+    out: list[Extent] = []
+    for ex in extents:
+        ex_end = ex.logical + ex.length
+        if not ex.uninitialized or ex_end <= logical or ex.logical >= end:
+            out.append(ex)
+            continue
+        if ex.logical < logical:
+            out.append(Extent(ex.logical, logical - ex.logical, ex.physical, True))
+        mid_lo = logical if logical > ex.logical else ex.logical
+        mid_hi = end if end < ex_end else ex_end
+        out.append(Extent(mid_lo, mid_hi - mid_lo, ex.physical + (mid_lo - ex.logical), False))
+        if ex_end > end:
+            out.append(Extent(end, ex_end - end, ex.physical + (end - ex.logical), True))
+    return _merge_extents(out)
+
+
+def _write_at_block(vol: Ext4Volume, phys: int, boff: int, data: bytes) -> None:
+    bs = vol.sb.block_size
+    if not data:
+        return
+    if boff == 0 and len(data) % bs == 0:
+        _pwrite(vol, phys * bs, data)
+        return
+    if boff:
+        take = min(bs - boff, len(data))
+        blk = bytearray(vol.read_block(phys))
+        blk[boff : boff + take] = data[:take]
+        vol.write_block(phys, bytes(blk))
+        data = data[take:]
+        phys += 1
+        if not data:
+            return
+    nfull = len(data) // bs
+    if nfull:
+        _pwrite(vol, phys * bs, data[: nfull * bs])
+        phys += nfull
+        data = data[nfull * bs :]
+    if data:
+        blk = bytearray(vol.read_block(phys))
+        blk[: len(data)] = data
+        vol.write_block(phys, bytes(blk))
 
 
 def inode_block_map(vol: Ext4Volume, inode: Inode) -> list[int | None]:
@@ -404,21 +529,12 @@ def read_range(vol: Ext4Volume, inode: Inode, offset: int, length: int) -> bytes
     if offset >= inode.size or length <= 0:
         return b""
     length = min(length, inode.size - offset)
-    bs = vol.sb.block_size
-    out = bytearray()
-    pos = offset
-    end = offset + length
-    while pos < end:
-        lblk = pos // bs
-        boff = pos % bs
-        take = min(bs - boff, end - pos)
-        phys = lookup_phys(vol, inode, lblk)
-        if phys is None:
-            out += b"\x00" * take
-        else:
-            out += vol.read_block(phys)[boff : boff + take]
-        pos += take
-    return bytes(out)
+    return read_mapped(vol, inode, offset, length)
+
+
+# Sequential copies allocate this many blocks at a time so a 1MB write does not
+# become its own extent. 8192 * 4KiB is 32MiB.
+_PREALLOC_BLOCKS = 8192
 
 
 def write_range(vol: Ext4Volume, inode: Inode, offset: int, data: bytes, flush: bool = False) -> int:
@@ -433,39 +549,68 @@ def write_range(vol: Ext4Volume, inode: Inode, offset: int, data: bytes, flush: 
         return 0
     bs = vol.sb.block_size
     prefer = (inode.ino - 1) // vol.sb.inodes_per_group
-    mapping = None
+    extents = [Extent(e.logical, e.length, e.physical, e.uninitialized) for e in file_extents(vol, inode)]
+    changed = False
     pos = 0
+    guard = 0
     while pos < len(data):
+        guard += 1
+        if guard > len(data) * 2 + 4:
+            raise Ext4Error("파일 쓰기가 진행되지 않습니다.")
         abs_off = offset + pos
         lblk = abs_off // bs
         boff = abs_off % bs
-        take = min(bs - boff, len(data) - pos)
-        phys = lookup_phys(vol, inode, lblk)
-        if phys is None:
-            if mapping is None:
-                mapping = inode_block_map(vol, inode)
-            while lblk >= len(mapping):
-                mapping.append(None)
-            if mapping[lblk] is None:
-                mapping[lblk] = alloc_blocks(vol, 1, prefer)[0]
-            phys = mapping[lblk]
-        chunk = data[pos : pos + take]
-        if take == bs and boff == 0:
-            vol.write_block(phys, chunk)
-        else:
-            blk = bytearray(vol.read_block(phys))
-            blk[boff : boff + take] = chunk
-            vol.write_block(phys, bytes(blk))
+        ex = extent_at(extents, lblk)
+        if ex is None:
+            next_l = _successor_logical(extents, lblk)
+            write_last = (offset + len(data) - 1) // bs
+            hole_last = write_last if next_l is None else min(write_last, next_l - 1)
+            need = hole_last - lblk + 1
+            if need <= 0:
+                raise Ext4Error("할당할 블록이 없습니다.")
+            extra = 0
+            if next_l is None and need < _PREALLOC_BLOCKS:
+                extra = _PREALLOC_BLOCKS - need
+            try:
+                phys_list = alloc_blocks(vol, need + extra, prefer)
+            except AllocError:
+                if not extra:
+                    raise
+                phys_list = alloc_blocks(vol, need, prefer)
+                extra = 0
+            if extra and len(phys_list) > need:
+                extents = _add_runs(extents, lblk, phys_list[:need])
+                extents = _add_runs(extents, lblk + need, phys_list[need:], uninit=True)
+            else:
+                extents = _add_runs(extents, lblk, phys_list)
+            changed = True
+            continue
+        extent_end = (ex.logical + ex.length) * bs
+        take = min(len(data) - pos, extent_end - abs_off)
+        if take <= 0:
+            raise Ext4Error("파일 쓰기가 진행되지 않습니다.")
+        phys = ex.physical + (lblk - ex.logical)
+        _write_at_block(vol, phys, boff, data[pos : pos + take])
+        if ex.uninitialized:
+            touched = (boff + take + bs - 1) // bs
+            extents = _initialize_range(extents, lblk, touched)
+            changed = True
         pos += take
-    if mapping is not None:
-        _commit_mapping(vol, inode, mapping)
+    if changed:
+        extents = _merge_extents(extents)
+        inode.set_blocks(sum(e.length for e in extents), bs)
+        inode.set_i_block(build_extent_tree(vol, inode, extents))
     new_size = max(inode.size, offset + len(data))
     if new_size != inode.size:
         inode.set_size(new_size)
     inode.set_times()
+    # Reserve blocks before the inode points at them. Device flush waits until
+    # the caller asks, so a long copy is not stalled on the USB cache.
+    vol.commit_metadata(sync=False)
     vol.write_inode(inode)
+    discard_old_extent_indexes(vol, inode)
     if flush:
-        vol.flush_metadata()
+        vol.commit_metadata(sync=True)
     return len(data)
 
 
@@ -474,17 +619,30 @@ def set_file_size(vol: Ext4Volume, inode: Inode, new_size: int) -> Inode:
     bs = vol.sb.block_size
     if new_size < 0:
         new_size = 0
-    mapping = inode_block_map(vol, inode)
     new_n = (new_size + bs - 1) // bs if new_size else 0
-    extra = [b for b in mapping[new_n:] if b is not None]
-    mapping = mapping[:new_n]
-    if extra:
-        free_blocks(vol, extra)
+    keep: list[Extent] = []
+    runs: list[tuple[int, int]] = []
+    for ex in file_extents(vol, inode):
+        ex_end = ex.logical + ex.length
+        if ex_end <= new_n:
+            keep.append(Extent(ex.logical, ex.length, ex.physical, ex.uninitialized))
+            continue
+        if ex.logical >= new_n:
+            runs.append((ex.physical, ex.length))
+            continue
+        keep_len = new_n - ex.logical
+        keep.append(Extent(ex.logical, keep_len, ex.physical, ex.uninitialized))
+        runs.append((ex.physical + keep_len, ex.length - keep_len))
+    if runs:
+        free_phys_runs(vol, runs)
+    keep = _merge_extents(keep)
     inode.set_size(new_size)
-    _commit_mapping(vol, inode, mapping)
+    inode.set_blocks(sum(e.length for e in keep), bs)
+    inode.set_i_block(build_extent_tree(vol, inode, keep))
     inode.set_times()
     vol.write_inode(inode)
-    vol.flush_metadata()
+    discard_old_extent_indexes(vol, inode)
+    vol.commit_metadata(sync=True)
     return inode
 
 
