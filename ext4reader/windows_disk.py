@@ -1742,6 +1742,146 @@ class WindowsPhysicalDevice(BlockDevice):
             blocks,
         )
 
+    def _write_locked_partition_device(self, offset: int, data: bytes) -> None:
+        """Write via the partition device after the real matching volume is locked.
+
+        Earlier versions tried HarddiskNPartitionM before we could positively
+        lock the corresponding hidden HarddiskVolume.  On Windows these are
+        different device objects.  Retry the partition PDO only after the
+        matching volume lock/dismount has succeeded.
+        """
+        from ext4reader.debuglog import LOG
+
+        disk_index = _physical_index(self.path)
+        part = self._partition_number
+        if disk_index is None or part is None:
+            raise IoError("파티션 장치 경로를 계산할 수 없습니다.", winerr=87)
+        if offset < 0 or (self._partition_size and offset + len(data) > self._partition_size):
+            raise IoError(
+                f"파티션 범위 밖 쓰기 offset={offset} len={len(data)}",
+                winerr=87,
+            )
+
+        candidates = [
+            rf"\\.\Harddisk{disk_index}Partition{int(part)}",
+            rf"\\?\GLOBALROOT\Device\Harddisk{disk_index}\Partition{int(part)}",
+        ]
+        failures: list[str] = []
+
+        for path in candidates:
+            handle = kernel32.CreateFileW(
+                path,
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+            if handle == INVALID_HANDLE_VALUE or handle is None:
+                failures.append(f"{path} open Win32={ctypes.get_last_error()}")
+                continue
+            try:
+                _allow_extended_io(handle)
+                new_pos = ctypes.c_longlong(0)
+                kernel32.SetLastError(0)
+                if not kernel32.SetFilePointerEx(
+                    handle,
+                    int(offset),
+                    ctypes.byref(new_pos),
+                    FILE_BEGIN,
+                ):
+                    failures.append(f"{path} seek Win32={ctypes.get_last_error()}")
+                    continue
+
+                done = wintypes.DWORD(0)
+                buf = (ctypes.c_char * len(data)).from_buffer_copy(data)
+                kernel32.SetLastError(0)
+                ok = kernel32.WriteFile(handle, buf, len(data), ctypes.byref(done), None)
+                err = ctypes.get_last_error()
+                if ok and done.value == len(data):
+                    kernel32.FlushFileBuffers(handle)
+                    absolute = self._partition_offset + offset
+                    if self._read_at(absolute, len(data)) != data:
+                        raise IoError(
+                            f"{path} 파티션 쓰기 read-back 검증 실패 offset={offset}",
+                            winerr=23,
+                        )
+                    LOG.warning(
+                        "잠금된 hidden volume 우회: 파티션 장치 WriteFile 성공 "
+                        "path=%s offset=%s len=%s",
+                        path,
+                        offset,
+                        len(data),
+                    )
+                    return
+                failures.append(
+                    f"{path} WriteFile Win32={err} {done.value}/{len(data)}"
+                )
+            finally:
+                kernel32.CloseHandle(handle)
+
+        # Win32 partition-device WriteFile may itself be filtered. Try the same
+        # partition device through Native NT I/O before falling back to the
+        # whole PhysicalDrive object.
+        for path in candidates:
+            nt_handle = None
+            try:
+                nt_handle = _nt_open_raw_handle(path)
+                iosb = _IO_STATUS_BLOCK()
+                nt_offset = ctypes.c_longlong(int(offset))
+                buf = (ctypes.c_char * len(data)).from_buffer_copy(data)
+                status = ntdll.NtWriteFile(
+                    nt_handle,
+                    None,
+                    None,
+                    None,
+                    ctypes.byref(iosb),
+                    buf,
+                    len(data),
+                    ctypes.byref(nt_offset),
+                    None,
+                )
+                if not _nt_success(status):
+                    failures.append(
+                        f"{_nt_native_path(path)} NtWriteFile "
+                        f"NTSTATUS={_nt_status_hex(status)}"
+                    )
+                    continue
+                if int(iosb.Information) != len(data):
+                    failures.append(
+                        f"{_nt_native_path(path)} NtWriteFile short "
+                        f"{int(iosb.Information)}/{len(data)}"
+                    )
+                    continue
+
+                flush_iosb = _IO_STATUS_BLOCK()
+                ntdll.NtFlushBuffersFile(nt_handle, ctypes.byref(flush_iosb))
+                absolute = self._partition_offset + offset
+                if self._read_at(absolute, len(data)) != data:
+                    raise IoError(
+                        f"{path} Native NT 파티션 쓰기 read-back 검증 실패 offset={offset}",
+                        winerr=23,
+                    )
+                LOG.warning(
+                    "잠금된 hidden volume 우회: 파티션 장치 NtWriteFile 성공 "
+                    "path=%s offset=%s len=%s",
+                    _nt_native_path(path),
+                    offset,
+                    len(data),
+                )
+                return
+            except IoError as exc:
+                failures.append(str(exc))
+            finally:
+                if nt_handle is not None:
+                    ntdll.NtClose(nt_handle)
+
+        raise IoError(
+            "잠금된 파티션 장치 쓰기 실패: " + " | ".join(failures[-6:]),
+            winerr=5,
+        )
+
     def _fallback_after_volume_access_denied(self, offset: int, data: bytes) -> None:
         """Retry through PhysicalDrive after the matching volume is locked.
 
@@ -1751,6 +1891,16 @@ class WindowsPhysicalDevice(BlockDevice):
         from ext4reader.debuglog import LOG
 
         absolute = self._partition_offset + offset
+
+        try:
+            self._write_locked_partition_device(offset, data)
+            return
+        except IoError as part_exc:
+            LOG.warning(
+                "잠금된 파티션 장치 쓰기도 실패: %s; PhysicalDrive write 시도",
+                part_exc,
+            )
+
         try:
             self._write_at(absolute, data)
             LOG.warning(
