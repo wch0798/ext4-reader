@@ -157,6 +157,7 @@ class UsbIdentity:
     instance_id: str
     vid: int
     pid: int
+    lun: int = 0
 
 
 @dataclass(frozen=True)
@@ -176,7 +177,7 @@ class Capacity:
         return (self.last_lba + 1) * self.block_size
 
 
-def parse_usb_identity(parent_instance_id: str) -> UsbIdentity:
+def parse_usb_identity(parent_instance_id: str, child_instance_id: str = "") -> UsbIdentity:
     text = (parent_instance_id or "").strip()
     m = _USB_ID_RE.match(text)
     if not m:
@@ -188,7 +189,17 @@ def parse_usb_identity(parent_instance_id: str) -> UsbIdentity:
     pid = int(m.group(2), 16)
     instance = m.group(3)
     device_id = f"USB\\VID_{vid:04X}&PID_{pid:04X}"
-    return UsbIdentity(device_id, instance, vid, pid)
+    lun = 0
+    child = (child_instance_id or "").strip()
+    lm = re.search(r"&([0-9A-Fa-f]+)$", child)
+    if lm:
+        try:
+            candidate = int(lm.group(1), 16)
+            if 0 <= candidate <= 15:
+                lun = candidate
+        except ValueError:
+            pass
+    return UsbIdentity(device_id, instance, vid, pid, lun)
 
 
 def resolve_usb_identity_for_physicaldrive(path: str) -> UsbIdentity:
@@ -247,7 +258,10 @@ if (-not $found) {{ throw "USB parent not found for PhysicalDrive{index}" }}
         )
     try:
         obj = json.loads((proc.stdout or "").strip())
-        return parse_usb_identity(str(obj["parent"]))
+        return parse_usb_identity(
+            str(obj["parent"]),
+            str(obj.get("pnp") or ""),
+        )
     except Exception as exc:
         raise UsbDkDeviceNotFound(
             f"USB 부모 장치 결과를 해석하지 못했습니다: {(proc.stdout or '').strip()}",
@@ -591,14 +605,16 @@ class UsbDkBotBackend:
         self.bulk_in = endpoints.bulk_in
         self.bulk_out = endpoints.bulk_out
         self.interface_number = endpoints.interface_number
+        self.lun = int(identity.lun)
 
         LOG.warning(
-            "UsbDk 후보 확인 path=%s usb=%04X:%04X instance=%s "
+            "UsbDk 후보 확인 path=%s usb=%04X:%04X instance=%s lun=%s "
             "bulk_in=0x%02X bulk_out=0x%02X",
             physical_path,
             identity.vid,
             identity.pid,
             identity.instance_id,
+            self.lun,
             self.bulk_in,
             self.bulk_out,
         )
@@ -723,7 +739,7 @@ class UsbDkBotBackend:
             tag,
             transfer_len,
             flags,
-            0,
+            self.lun & 0x0F,
             len(cdb),
             cdb.ljust(16, b"\x00"),
         )
