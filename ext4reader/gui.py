@@ -59,7 +59,7 @@ def _kind_icon(kind: str) -> str:
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title(f"{__app_name__} — Windows 탐색기")
+        self.title(f"{__app_name__} {__version__}")
         self.geometry("860x720")
         self.minsize(760, 600)
         self.configure(bg=BG)
@@ -111,7 +111,7 @@ class App(tk.Tk):
     def _build(self) -> None:
         top = ttk.Frame(self)
         top.pack(fill="x", padx=16, pady=(14, 4))
-        ttk.Label(top, text="EXT4 Reader", style="Head.TLabel").pack(side="left")
+        ttk.Label(top, text=f"{__app_name__} {__version__}", style="Head.TLabel").pack(side="left")
         ttk.Label(top, text="  탐색기 드라이브로 연결", style="Dim.TLabel").pack(side="left")
         self.write_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(top, text="쓰기 허용", variable=self.write_var, command=self._on_write_toggle).pack(
@@ -129,11 +129,11 @@ class App(tk.Tk):
         )
         if is_admin():
             self.admin_badge.pack(side="right", padx=6)
-            self.title(f"{__app_name__} — 관리자 실행 중")
+            self.title(f"{__app_name__} {__version__} — 관리자 실행 중")
             LOG.info("GUI: 관리자 실행 중")
         else:
             self.admin_btn.pack(side="right", padx=4)
-            self.title(f"{__app_name__} — 관리자 권한 필요")
+            self.title(f"{__app_name__} {__version__} — 관리자 권한 필요")
             LOG.info("GUI: 일반 권한으로 실행 중")
 
         ttk.Label(

@@ -10,7 +10,6 @@ venv/
 *.iso
 *.bin
 *.dd
-Ext4Reader.exe
 *.log
 .cursor/
 agent-transcripts/
