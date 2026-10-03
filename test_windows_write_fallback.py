@@ -236,3 +236,24 @@ class VolumeOfflineTests(unittest.TestCase):
 
         self.assertFalse(item.offline)
         self.assertEqual(calls, [(88, wd.IOCTL_VOLUME_ONLINE)])
+
+
+class StoragePrivilegeTests(unittest.TestCase):
+    def test_storage_privilege_requests_manage_volume(self):
+        import ext4reader.windows_disk as wd
+
+        calls = []
+        with patch.object(
+            wd,
+            "_enable_privilege",
+            lambda name: calls.append(name) or (True, 0),
+        ):
+            self.assertTrue(wd._enable_storage_privileges())
+
+        self.assertEqual(calls, [wd.SE_MANAGE_VOLUME_NAME])
+
+    def test_storage_privilege_failure_is_reported(self):
+        import ext4reader.windows_disk as wd
+
+        with patch.object(wd, "_enable_privilege", return_value=(False, wd.ERROR_NOT_ALL_ASSIGNED)):
+            self.assertFalse(wd._enable_storage_privileges())
