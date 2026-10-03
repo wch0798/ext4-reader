@@ -659,6 +659,8 @@ def _write_unbuffered_raw_path(
     offset: int,
     data: bytes,
     fallback_sector: int = 512,
+    expected_device_number: int | None = None,
+    expected_device_type: int | None = None,
 ) -> tuple[int, int]:
     """Perform aligned raw I/O with FILE_FLAG_NO_BUFFERING.
 
@@ -688,6 +690,36 @@ def _write_unbuffered_raw_path(
     base = None
     try:
         _allow_extended_io(handle)
+        if expected_device_number is not None or expected_device_type is not None:
+            try:
+                raw_num = _ioctl(
+                    handle,
+                    IOCTL_STORAGE_GET_DEVICE_NUMBER,
+                    out_cb=ctypes.sizeof(STORAGE_DEVICE_NUMBER),
+                )
+                dev_num = STORAGE_DEVICE_NUMBER.from_buffer_copy(raw_num)
+            except OSError as exc:
+                raise IoError(
+                    f"NO_BUFFERING 장치 번호 확인 실패: {exc}",
+                    winerr=int(exc.args[0]) if exc.args else 31,
+                )
+            if (
+                expected_device_number is not None
+                and int(dev_num.DeviceNumber) != int(expected_device_number)
+            ):
+                raise IoError(
+                    "NO_BUFFERING PhysicalDrive 장치 번호 불일치",
+                    winerr=1167,
+                )
+            if (
+                expected_device_type is not None
+                and int(dev_num.DeviceType) != int(expected_device_type)
+            ):
+                raise IoError(
+                    "NO_BUFFERING PhysicalDrive 장치 유형 불일치",
+                    winerr=1167,
+                )
+
         logical, physical = _query_access_alignment(handle, fallback_sector)
         if offset < 0 or offset % logical or len(data) % logical:
             raise IoError(
