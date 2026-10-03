@@ -480,6 +480,58 @@ def _open_handle(path: str, writable: bool):
     return handle
 
 
+def _open_partition_device(disk_index: int, partition_number: int) -> _LockedVolume | None:
+    """Open the partition PDO directly when Mount Manager exposes no Volume{GUID}.
+
+    Linux/ext4 partitions often have no drive letter and, on some Windows
+    systems, are not returned by FindFirstVolumeW at all.  disk.sys still
+    exposes the partition device as
+    \\?\GLOBALROOT\Device\HarddiskN\PartitionM, which can be opened as a
+    direct-access volume/partition handle.
+    """
+    from ext4reader.debuglog import LOG
+
+    path = rf"\\?\GLOBALROOT\Device\Harddisk{disk_index}\Partition{partition_number}"
+    handle = kernel32.CreateFileW(
+        path,
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        None,
+        OPEN_EXISTING,
+        0,
+        None,
+    )
+    if handle == INVALID_HANDLE_VALUE or handle is None:
+        err = ctypes.get_last_error()
+        LOG.warning("파티션 장치 직접 열기 실패 %s (Win32 %s)", path, err)
+        return None
+
+    lock_ok = False
+    try:
+        try:
+            _ioctl(handle, FSCTL_LOCK_VOLUME)
+            lock_ok = True
+            LOG.info("파티션 장치 잠금 성공 %s", path)
+        except OSError as exc:
+            # RAW/unknown filesystems may have no mounted filesystem to lock.
+            LOG.info("파티션 장치 잠금 생략/실패 %s: %s", path, exc)
+        try:
+            _ioctl(handle, FSCTL_DISMOUNT_VOLUME)
+            LOG.info("파티션 장치 분리 성공 %s", path)
+        except OSError as exc:
+            LOG.info("파티션 장치 분리 생략/실패 %s: %s", path, exc)
+        _allow_extended_io(handle)
+        return _LockedVolume(
+            handle=int(handle),
+            name=path,
+            partition_number=int(partition_number),
+            locked=lock_ok,
+        )
+    except Exception:
+        kernel32.CloseHandle(handle)
+        raise
+
+
 def list_physical_disks() -> list[DiskInfo]:
     disks: list[DiskInfo] = []
     for idx in range(32):
@@ -583,10 +635,21 @@ class WindowsPhysicalDevice(BlockDevice):
                         )
                     else:
                         LOG.warning(
-                            "PhysicalDrive%s part=%s 에 해당하는 Windows 볼륨 핸들을 찾지 못했습니다.",
+                            "PhysicalDrive%s part=%s 에 해당하는 Volume{GUID} 핸들을 찾지 못했습니다. "
+                            "파티션 장치를 직접 엽니다.",
                             idx,
                             partition_number,
                         )
+                        direct = _open_partition_device(idx, int(partition_number))
+                        if direct is not None:
+                            self._volume_locks.append(direct)
+                            self._partition_volume = direct
+                            LOG.info(
+                                "파티션 직접 쓰기용 장치 핸들 선택 %s part=%s locked=%s",
+                                direct.name,
+                                direct.partition_number,
+                                direct.locked,
+                            )
         self._handle = _open_handle(path, writable)
         self._use_overlapped = True
         self._size, geo_ss = _query_geometry(self._handle)
@@ -657,6 +720,11 @@ class WindowsPhysicalDevice(BlockDevice):
                         ),
                         None,
                     )
+                    if self._partition_volume is None:
+                        direct = _open_partition_device(idx, int(self._partition_number))
+                        if direct is not None:
+                            self._volume_locks.append(direct)
+                            self._partition_volume = direct
         self._handle = _open_handle(self.path, self._writable)
         self._use_overlapped = True
         self._size, geo_ss = _query_geometry(self._handle)
@@ -864,6 +932,8 @@ class WindowsPhysicalDevice(BlockDevice):
             if self._closed:
                 return
             kernel32.FlushFileBuffers(self._handle)
+            if self._partition_volume is not None:
+                kernel32.FlushFileBuffers(self._partition_volume.handle)
 
     def close(self) -> None:
         self._stop_ka.set()
