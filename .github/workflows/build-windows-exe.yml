@@ -6,6 +6,9 @@ on:
       - main
     paths-ignore:
       - Ext4Reader.exe
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -31,6 +34,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pyinstaller
+
+      - name: Run regression tests
+        shell: pwsh
+        run: |
+          python -m unittest discover -v -p "test_*.py"
 
       - name: Read application version
         id: version
