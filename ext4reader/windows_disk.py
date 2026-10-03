@@ -1219,6 +1219,32 @@ class WindowsPhysicalDevice(BlockDevice):
             blocks,
         )
 
+    def _fallback_after_volume_access_denied(self, offset: int, data: bytes) -> None:
+        """Retry through PhysicalDrive after the matching volume is locked.
+
+        SCSI passthrough is used only if the PhysicalDrive write is still denied.
+        Kept separate so the routing can be unit-tested without real hardware.
+        """
+        from ext4reader.debuglog import LOG
+
+        absolute = self._partition_offset + offset
+        try:
+            self._write_at(absolute, data)
+            LOG.warning(
+                "볼륨 WriteFile Win32 5 우회: 잠금된 볼륨 상태에서 PhysicalDrive 쓰기 성공 "
+                "absolute=%s len=%s",
+                absolute,
+                len(data),
+            )
+            return
+        except IoError as phys_exc:
+            LOG.warning(
+                "잠금 후 PhysicalDrive 쓰기도 실패: %s; SCSI fallback 시도",
+                phys_exc,
+            )
+
+        self._scsi_write10(absolute, data)
+
     def _write_volume_seek(self, item: _LockedVolume, offset: int, data: bytes) -> None:
         """Write relative to a locked/dismounted volume handle."""
         kernel32.SetLastError(0)
@@ -1242,30 +1268,7 @@ class WindowsPhysicalDevice(BlockDevice):
         err = ctypes.get_last_error()
         if not ok or done.value != len(data):
             if err == 5:
-                absolute = self._partition_offset + offset
-                from ext4reader.debuglog import LOG
-
-                # Now that we have positively discovered and locked/dismounted
-                # the matching volume (including hidden HarddiskVolumeN
-                # aliases), retry the write on the PhysicalDrive handle.
-                # Windows Vista+ permits disk-handle writes into a volume's
-                # extents when that volume is explicitly locked/dismounted.
-                try:
-                    self._write_at(absolute, data)
-                    LOG.warning(
-                        "볼륨 WriteFile Win32 5 우회: 잠금된 볼륨 상태에서 PhysicalDrive 쓰기 성공 "
-                        "absolute=%s len=%s",
-                        absolute,
-                        len(data),
-                    )
-                    return
-                except IoError as phys_exc:
-                    LOG.warning(
-                        "잠금 후 PhysicalDrive 쓰기도 실패: %s; SCSI fallback 시도",
-                        phys_exc,
-                    )
-
-                self._scsi_write10(absolute, data)
+                self._fallback_after_volume_access_denied(offset, data)
                 return
             raise IoError(
                 f"{item.name} 볼륨 오프셋 {offset} 쓰기 실패 (Win32 {err})",
