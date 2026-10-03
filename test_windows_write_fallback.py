@@ -152,6 +152,7 @@ class WriteFallbackTests(unittest.TestCase):
         dev._scsi_write10 = lambda offset, data: (_ for _ in ()).throw(
             IoError("scsi denied", winerr=5)
         )
+        dev._prepare_system_helper_handle = lambda: None
         dev._read_at = lambda offset, length: payload if (offset, length) == (absolute, len(payload)) else b""
 
         with patch(
