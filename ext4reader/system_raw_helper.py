@@ -88,6 +88,7 @@ def run_system_raw_write(
     partition_size: int,
     data: bytes,
     sector_size: int,
+    try_disk_offline: bool = False,
     timeout: float = 25.0,
 ) -> dict:
     """Run one raw-write attempt in a LocalSystem scheduled task."""
@@ -121,6 +122,7 @@ def run_system_raw_write(
         "partition_offset": int(partition_offset),
         "partition_size": int(partition_size),
         "sector_size": int(sector_size),
+        "try_disk_offline": bool(try_disk_offline),
         "data_b64": base64.b64encode(data).decode("ascii"),
         "sha256": hashlib.sha256(data).hexdigest(),
         "result_path": result_path,
@@ -352,6 +354,7 @@ def _read_win32(handle: int, offset: int, length: int) -> bytes:
 
 def _execute_request(req: dict) -> dict:
     from ext4reader.windows_disk import (
+        IOCTL_DISK_UPDATE_PROPERTIES,
         IOCTL_STORAGE_GET_DEVICE_NUMBER,
         STORAGE_DEVICE_NUMBER,
         WindowsPhysicalDevice,
@@ -360,6 +363,7 @@ def _execute_request(req: dict) -> dict:
         _nt_open_raw_handle,
         _open_handle,
         _query_storage,
+        _set_disk_offline_state,
         kernel32,
         ntdll,
     )
@@ -376,6 +380,7 @@ def _execute_request(req: dict) -> dict:
     partition_offset = int(req["partition_offset"])
     partition_size = int(req["partition_size"])
     sector_size = int(req["sector_size"])
+    try_disk_offline = bool(req.get("try_disk_offline", False))
     data = base64.b64decode(req["data_b64"], validate=True)
 
     if not data or len(data) > MAX_WRITE:
@@ -441,9 +446,23 @@ def _execute_request(req: dict) -> dict:
                 writer(handle, offset, data)
                 if _read_win32(physical_dup, absolute_offset, len(data)) != data:
                     raise IoError(f"{name} read-back 불일치", winerr=23)
-                return {"ok": True, "method": name}
+                return {"ok": True, "method": name, "disk_offline": False}
             except IoError as exc:
                 failures.append(f"{name}: {exc}")
+
+        helper_set_offline = False
+        if try_disk_offline:
+            ok_offline, err_offline = _set_disk_offline_state(
+                wintypes.HANDLE(physical_dup),
+                True,
+            )
+            if ok_offline:
+                helper_set_offline = True
+                failures.append("SYSTEM whole-disk OFFLINE: success")
+            else:
+                failures.append(
+                    f"SYSTEM whole-disk OFFLINE: Win32={err_offline}"
+                )
 
         # A duplicated handle preserves the parent's original file object.
         # Create a fresh PhysicalDrive file object as LocalSystem so drivers
@@ -478,7 +497,11 @@ def _execute_request(req: dict) -> dict:
                     writer(int(fresh), absolute_offset, data)
                     if _read_win32(int(fresh), absolute_offset, len(data)) != data:
                         raise IoError(f"{name} read-back 불일치", winerr=23)
-                    return {"ok": True, "method": name}
+                    return {
+                        "ok": True,
+                        "method": name,
+                        "disk_offline": helper_set_offline,
+                    }
                 except IoError as exc:
                     failures.append(f"{name}: {exc}")
 
@@ -488,7 +511,11 @@ def _execute_request(req: dict) -> dict:
                 _write_nt(int(nt_handle.value), absolute_offset, data)
                 if _read_win32(int(fresh), absolute_offset, len(data)) != data:
                     raise IoError("SYSTEM fresh NT read-back 불일치", winerr=23)
-                return {"ok": True, "method": "SYSTEM fresh-PhysicalDrive NtOpenFile/NtWriteFile"}
+                return {
+                    "ok": True,
+                    "method": "SYSTEM fresh-PhysicalDrive NtOpenFile/NtWriteFile",
+                    "disk_offline": helper_set_offline,
+                }
             except IoError as exc:
                 failures.append(f"SYSTEM fresh NtOpenFile/NtWriteFile: {exc}")
             finally:
@@ -501,7 +528,11 @@ def _execute_request(req: dict) -> dict:
                 dev.sector_size = sector_size
                 dev._read_at = lambda off, length: _read_win32(int(fresh), off, length)
                 dev._scsi_write10(absolute_offset, data)
-                return {"ok": True, "method": "SYSTEM fresh SCSI WRITE(10)"}
+                return {
+                    "ok": True,
+                    "method": "SYSTEM fresh SCSI WRITE(10)",
+                    "disk_offline": helper_set_offline,
+                }
             except IoError as exc:
                 failures.append(f"SYSTEM fresh SCSI WRITE(10): {exc}")
         except IoError as exc:
@@ -510,10 +541,30 @@ def _execute_request(req: dict) -> dict:
             if fresh is not None:
                 kernel32.CloseHandle(fresh)
 
+        if helper_set_offline:
+            ok_online, err_online = _set_disk_offline_state(
+                wintypes.HANDLE(physical_dup),
+                False,
+            )
+            if ok_online:
+                try:
+                    _ioctl(
+                        wintypes.HANDLE(physical_dup),
+                        IOCTL_DISK_UPDATE_PROPERTIES,
+                    )
+                except OSError:
+                    pass
+                failures.append("SYSTEM whole-disk ONLINE restore: success")
+            else:
+                failures.append(
+                    f"SYSTEM whole-disk ONLINE restore failed Win32={err_online}"
+                )
+
         return {
             "ok": False,
-            "error": " | ".join(failures[-12:]),
+            "error": " | ".join(failures[-14:]),
             "failures": failures,
+            "disk_offline": False,
         }
     finally:
         for handle in handles:

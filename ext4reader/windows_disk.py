@@ -47,6 +47,8 @@ STALE_HANDLE_ERRORS = {6, 31, 995, 1167}  # invalid handle / gen fail / aborted 
 IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = 0x000700A0
 IOCTL_DISK_GET_PARTITION_INFO_EX = 0x00070048
 IOCTL_DISK_GET_DISK_ATTRIBUTES = 0x000700F0
+IOCTL_DISK_SET_DISK_ATTRIBUTES = 0x0007C0F4
+IOCTL_DISK_UPDATE_PROPERTIES = 0x00070140
 IOCTL_DISK_IS_WRITABLE = 0x00070024
 IOCTL_STORAGE_QUERY_PROPERTY = 0x002D1400
 IOCTL_SCSI_PASS_THROUGH = 0x0004D004
@@ -774,6 +776,60 @@ def _query_disk_attributes(handle) -> tuple[int | None, int]:
     return int.from_bytes(raw[8:16], "little"), 0
 
 
+def _set_disk_offline_state(handle, offline: bool) -> tuple[bool, int]:
+    """Set DISK_ATTRIBUTE_OFFLINE non-persistently and verify the result.
+
+    SET_DISK_ATTRIBUTES.Version is documented as sizeof(GET_DISK_ATTRIBUTES),
+    which is 16 bytes. The input structure itself is 40 bytes.
+    """
+    raw = bytearray(40)
+    raw[0:4] = (16).to_bytes(4, "little")
+    raw[4] = 0  # Persist = FALSE
+    raw[8:16] = (
+        DISK_ATTRIBUTE_OFFLINE if offline else 0
+    ).to_bytes(8, "little")
+    raw[16:24] = DISK_ATTRIBUTE_OFFLINE.to_bytes(8, "little")
+    try:
+        _ioctl(handle, IOCTL_DISK_SET_DISK_ATTRIBUTES, bytes(raw))
+    except OSError as exc:
+        return False, int(exc.args[0]) if exc.args else 0
+
+    attrs, err = _query_disk_attributes(handle)
+    if attrs is None:
+        return False, err or 13
+    expected = bool(offline)
+    actual = bool(attrs & DISK_ATTRIBUTE_OFFLINE)
+    if actual != expected:
+        return False, 31
+    return True, 0
+
+
+def _close_locked_volume_without_online(item: _LockedVolume) -> None:
+    """Drop a volume handle after the whole disk is offline.
+
+    Do not send IOCTL_VOLUME_ONLINE while the containing disk is intentionally
+    offline. FVE raw mode is released separately after the handle is closed.
+    """
+    from ext4reader.debuglog import LOG
+
+    try:
+        kernel32.CloseHandle(item.handle)
+    except Exception:
+        pass
+    fve_name = item.fve_name or item.volume_guid
+    if item.fve_raw and fve_name:
+        ok, hr = _fve_raw_access(fve_name, False)
+        if ok:
+            LOG.info("FVE raw-access 해제 성공 %s", fve_name)
+            item.fve_raw = False
+        else:
+            LOG.warning(
+                "FVE raw-access 해제 실패 %s HRESULT=0x%08X",
+                fve_name,
+                hr,
+            )
+
+
 def _query_partition_gpt_attributes(handle) -> tuple[int | None, int]:
     """Return GPT partition attributes, or None for non-GPT/unavailable."""
     try:
@@ -1423,6 +1479,7 @@ class WindowsPhysicalDevice(BlockDevice):
         self._partition_volume: _LockedVolume | None = None
         self._nt_handle = None
         self._write_blockers: list[str] = []
+        self._disk_offline = False
         LOG.info(
             "디스크 열기 %s writable=%s sector=%s part=%s part_offset=%s part_size=%s",
             path,
@@ -1578,7 +1635,7 @@ class WindowsPhysicalDevice(BlockDevice):
         if self._writable:
             _enable_storage_privileges()
             idx = _physical_index(self.path)
-            if idx is not None:
+            if idx is not None and not self._disk_offline:
                 for item in self._volume_locks:
                     _release_locked_volume(item)
                 self._volume_locks = _lock_volumes_for_disk(idx)
@@ -2086,6 +2143,80 @@ class WindowsPhysicalDevice(BlockDevice):
             winerr=5,
         )
 
+    def _adopt_whole_disk_offline(self) -> None:
+        """Switch the instance to PhysicalDrive-only I/O while disk is offline."""
+        from ext4reader.debuglog import LOG
+
+        self._disk_offline = True
+        self._partition_volume = None
+        for item in self._volume_locks:
+            _close_locked_volume_without_online(item)
+        self._volume_locks = []
+
+        if self._nt_handle is not None:
+            try:
+                ntdll.NtClose(self._nt_handle)
+            except Exception:
+                pass
+            self._nt_handle = None
+
+        # Keep the current PhysicalDrive file object alive. If it is still
+        # denied after the global disk state changes, the LocalSystem stage
+        # below will create a genuinely fresh file object.
+        self._use_overlapped = False
+        LOG.warning(
+            "전체 디스크 OFFLINE 모드 채택: PhysicalDrive-only I/O size=%s sector=%s",
+            self._size,
+            self.sector_size,
+        )
+
+    def _activate_whole_disk_offline(self) -> tuple[bool, int]:
+        """Take only a removable data disk offline, non-persistently."""
+        from ext4reader.debuglog import LOG
+
+        if self._disk_offline:
+            return True, 0
+        if not self._removable:
+            return False, 5
+
+        ok, err = _set_disk_offline_state(self._handle, True)
+        if not ok:
+            LOG.warning("전체 디스크 OFFLINE 전환 실패 Win32=%s", err)
+            return False, err
+
+        LOG.warning(
+            "전체 디스크 OFFLINE 전환 성공 path=%s (비영구 설정)",
+            self.path,
+        )
+        self._adopt_whole_disk_offline()
+        return True, 0
+
+    def _restore_whole_disk_online(self) -> tuple[bool, int]:
+        """Clear the temporary whole-disk OFFLINE state before closing."""
+        from ext4reader.debuglog import LOG
+
+        if not self._disk_offline:
+            return True, 0
+
+        ok, err = _set_disk_offline_state(self._handle, False)
+        if not ok:
+            LOG.error(
+                "전체 디스크 ONLINE 복구 실패 path=%s Win32=%s. "
+                "카드 재삽입 또는 재부팅 시 비영구 OFFLINE 상태가 해제됩니다.",
+                self.path,
+                err,
+            )
+            return False, err
+
+        try:
+            _ioctl(self._handle, IOCTL_DISK_UPDATE_PROPERTIES)
+        except OSError as exc:
+            LOG.info("디스크 속성 재검색 생략/실패: %s", exc)
+
+        self._disk_offline = False
+        LOG.info("전체 디스크 ONLINE 복구 성공 path=%s", self.path)
+        return True, 0
+
     def _prepare_system_helper_handle(self) -> None:
         """Reopen PhysicalDrive with write sharing for a fresh SYSTEM open.
 
@@ -2213,9 +2344,35 @@ class WindowsPhysicalDevice(BlockDevice):
                 ) from scsi_exc
 
             LOG.warning(
-                "관리자 raw-write 경로가 모두 거부됨: %s; LocalSystem helper 시도",
+                "관리자 raw-write 경로가 모두 거부됨: %s; 전체 디스크 OFFLINE 모드 시도",
                 scsi_exc,
             )
+
+            offline_ok, offline_err = self._activate_whole_disk_offline()
+            if offline_ok:
+                for label, writer in (
+                    ("OFFLINE PhysicalDrive WriteFile", self._write_at),
+                    ("OFFLINE PhysicalDrive NtWriteFile", self._nt_write_at),
+                    ("OFFLINE SCSI WRITE(10)", self._scsi_write10),
+                ):
+                    try:
+                        writer(absolute, data)
+                        LOG.warning(
+                            "%s 성공 absolute=%s len=%s",
+                            label,
+                            absolute,
+                            len(data),
+                        )
+                        return
+                    except IoError as offline_exc:
+                        LOG.warning("%s 실패: %s", label, offline_exc)
+            else:
+                LOG.warning(
+                    "전체 디스크 OFFLINE 모드를 사용할 수 없음 Win32=%s",
+                    offline_err,
+                )
+
+            LOG.warning("LocalSystem helper 시도")
             from ext4reader.system_raw_helper import run_system_raw_write
 
             self._prepare_system_helper_handle()
@@ -2231,6 +2388,7 @@ class WindowsPhysicalDevice(BlockDevice):
                 partition_size=int(self._partition_size),
                 data=bytes(data),
                 sector_size=int(self.sector_size or 512),
+                try_disk_offline=not self._disk_offline,
             )
             if not result.get("ok"):
                 raise IoError(
@@ -2239,11 +2397,15 @@ class WindowsPhysicalDevice(BlockDevice):
                     winerr=5,
                 ) from scsi_exc
 
+            if result.get("disk_offline") and not self._disk_offline:
+                self._adopt_whole_disk_offline()
+
             LOG.warning(
-                "LocalSystem raw helper 성공 method=%s absolute=%s len=%s",
+                "LocalSystem raw helper 성공 method=%s absolute=%s len=%s disk_offline=%s",
                 result.get("method"),
                 absolute,
                 len(data),
+                bool(result.get("disk_offline")),
             )
             verify = self._read_at(absolute, len(data))
             if verify != data:
@@ -2449,6 +2611,8 @@ class WindowsPhysicalDevice(BlockDevice):
             if self._closed:
                 return
             self._closed = True
+            if self._disk_offline:
+                self._restore_whole_disk_online()
             try:
                 kernel32.CloseHandle(self._handle)
             except Exception:
