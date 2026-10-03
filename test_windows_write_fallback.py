@@ -35,12 +35,6 @@ class WriteFallbackTests(unittest.TestCase):
         dev._write_locked_partition_device = lambda offset, data: (_ for _ in ()).throw(
             IoError("partition access denied", winerr=5)
         )
-        dev._write_locked_partition_device = lambda offset, data: (_ for _ in ()).throw(
-            IoError("partition access denied", winerr=5)
-        )
-        dev._write_locked_partition_device = lambda offset, data: (_ for _ in ()).throw(
-            IoError("partition access denied", winerr=5)
-        )
         dev._write_at = write_at
         dev._nt_write_at = nt_write
         dev._scsi_write10 = scsi
@@ -370,3 +364,82 @@ class WindowsWritePolicyTests(unittest.TestCase):
 
         self.assertIn("Windows가 저장장치 쓰기를 정책/속성으로 차단", str(cm.exception))
         self.assertIn("Deny_Write=1", str(cm.exception))
+
+
+
+class ReaderCompatibilityTests(unittest.TestCase):
+    def test_volume_guid_normalization_for_fve(self):
+        import ext4reader.windows_disk as wd
+
+        self.assertEqual(
+            wd._volume_guid_for_fve("Volume{01234567-89ab-cdef-0123-456789abcdef}"),
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\",
+        )
+        self.assertEqual(
+            wd._volume_guid_for_fve(r"\\.\Volume{01234567-89ab-cdef-0123-456789abcdef}"),
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\",
+        )
+        self.assertIsNone(wd._volume_guid_for_fve(r"\\.\HarddiskVolume27"))
+
+    def test_fve_raw_access_success_and_hresult(self):
+        import ext4reader.windows_disk as wd
+
+        calls = []
+        def fake_fve(name, enabled):
+            calls.append((name, bool(enabled)))
+            return 0
+
+        with patch.object(wd, "_FveEnableRawAccessW", fake_fve):
+            ok, hr = wd._fve_raw_access(
+                r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\",
+                True,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(hr, 0)
+        self.assertEqual(calls[0][1], True)
+
+    def test_fve_raw_access_reports_access_denied_hresult(self):
+        import ext4reader.windows_disk as wd
+
+        with patch.object(wd, "_FveEnableRawAccessW", lambda name, enabled: -2147024891):
+            ok, hr = wd._fve_raw_access(
+                r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\",
+                True,
+            )
+
+        self.assertFalse(ok)
+        self.assertEqual(hr, 0x80070005)
+
+    def test_release_disables_fve_raw_access_after_closing_volume(self):
+        import ext4reader.windows_disk as wd
+
+        item = _LockedVolume(
+            handle=91,
+            name=r"\\.\HarddiskVolume27",
+            partition_number=1,
+            locked=True,
+            offline=False,
+            volume_guid=r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\",
+            fve_raw=True,
+        )
+        calls = []
+        with patch.object(wd, "_bring_volume_online", lambda v: calls.append(("online", v.handle))), patch.object(
+            wd.kernel32, "CloseHandle", lambda h: calls.append(("close", int(h))) or True
+        ), patch.object(
+            wd, "_fve_raw_access", lambda name, enabled: calls.append(("fve", name, enabled)) or (True, 0)
+        ):
+            wd._release_locked_volume(item)
+
+        self.assertEqual(calls[0], ("online", 91))
+        self.assertEqual(calls[1], ("close", 91))
+        self.assertEqual(calls[2][0], "fve")
+        self.assertFalse(calls[2][2])
+        self.assertFalse(item.fve_raw)
+
+    def test_bus_names_cover_usb_sd_and_mmc_readers(self):
+        import ext4reader.windows_disk as wd
+
+        self.assertEqual(wd.BUS_NAMES[7], "USB")
+        self.assertEqual(wd.BUS_NAMES[12], "SD")
+        self.assertEqual(wd.BUS_NAMES[13], "MMC")
