@@ -1243,6 +1243,28 @@ class WindowsPhysicalDevice(BlockDevice):
         if not ok or done.value != len(data):
             if err == 5:
                 absolute = self._partition_offset + offset
+                from ext4reader.debuglog import LOG
+
+                # Now that we have positively discovered and locked/dismounted
+                # the matching volume (including hidden HarddiskVolumeN
+                # aliases), retry the write on the PhysicalDrive handle.
+                # Windows Vista+ permits disk-handle writes into a volume's
+                # extents when that volume is explicitly locked/dismounted.
+                try:
+                    self._write_at(absolute, data)
+                    LOG.warning(
+                        "볼륨 WriteFile Win32 5 우회: 잠금된 볼륨 상태에서 PhysicalDrive 쓰기 성공 "
+                        "absolute=%s len=%s",
+                        absolute,
+                        len(data),
+                    )
+                    return
+                except IoError as phys_exc:
+                    LOG.warning(
+                        "잠금 후 PhysicalDrive 쓰기도 실패: %s; SCSI fallback 시도",
+                        phys_exc,
+                    )
+
                 self._scsi_write10(absolute, data)
                 return
             raise IoError(
