@@ -514,6 +514,7 @@ class _LockedVolume:
     locked: bool
     offline: bool = False
     volume_guid: str | None = None
+    fve_name: str | None = None
     fve_raw: bool = False
 
 
@@ -885,13 +886,74 @@ def _volume_alias_candidates() -> list[tuple[str, str | None, str | None]]:
     return out
 
 
-def _fve_raw_access(volume_guid: str | None, enabled: bool) -> tuple[bool, int]:
+def _fve_raw_access(volume_name: str | None, enabled: bool) -> tuple[bool, int]:
     """Ask Windows' FVE layer to permit raw sector access for a volume."""
-    if not volume_guid or _FveEnableRawAccessW is None:
+    if not volume_name or _FveEnableRawAccessW is None:
         return False, -1
-    hr = int(_FveEnableRawAccessW(volume_guid, bool(enabled)))
+    hr = int(_FveEnableRawAccessW(volume_name, bool(enabled)))
     ok = hr >= 0
     return ok, hr & 0xFFFFFFFF
+
+
+def _fve_raw_candidates(
+    open_path: str,
+    volume_guid: str | None,
+    target: str | None,
+) -> list[str]:
+    """Return reader-independent volume identifiers for FVE raw mode.
+
+    Microsoft documents the first FveEnableRawAccessW argument as a unique
+    volume identifier, not specifically as a drive letter.  Some SD/MMC
+    readers expose only HarddiskVolumeN and never publish a Volume{GUID}
+    alias, so try the stable NT/GLOBALROOT forms as well.
+    """
+    values: list[str] = []
+    if volume_guid:
+        values.append(volume_guid)
+    if target and target.startswith("\\Device\\"):
+        values.append("\\\\?\\GLOBALROOT" + target)
+        values.append(target)
+    if open_path:
+        values.append(open_path)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        key = value.rstrip("\\").lower()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(value)
+    return out
+
+
+def _try_enable_fve_raw_access(
+    open_path: str,
+    volume_guid: str | None,
+    target: str | None,
+) -> str | None:
+    """Enable FVE raw mode using the first volume identifier Windows accepts."""
+    from ext4reader.debuglog import LOG
+
+    if _FveEnableRawAccessW is None:
+        LOG.info("FVE raw-access API를 사용할 수 없습니다.")
+        return None
+
+    last_hr = -1
+    for candidate in _fve_raw_candidates(open_path, volume_guid, target):
+        ok, hr = _fve_raw_access(candidate, True)
+        last_hr = hr
+        if ok:
+            LOG.info("FVE raw-access 활성화 성공 %s", candidate)
+            return candidate
+        LOG.info(
+            "FVE raw-access 후보 실패 %s HRESULT=0x%08X",
+            candidate,
+            hr,
+        )
+
+    if last_hr != -1:
+        LOG.info("FVE raw-access 가능한 볼륨 식별자를 찾지 못했습니다.")
+    return None
 
 
 def _release_locked_volume(item: _LockedVolume) -> None:
@@ -903,14 +965,15 @@ def _release_locked_volume(item: _LockedVolume) -> None:
         kernel32.CloseHandle(item.handle)
     except Exception:
         pass
-    if item.fve_raw and item.volume_guid:
+    fve_name = item.fve_name or item.volume_guid
+    if item.fve_raw and fve_name:
         from ext4reader.debuglog import LOG
-        ok, hr = _fve_raw_access(item.volume_guid, False)
+        ok, hr = _fve_raw_access(fve_name, False)
         if ok:
-            LOG.info("FVE raw-access 해제 성공 %s", item.volume_guid)
+            LOG.info("FVE raw-access 해제 성공 %s", fve_name)
             item.fve_raw = False
         else:
-            LOG.warning("FVE raw-access 해제 실패 %s HRESULT=0x%08X", item.volume_guid, hr)
+            LOG.warning("FVE raw-access 해제 실패 %s HRESULT=0x%08X", fve_name, hr)
 
 
 def _take_volume_offline(handle, name: str) -> bool:
@@ -1132,17 +1195,8 @@ def _open_hidden_volume_alias(disk_index: int, partition_number: int) -> _Locked
         # FveEnableRawAccessW may need to acquire its own volume lock. Close our
         # discovery handle first, request raw access, then reopen the volume.
         kernel32.CloseHandle(handle)
-        fve_ok = False
-        if volume_guid:
-            fve_ok, hr = _fve_raw_access(volume_guid, True)
-            if fve_ok:
-                LOG.info("FVE raw-access 활성화 성공 %s", volume_guid)
-            else:
-                LOG.info(
-                    "FVE raw-access 활성화 생략/실패 %s HRESULT=0x%08X",
-                    volume_guid,
-                    hr,
-                )
+        fve_name = _try_enable_fve_raw_access(path, volume_guid, target)
+        fve_ok = fve_name is not None
 
         handle = kernel32.CreateFileW(
             path,
@@ -1155,7 +1209,7 @@ def _open_hidden_volume_alias(disk_index: int, partition_number: int) -> _Locked
         )
         if handle == INVALID_HANDLE_VALUE or handle is None:
             if fve_ok:
-                _fve_raw_access(volume_guid, False)
+                _fve_raw_access(fve_name, False)
             continue
 
         keep = False
@@ -1198,6 +1252,7 @@ def _open_hidden_volume_alias(disk_index: int, partition_number: int) -> _Locked
                 locked=lock_ok,
                 offline=offline_ok,
                 volume_guid=volume_guid,
+                fve_name=fve_name,
                 fve_raw=fve_ok,
             )
         except OSError:
@@ -1206,7 +1261,7 @@ def _open_hidden_volume_alias(disk_index: int, partition_number: int) -> _Locked
             if not keep:
                 kernel32.CloseHandle(handle)
                 if fve_ok:
-                    _fve_raw_access(volume_guid, False)
+                    _fve_raw_access(fve_name, False)
     return None
 
 def _open_partition_device(disk_index: int, partition_number: int) -> _LockedVolume | None:
@@ -2087,6 +2142,68 @@ class WindowsPhysicalDevice(BlockDevice):
                 ) from scsi_exc
             raise
 
+    def _nt_write_volume_handle(
+        self,
+        item: _LockedVolume,
+        offset: int,
+        data: bytes,
+    ) -> None:
+        """Issue NtWriteFile on the already locked hidden-volume handle.
+
+        This preserves the exact volume object that Windows allowed us to open
+        and lock.  It is useful on card-reader stacks where the partition PDO
+        cannot be opened directly even though HarddiskVolumeN is writable.
+        """
+        from ext4reader.debuglog import LOG
+
+        iosb = _IO_STATUS_BLOCK()
+        nt_offset = ctypes.c_longlong(int(offset))
+        buf = (ctypes.c_char * len(data)).from_buffer_copy(data)
+        status = ntdll.NtWriteFile(
+            wintypes.HANDLE(item.handle),
+            None,
+            None,
+            None,
+            ctypes.byref(iosb),
+            buf,
+            len(data),
+            ctypes.byref(nt_offset),
+            None,
+        )
+        if not _nt_success(status):
+            dos = int(ntdll.RtlNtStatusToDosError(status))
+            raise IoError(
+                f"{item.name} NtWriteFile 실패 offset={offset} len={len(data)} "
+                f"NTSTATUS={_nt_status_hex(status)} (Win32 {dos})",
+                winerr=dos,
+            )
+        if int(iosb.Information) != len(data):
+            raise IoError(
+                f"{item.name} NtWriteFile 짧은 쓰기 offset={offset} "
+                f"{int(iosb.Information)}/{len(data)}",
+                winerr=23,
+            )
+
+        flush_iosb = _IO_STATUS_BLOCK()
+        ntdll.NtFlushBuffersFile(
+            wintypes.HANDLE(item.handle),
+            ctypes.byref(flush_iosb),
+        )
+
+        absolute = self._partition_offset + int(offset)
+        verify = self._read_at(absolute, len(data))
+        if verify != data:
+            raise IoError(
+                f"{item.name} NtWriteFile read-back 검증 실패 offset={offset} len={len(data)}",
+                winerr=23,
+            )
+        LOG.warning(
+            "숨은 볼륨 Native NT write 성공 path=%s offset=%s len=%s",
+            item.name,
+            offset,
+            len(data),
+        )
+
     def _write_volume_seek(self, item: _LockedVolume, offset: int, data: bytes) -> None:
         """Write relative to a locked/dismounted volume handle."""
         if item.offline:
@@ -2119,6 +2236,15 @@ class WindowsPhysicalDevice(BlockDevice):
         err = ctypes.get_last_error()
         if not ok or done.value != len(data):
             if err == 5:
+                from ext4reader.debuglog import LOG
+                try:
+                    self._nt_write_volume_handle(item, offset, data)
+                    return
+                except IoError as nt_exc:
+                    LOG.warning(
+                        "숨은 볼륨 Native NT write도 실패: %s; 다른 raw 경로 시도",
+                        nt_exc,
+                    )
                 self._fallback_after_volume_access_denied(offset, data)
                 return
             raise IoError(
