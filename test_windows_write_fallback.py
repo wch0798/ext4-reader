@@ -331,6 +331,64 @@ class WriteFallbackTests(unittest.TestCase):
 
         self.assertIn("LocalSystem raw helper 실패", str(cm.exception))
 
+    def test_usbdk_failure_restore_retries_during_pnp_reenumeration(self):
+        import ext4reader.windows_disk as wd
+
+        dev = WindowsPhysicalDevice.__new__(WindowsPhysicalDevice)
+        dev.path = r"\\.\PhysicalDrive1"
+        dev._size = 0
+        dev._usbdk = object()
+        attempts = {"count": 0}
+
+        def reopen():
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise IoError("PhysicalDrive not back yet", winerr=1167)
+
+        dev._reopen_locked = reopen
+
+        with patch.object(wd.time, "sleep") as sleep:
+            dev._restore_windows_after_usbdk_failure()
+
+        self.assertIsNone(dev._usbdk)
+        self.assertEqual(attempts["count"], 3)
+        self.assertEqual(sleep.call_count, 2)
+        sleep.assert_called_with(0.25)
+
+    def test_usbdk_activation_preserves_original_probe_error_after_restore(self):
+        import threading
+        import ext4reader.windows_disk as wd
+
+        dev = WindowsPhysicalDevice.__new__(WindowsPhysicalDevice)
+        dev.path = r"\\.\PhysicalDrive1"
+        dev._writable = True
+        dev._removable = True
+        dev._bus_type = 7
+        dev._partition_offset = 1048576
+        dev._partition_size = 1023869452288
+        dev._size = 1023871549440
+        dev.sector_size = 512
+        dev._usbdk = None
+        dev._disk_offline = False
+        dev._stop_ka = threading.Event()
+        dev._nt_handle = None
+        dev._volume_locks = []
+        dev._partition_volume = None
+        dev._handle = 888
+        dev._raw_read_once = lambda offset, length: b"x" * length
+        restored = []
+        dev._restore_windows_after_usbdk_failure = lambda: restored.append(True)
+
+        with patch("ext4reader.usbdk_setup.usbdk_ready", return_value=True), patch(
+            "ext4reader.usbdk_backend.UsbDkBotBackend",
+            side_effect=IoError("BOT probe failed", winerr=31),
+        ), patch.object(wd.kernel32, "CloseHandle", return_value=True):
+            with self.assertRaises(IoError) as cm:
+                dev._activate_usbdk_backend()
+
+        self.assertEqual(str(cm.exception), "BOT probe failed")
+        self.assertEqual(restored, [True])
+
     def test_partition_write_target_is_relative_to_partition_start(self):
         dev = self.make_dev()
         item = object()
