@@ -480,7 +480,7 @@ class App(tk.Tk):
 
         err = result_box["err"]
         if err is not None:
-            LOG.exception("UsbDk 설치 실패", exc_info=err)
+            LOG.error("UsbDk 설치 실패: %s", err)
             message = str(err)
             if isinstance(err, UsbDkSetupError) and err.manual_install:
                 message += "\n\n자동 설치가 안 되면 공식 릴리스에서 직접 설치할 수 있습니다."
