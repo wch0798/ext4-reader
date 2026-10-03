@@ -17,7 +17,9 @@ class WriteFallbackTests(unittest.TestCase):
         dev._handle = 888
         dev.sector_size = 512
         dev._removable = True
+        dev._bus_type = 7
         dev._disk_offline = False
+        dev._usbdk = None
         dev._nt_handle = None
         dev._use_overlapped = False
         dev._partition_volume = _LockedVolume(
@@ -261,6 +263,73 @@ class WriteFallbackTests(unittest.TestCase):
         self.assertEqual(kwargs["sector_size"], 512)
         self.assertTrue(kwargs["try_disk_offline"])
         self.assertEqual(kwargs["data"], payload)
+
+    def test_usbdk_runs_only_after_localsystem_failure_on_usb_reader(self):
+        dev = self.make_dev()
+        payload = b"b" * 4096
+        absolute = dev._partition_offset + 4755456
+        calls = []
+
+        dev._write_at = lambda offset, data: (_ for _ in ()).throw(
+            IoError("physical denied", winerr=5)
+        )
+        dev._nt_write_at = lambda offset, data: (_ for _ in ()).throw(
+            IoError("native denied", winerr=5)
+        )
+        dev._scsi_write10 = lambda offset, data: (_ for _ in ()).throw(
+            IoError("scsi denied", winerr=5)
+        )
+        dev._prepare_system_helper_handle = lambda: None
+
+        class FakeUsb:
+            def write(self, offset, data):
+                calls.append(("usbdk", offset, bytes(data)))
+
+        def activate():
+            calls.append(("activate",))
+            dev._usbdk = FakeUsb()
+
+        dev._activate_usbdk_backend = activate
+
+        with patch(
+            "ext4reader.system_raw_helper.run_system_raw_write",
+            return_value={"ok": False, "error": "SYSTEM denied"},
+        ):
+            dev._fallback_after_volume_access_denied(4755456, payload)
+
+        self.assertEqual(
+            calls,
+            [
+                ("activate",),
+                ("usbdk", absolute, payload),
+            ],
+        )
+
+    def test_non_usb_reader_does_not_use_usbdk_after_localsystem_failure(self):
+        dev = self.make_dev()
+        dev._bus_type = 12
+        dev._write_at = lambda offset, data: (_ for _ in ()).throw(
+            IoError("physical denied", winerr=5)
+        )
+        dev._nt_write_at = lambda offset, data: (_ for _ in ()).throw(
+            IoError("native denied", winerr=5)
+        )
+        dev._scsi_write10 = lambda offset, data: (_ for _ in ()).throw(
+            IoError("scsi denied", winerr=5)
+        )
+        dev._prepare_system_helper_handle = lambda: None
+        dev._activate_usbdk_backend = lambda: (_ for _ in ()).throw(
+            AssertionError("UsbDk must not run for native SD/MMC bus")
+        )
+
+        with patch(
+            "ext4reader.system_raw_helper.run_system_raw_write",
+            return_value={"ok": False, "error": "SYSTEM denied"},
+        ):
+            with self.assertRaises(IoError) as cm:
+                dev._fallback_after_volume_access_denied(4755456, b"x" * 4096)
+
+        self.assertIn("LocalSystem raw helper 실패", str(cm.exception))
 
     def test_partition_write_target_is_relative_to_partition_start(self):
         dev = self.make_dev()
