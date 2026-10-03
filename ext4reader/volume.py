@@ -88,6 +88,22 @@ class Ext4Volume:
         self._dir_index: dict = {}
         self._load_groups()
 
+    def reload_metadata(self) -> None:
+        """Drop cached metadata and re-read the superblock/GDT after journal replay."""
+        self._block_cache.clear()
+        self._inode_cache.clear()
+        self._extent_cache.clear()
+        self._block_bm_cache.clear()
+        self._inode_bm_cache.clear()
+        self._dirty_block_bm.clear()
+        self._dirty_inode_bm.clear()
+        self._alloc_hint.clear()
+        self._dir_list.clear()
+        self._dir_index.clear()
+        raw = self.dev.read(self.part_offset + 1024, 1024)
+        self.sb = parse_superblock(raw)
+        self._load_groups()
+
     def _load_groups(self) -> None:
         gdt_block = self.sb.first_data_block + 1
         total = self.sb.groups_count * self.sb.desc_size
@@ -265,6 +281,23 @@ class Ext4Volume:
             LOG.info("RECOVER 플래그는 있으나 저널이 비어 있습니다 (s_start=0). 쓰기를 막을 필요는 없습니다.")
         return False
 
+    def recover_pending_journal(self):
+        """Replay a pending internal JBD2 journal on Windows.
+
+        Returns ReplayStats. Unsupported/corrupt journals raise Ext4Error and
+        remain read-only; no recovery flag is cleared on failure.
+        """
+        if not self.dev.writable:
+            raise Ext4Error("저널 복구를 하려면 장치를 쓰기 가능으로 열어야 합니다.")
+        if not self.journal_needs_recovery() and not self.sb.needs_recovery:
+            from ext4reader.journal import ReplayStats
+            return ReplayStats(0, 0, 0, 0)
+        try:
+            from ext4reader.journal import JournalRecoveryError, recover_journal
+            return recover_journal(self)
+        except JournalRecoveryError as exc:
+            raise Ext4Error(f"Windows 저널 복구 실패: {exc}") from exc
+
     def fs_write_blockers(self) -> list[str]:
         return self.hard_write_blockers() + self.soft_write_warnings()
 
@@ -272,7 +305,7 @@ class Ext4Volume:
         reasons = []
         if self.journal_needs_recovery():
             reasons.append(
-                "저널에 재생하지 않은 기록이 있습니다. 리눅스에서 한 번 마운트한 뒤 빼는 것이 안전합니다."
+                "저널에 재생하지 않은 기록이 있습니다. 쓰기 연결 시 Windows에서 자동 복구를 시도합니다."
             )
         unknown = self.sb.feature_incompat & ~C.SUPPORTED_INCOMPAT_WRITE
         if unknown & C.EXT4_FEATURE_INCOMPAT_ENCRYPT:
