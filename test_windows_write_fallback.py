@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from ext4reader.io_backend import IoError
-from ext4reader.windows_disk import WindowsPhysicalDevice
+from ext4reader.windows_disk import WindowsPhysicalDevice, _LockedVolume
 
 
 class WriteFallbackTests(unittest.TestCase):
@@ -121,6 +121,27 @@ class WriteFallbackTests(unittest.TestCase):
         )
 
 
+    def test_offline_volume_skips_volume_write_and_uses_physical_fallback(self):
+        dev = self.make_dev()
+        calls = []
+        item = _LockedVolume(
+            handle=123,
+            name=r"\\.\HarddiskVolume26",
+            partition_number=1,
+            locked=True,
+            offline=True,
+        )
+
+        def fallback(relative, data):
+            calls.append((relative, bytes(data)))
+
+        dev._fallback_after_volume_access_denied = fallback
+        payload = b"o" * 4096
+        dev._write_volume_seek(item, 4755456, payload)
+
+        self.assertEqual(calls, [(4755456, payload)])
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -187,3 +208,31 @@ class NativePathTests(unittest.TestCase):
             wd._nt_native_path(r"\\?\GLOBALROOT\Device\HarddiskVolume26"),
             r"\Device\HarddiskVolume26",
         )
+
+
+class VolumeOfflineTests(unittest.TestCase):
+    def test_take_volume_offline_uses_documented_ioctl(self):
+        import ext4reader.windows_disk as wd
+
+        calls = []
+        with patch.object(wd, "_ioctl", lambda handle, code: calls.append((handle, code)) or b""):
+            self.assertTrue(wd._take_volume_offline(77, r"\\.\HarddiskVolume26"))
+
+        self.assertEqual(calls, [(77, wd.IOCTL_VOLUME_OFFLINE)])
+
+    def test_bring_volume_online_clears_offline_state(self):
+        import ext4reader.windows_disk as wd
+
+        item = _LockedVolume(
+            handle=88,
+            name=r"\\.\HarddiskVolume26",
+            partition_number=1,
+            locked=True,
+            offline=True,
+        )
+        calls = []
+        with patch.object(wd, "_ioctl", lambda handle, code: calls.append((handle, code)) or b""):
+            wd._bring_volume_online(item)
+
+        self.assertFalse(item.offline)
+        self.assertEqual(calls, [(88, wd.IOCTL_VOLUME_ONLINE)])
