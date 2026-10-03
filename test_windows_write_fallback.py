@@ -34,6 +34,10 @@ class WriteFallbackTests(unittest.TestCase):
         # Most fallback-ordering tests focus on pre-existing routes. Dedicated
         # tests below enable the new whole-disk OFFLINE stage explicitly.
         dev._activate_whole_disk_offline = lambda: (False, 5)
+        dev._prepare_system_helper_handle = lambda: None
+        dev._write_unbuffered_physical = lambda offset, data: (_ for _ in ()).throw(
+            IoError("unbuffered denied", winerr=5)
+        )
         return dev
 
     def test_physicaldrive_retry_uses_absolute_offset_and_stops_on_success(self):
@@ -111,6 +115,38 @@ class WriteFallbackTests(unittest.TestCase):
             [
                 ("physical", absolute, payload),
                 ("nt", absolute, payload),
+            ],
+        )
+
+    def test_unbuffered_runs_after_native_nt_before_scsi(self):
+        dev = self.make_dev()
+        calls = []
+        absolute = dev._partition_offset + 4755456
+        payload = b"u" * 4096
+
+        dev._write_at = lambda offset, data: (
+            calls.append(("physical", offset)),
+            (_ for _ in ()).throw(IoError("physical denied", winerr=5)),
+        )[1]
+        dev._nt_write_at = lambda offset, data: (
+            calls.append(("nt", offset)),
+            (_ for _ in ()).throw(IoError("nt denied", winerr=5)),
+        )[1]
+
+        def unbuffered(offset, data):
+            calls.append(("unbuffered", offset, bytes(data)))
+
+        dev._write_unbuffered_physical = unbuffered
+        dev._scsi_write10 = lambda offset, data: calls.append(("scsi", offset))
+
+        dev._fallback_after_volume_access_denied(4755456, payload)
+
+        self.assertEqual(
+            calls,
+            [
+                ("physical", absolute),
+                ("nt", absolute),
+                ("unbuffered", absolute, payload),
             ],
         )
 
@@ -464,6 +500,31 @@ class StoragePrivilegeTests(unittest.TestCase):
 
         with patch.object(wd, "_enable_privilege", return_value=(False, wd.ERROR_NOT_ALL_ASSIGNED)):
             self.assertFalse(wd._enable_storage_privileges())
+
+
+class UnbufferedRawIoTests(unittest.TestCase):
+    def test_access_alignment_parser_prefers_device_values(self):
+        import ext4reader.windows_disk as wd
+
+        raw = bytearray(28)
+        raw[0:4] = (28).to_bytes(4, "little")
+        raw[4:8] = (28).to_bytes(4, "little")
+        raw[16:20] = (512).to_bytes(4, "little")
+        raw[20:24] = (4096).to_bytes(4, "little")
+
+        with patch.object(wd, "_ioctl", return_value=bytes(raw)):
+            logical, physical = wd._query_access_alignment(123, 512)
+
+        self.assertEqual(logical, 512)
+        self.assertEqual(physical, 4096)
+
+    def test_access_alignment_falls_back_when_query_fails(self):
+        import ext4reader.windows_disk as wd
+
+        with patch.object(wd, "_ioctl", side_effect=OSError(5)):
+            logical, physical = wd._query_access_alignment(123, 4096)
+
+        self.assertEqual((logical, physical), (4096, 4096))
 
 
 class WholeDiskOfflineTests(unittest.TestCase):

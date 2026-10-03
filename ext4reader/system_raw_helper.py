@@ -364,6 +364,7 @@ def _execute_request(req: dict) -> dict:
         _open_handle,
         _query_storage,
         _set_disk_offline_state,
+        _write_unbuffered_raw_path,
         kernel32,
         ntdll,
     )
@@ -450,6 +451,25 @@ def _execute_request(req: dict) -> dict:
             except IoError as exc:
                 failures.append(f"{name}: {exc}")
 
+        try:
+            logical, physical = _write_unbuffered_raw_path(
+                path,
+                absolute_offset,
+                data,
+                sector_size,
+                expected_device_number=int(parent_dev.DeviceNumber),
+                expected_device_type=int(parent_dev.DeviceType),
+            )
+            return {
+                "ok": True,
+                "method": "SYSTEM fresh-PhysicalDrive NO_BUFFERING",
+                "disk_offline": False,
+                "logical_sector": logical,
+                "physical_sector": physical,
+            }
+        except IoError as exc:
+            failures.append(f"SYSTEM fresh NO_BUFFERING: {exc}")
+
         helper_set_offline = False
         if try_disk_offline:
             ok_offline, err_offline = _set_disk_offline_state(
@@ -463,6 +483,26 @@ def _execute_request(req: dict) -> dict:
                 failures.append(
                     f"SYSTEM whole-disk OFFLINE: Win32={err_offline}"
                 )
+
+        if helper_set_offline:
+            try:
+                logical, physical = _write_unbuffered_raw_path(
+                    path,
+                    absolute_offset,
+                    data,
+                    sector_size,
+                    expected_device_number=int(parent_dev.DeviceNumber),
+                    expected_device_type=int(parent_dev.DeviceType),
+                )
+                return {
+                    "ok": True,
+                    "method": "SYSTEM OFFLINE fresh-PhysicalDrive NO_BUFFERING",
+                    "disk_offline": True,
+                    "logical_sector": logical,
+                    "physical_sector": physical,
+                }
+            except IoError as exc:
+                failures.append(f"SYSTEM OFFLINE NO_BUFFERING: {exc}")
 
         # A duplicated handle preserves the parent's original file object.
         # Create a fresh PhysicalDrive file object as LocalSystem so drivers
