@@ -1687,6 +1687,7 @@ class WindowsPhysicalDevice(BlockDevice):
         self._nt_handle = None
         self._write_blockers: list[str] = []
         self._disk_offline = False
+        self._usbdk = None
         LOG.info(
             "디스크 열기 %s writable=%s sector=%s part=%s part_offset=%s part_size=%s",
             path,
@@ -2494,6 +2495,104 @@ class WindowsPhysicalDevice(BlockDevice):
             self.sector_size,
         )
 
+    def _restore_windows_after_usbdk_failure(self) -> None:
+        """Reopen the Windows storage path after a failed UsbDk redirect attempt."""
+        from ext4reader.debuglog import LOG
+
+        self._usbdk = None
+        self._stop_ka = threading.Event()
+        self._reopen_locked()
+        if self._size:
+            self._ka = threading.Thread(
+                target=self._keepalive,
+                daemon=True,
+                name=f"disk-ka-{self.path}",
+            )
+            self._ka.start()
+        LOG.warning("UsbDk 실패 후 Windows storage 경로 복구 완료 %s", self.path)
+
+    def _activate_usbdk_backend(self) -> None:
+        """Switch only this USB removable reader to direct UsbDk BOT I/O.
+
+        Normal readers never enter this path. It is reached only after all
+        native/admin/LocalSystem write routes have failed.
+        """
+        from ext4reader.debuglog import LOG
+        from ext4reader.usbdk_setup import UsbDkRequiredError, usbdk_ready
+
+        if self._usbdk is not None:
+            return
+        if not self._writable or not self._removable or int(self._bus_type) != 7:
+            raise IoError(
+                "UsbDk fallback은 쓰기 가능한 USB removable 장치에만 사용합니다.",
+                winerr=50,
+            )
+        if self._partition_size <= 0:
+            raise IoError("UsbDk fallback에 유효한 파티션 범위가 없습니다.", winerr=87)
+        if not usbdk_ready():
+            raise UsbDkRequiredError(
+                "이 USB 카드리더는 Windows raw-write를 모두 거부했습니다. "
+                "선택적 UsbDk direct-USB 백엔드가 필요합니다.",
+                manual_install=True,
+            )
+
+        # Identify the exact medium before PnP redirection removes PhysicalDrive.
+        prefix_len = min(int(self._size or 0), max(4096, int(self.sector_size or 512)))
+        if prefix_len <= 0:
+            raise IoError("UsbDk 전환 전에 장치 크기를 확인할 수 없습니다.", winerr=1167)
+        prefix_len = (prefix_len // int(self.sector_size or 512)) * int(self.sector_size or 512)
+        expected_prefix = self._raw_read_once(0, prefix_len)
+
+        if self._disk_offline:
+            self._restore_whole_disk_online()
+
+        # Stop the keepalive and release all Windows handles so PnP can detach
+        # exactly this reader cleanly.
+        self._stop_ka.set()
+        if self._nt_handle is not None:
+            try:
+                ntdll.NtClose(self._nt_handle)
+            except Exception:
+                pass
+            self._nt_handle = None
+        for item in self._volume_locks:
+            _release_locked_volume(item)
+        self._volume_locks = []
+        self._partition_volume = None
+        old_handle = self._handle
+        try:
+            kernel32.CloseHandle(old_handle)
+        except Exception:
+            pass
+        self._handle = None
+
+        backend = None
+        try:
+            from ext4reader.usbdk_backend import UsbDkBotBackend
+
+            backend = UsbDkBotBackend(
+                self.path,
+                expected_size=int(self._size),
+                expected_sector_size=int(self.sector_size or 512),
+                partition_offset=int(self._partition_offset),
+                partition_size=int(self._partition_size),
+                expected_prefix=expected_prefix,
+            )
+            self._usbdk = backend
+            self.sector_size = int(backend.sector_size)
+            LOG.warning(
+                "Windows storage stack 우회: UsbDk direct-USB BOT 백엔드로 전환 %s",
+                self.path,
+            )
+        except Exception:
+            if backend is not None:
+                try:
+                    backend.close()
+                except Exception:
+                    pass
+            self._restore_windows_after_usbdk_failure()
+            raise
+
     def _write_unbuffered_physical(self, offset: int, data: bytes) -> None:
         from ext4reader.debuglog import LOG
 
@@ -2627,9 +2726,35 @@ class WindowsPhysicalDevice(BlockDevice):
                 try_disk_offline=not self._disk_offline,
             )
             if not result.get("ok"):
+                system_detail = str(result.get("error") or result)
+                if self._removable and int(self._bus_type) == 7:
+                    LOG.warning(
+                        "LocalSystem도 raw-write 거부: %s; UsbDk direct-USB BOT fallback 시도",
+                        system_detail,
+                    )
+                    try:
+                        self._activate_usbdk_backend()
+                        self._usbdk.write(absolute, bytes(data))
+                        LOG.warning(
+                            "UsbDk direct-USB BOT write 성공 absolute=%s len=%s",
+                            absolute,
+                            len(data),
+                        )
+                        return
+                    except Exception as usb_exc:
+                        from ext4reader.usbdk_setup import UsbDkRequiredError
+
+                        if isinstance(usb_exc, UsbDkRequiredError):
+                            raise
+                        raise IoError(
+                            "LocalSystem raw helper 실패: "
+                            + system_detail
+                            + " | UsbDk direct-USB 실패: "
+                            + str(usb_exc),
+                            winerr=getattr(usb_exc, "winerr", 5) or 5,
+                        ) from scsi_exc
                 raise IoError(
-                    "LocalSystem raw helper 실패: "
-                    + str(result.get("error") or result),
+                    "LocalSystem raw helper 실패: " + system_detail,
                     winerr=5,
                 ) from scsi_exc
 
@@ -2819,14 +2944,24 @@ class WindowsPhysicalDevice(BlockDevice):
             pos += n
 
     def _raw_read(self, offset: int, length: int) -> bytes:
+        with self._io_lock:
+            if self._usbdk is not None:
+                return self._usbdk.read(offset, length)
         return self._retry(lambda: self._raw_read_once(offset, length))
 
     def _raw_write(self, offset: int, data: bytes) -> None:
+        with self._io_lock:
+            if self._usbdk is not None:
+                self._usbdk.write(offset, bytes(data))
+                return
         self._retry(lambda: self._raw_write_once(offset, data))
 
     def flush(self) -> None:
         with self._io_lock:
             if self._closed:
+                return
+            if self._usbdk is not None:
+                self._usbdk.flush()
                 return
             kernel32.FlushFileBuffers(self._handle)
             if self._partition_volume is not None:
@@ -2847,6 +2982,17 @@ class WindowsPhysicalDevice(BlockDevice):
             if self._closed:
                 return
             self._closed = True
+            if self._usbdk is not None:
+                backend = self._usbdk
+                self._usbdk = None
+                try:
+                    backend.close()
+                finally:
+                    self._volume_locks = []
+                    self._partition_volume = None
+                    self._nt_handle = None
+                    self._handle = None
+                return
             if self._disk_offline:
                 self._restore_whole_disk_online()
             try:
