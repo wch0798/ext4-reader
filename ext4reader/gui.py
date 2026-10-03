@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from tkinter import filedialog, messagebox, ttk
 
 from ext4reader import __app_name__, __version__
@@ -36,6 +37,13 @@ from ext4reader.windows_disk import (
     restart_as_admin,
 )
 from ext4reader.winfsp_setup import WinFspSetupError, ensure_winfsp_installed, find_winfsp_dll, winfsp_ready
+from ext4reader.usbdk_setup import (
+    USBDK_RELEASE_URL,
+    UsbDkRequiredError,
+    UsbDkSetupError,
+    install_usbdk,
+    usbdk_ready,
+)
 
 BG = "#1e1e2e"
 BG2 = "#313244"
@@ -161,6 +169,7 @@ class App(tk.Tk):
         ttk.Button(bar, text="연결 해제", command=self.unmount_selected).pack(side="left", padx=2)
         ttk.Button(bar, text="로그 복사", command=self.copy_logs).pack(side="right", padx=2)
         ttk.Button(bar, text="WinFsp 설치", command=self.check_winfsp).pack(side="right", padx=2)
+        ttk.Button(bar, text="UsbDk 설치(선택)", command=self.check_usbdk).pack(side="right", padx=2)
 
         self.status = tk.StringVar(
             value="관리자 실행 중 — 디스크를 검색합니다" if is_admin() else "관리자 권한이 필요합니다. 오른쪽 위 버튼으로 다시 시작하세요."
@@ -387,6 +396,117 @@ class App(tk.Tk):
             self.ensure_winfsp(force=True, show_success=True)
             return
         self.ensure_winfsp(force=False, show_success=True)
+
+    def ensure_usbdk(self, show_success: bool = True) -> bool:
+        if usbdk_ready():
+            if show_success:
+                messagebox.showinfo(
+                    "UsbDk",
+                    "UsbDk가 이미 설치되어 실행 중입니다.\n\n"
+                    "일반 리더기는 기존 Windows 경로를 그대로 사용하고, "
+                    "모든 raw-write 경로가 거부되는 USB 리더기에서만 UsbDk를 사용합니다.",
+                )
+            return True
+
+        dlg = tk.Toplevel(self)
+        dlg.title("UsbDk 선택 설치")
+        dlg.configure(bg=BG)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.protocol("WM_DELETE_WINDOW", lambda: None)
+        ttk.Label(
+            dlg,
+            text=(
+                "공식 UsbDk 1.0.22 x64 MSI를 GitHub에서 내려받아 SHA-256을 확인한 뒤 설치합니다.\n"
+                "UsbDk는 시스템 USB 필터 드라이버이므로 선택 설치이며, 일반 리더기에는 사용하지 않습니다."
+            ),
+            wraplength=500,
+        ).pack(padx=20, pady=(16, 6))
+        status = ttk.Label(dlg, text="준비 중…", wraplength=500)
+        status.pack(padx=20, pady=(0, 16))
+        dlg.update_idletasks()
+        dlg.geometry(f"+{self.winfo_rootx() + 80}+{self.winfo_rooty() + 80}")
+        dlg.grab_set()
+        q: queue.Queue = queue.Queue()
+
+        def work():
+            try:
+                result = install_usbdk(progress=lambda m: q.put(("p", m)))
+                q.put(("ok", result))
+            except Exception as exc:
+                q.put(("err", exc))
+
+        threading.Thread(target=work, daemon=True).start()
+        result_box: dict = {"result": None, "err": None}
+
+        def poll():
+            try:
+                kind, payload = q.get_nowait()
+            except queue.Empty:
+                dlg.after(80, poll)
+                return
+            if kind == "p":
+                status.config(text=str(payload))
+                dlg.after(80, poll)
+                return
+            if kind == "ok":
+                result_box["result"] = payload
+            else:
+                result_box["err"] = payload
+            dlg.grab_release()
+            dlg.destroy()
+
+        poll()
+        self.wait_window(dlg)
+
+        result = result_box["result"]
+        if result is not None:
+            if result.reboot_required:
+                if messagebox.askyesno(
+                    "UsbDk 설치 완료 — 재시작 필요",
+                    "UsbDk 설치가 완료됐지만 적용을 위해 Windows 재시작이 필요합니다.\n\n"
+                    "지금 PC를 재시작할까요?",
+                ):
+                    os.system("shutdown /r /t 5")
+                return False
+            if show_success:
+                messagebox.showinfo(
+                    "UsbDk 설치 완료",
+                    "UsbDk가 준비되었습니다.\n\n"
+                    "카드리더를 다시 꽂거나 디스크 다시 검색 후 쓰기 연결을 다시 시도하세요. "
+                    "UsbDk는 Windows raw-write가 모두 실패하는 USB 리더기에만 자동 사용됩니다.",
+                )
+            return True
+
+        err = result_box["err"]
+        if err is not None:
+            LOG.error("UsbDk 설치 실패: %s", err)
+            message = str(err)
+            if isinstance(err, UsbDkSetupError) and err.manual_install:
+                message += "\n\n자동 설치가 안 되면 공식 릴리스에서 직접 설치할 수 있습니다."
+                if messagebox.askyesno(
+                    "UsbDk 설치 실패",
+                    message + "\n\n공식 UsbDk 릴리스 페이지를 열까요?",
+                ):
+                    webbrowser.open(USBDK_RELEASE_URL)
+            else:
+                messagebox.showerror("UsbDk 설치 실패", message)
+        return usbdk_ready()
+
+    def check_usbdk(self) -> None:
+        if usbdk_ready():
+            self.ensure_usbdk(show_success=True)
+            return
+        ok = messagebox.askyesno(
+            "UsbDk 선택 설치",
+            "UsbDk는 Windows의 일반 raw-write 경로가 전부 차단되는 일부 USB 카드리더를 위한 "
+            "마지막 fallback입니다.\n\n"
+            "설치하면 시스템 USB 필터 드라이버가 추가되므로 재부팅이 필요할 수 있고, "
+            "문제가 생기면 Windows의 '설치된 앱' 또는 UsbDkController -u로 제거할 수 있습니다.\n\n"
+            "공식 UsbDk 1.0.22를 다운로드하고 설치할까요?",
+        )
+        if ok:
+            self.ensure_usbdk(show_success=True)
 
     def scan_disks(self) -> None:
         if self._busy:
@@ -626,6 +746,26 @@ class App(tk.Tk):
                             recovery_stats.replayed_blocks,
                             recovery_stats.revoked_blocks,
                         )
+                    except UsbDkRequiredError as exc:
+                        LOG.exception("Windows JBD2 복구 중 UsbDk 필요")
+                        try:
+                            vol.dev.close()
+                        except Exception:
+                            LOG.exception("UsbDk 설치 전 장치 닫기 실패")
+                        install_now = messagebox.askyesno(
+                            "이 USB 카드리더에는 UsbDk가 필요합니다",
+                            str(exc)
+                            + "\n\n일반 Windows/관리자/LocalSystem raw-write 경로는 이미 모두 실패했습니다. "
+                            "다른 리더기에는 기존 경로를 계속 사용하고, 이 경우에만 UsbDk direct-USB fallback을 사용합니다.\n\n"
+                            "공식 UsbDk를 다운로드하고 설치할까요?",
+                        )
+                        if install_now:
+                            ready = self.ensure_usbdk(show_success=True)
+                            if ready:
+                                self.set_status("UsbDk 준비 완료 — 카드리더를 다시 검색한 뒤 연결을 다시 시도하세요.")
+                        else:
+                            self.set_status("UsbDk 설치를 취소했습니다.")
+                        return
                     except Exception as exc:
                         LOG.exception("Windows JBD2 복구 실패")
                         messagebox.showwarning(
