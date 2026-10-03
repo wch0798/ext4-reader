@@ -620,7 +620,7 @@ def _allow_extended_io(handle) -> None:
 def _enable_privilege(name: str) -> tuple[bool, int]:
     """Enable one privilege already assigned to the current process token."""
     token = wintypes.HANDLE()
-    kernel32.SetLastError(0)
+    ctypes.set_last_error(0)
     if not advapi32.OpenProcessToken(
         kernel32.GetCurrentProcess(),
         TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
@@ -630,7 +630,7 @@ def _enable_privilege(name: str) -> tuple[bool, int]:
 
     try:
         luid = _LUID()
-        kernel32.SetLastError(0)
+        ctypes.set_last_error(0)
         if not advapi32.LookupPrivilegeValueW(None, name, ctypes.byref(luid)):
             return False, ctypes.get_last_error()
 
@@ -639,7 +639,7 @@ def _enable_privilege(name: str) -> tuple[bool, int]:
         tp.Privileges[0].Luid = luid
         tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED
 
-        kernel32.SetLastError(0)
+        ctypes.set_last_error(0)
         if not advapi32.AdjustTokenPrivileges(
             token,
             False,
