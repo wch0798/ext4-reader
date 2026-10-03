@@ -32,6 +32,7 @@ IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = 0x000700A0
 IOCTL_DISK_IS_WRITABLE = 0x00070024
 IOCTL_STORAGE_QUERY_PROPERTY = 0x002D1400
 IOCTL_SCSI_PASS_THROUGH = 0x0004D004
+IOCTL_SCSI_PASS_THROUGH_DIRECT = 0x0004D014
 
 SCSI_IOCTL_DATA_OUT = 0
 SCSI_STATUS_GOOD = 0x00
@@ -170,6 +171,24 @@ class SCSI_PASS_THROUGH(ctypes.Structure):
         ("DataTransferLength", wintypes.DWORD),
         ("TimeOutValue", wintypes.DWORD),
         ("DataBufferOffset", ctypes.c_size_t),
+        ("SenseInfoOffset", wintypes.DWORD),
+        ("Cdb", ctypes.c_ubyte * 16),
+    ]
+
+
+class SCSI_PASS_THROUGH_DIRECT(ctypes.Structure):
+    _fields_ = [
+        ("Length", wintypes.USHORT),
+        ("ScsiStatus", ctypes.c_ubyte),
+        ("PathId", ctypes.c_ubyte),
+        ("TargetId", ctypes.c_ubyte),
+        ("Lun", ctypes.c_ubyte),
+        ("CdbLength", ctypes.c_ubyte),
+        ("SenseInfoLength", ctypes.c_ubyte),
+        ("DataIn", ctypes.c_ubyte),
+        ("DataTransferLength", wintypes.DWORD),
+        ("TimeOutValue", wintypes.DWORD),
+        ("DataBuffer", ctypes.c_void_p),
         ("SenseInfoOffset", wintypes.DWORD),
         ("Cdb", ctypes.c_ubyte * 16),
     ]
@@ -925,15 +944,105 @@ class WindowsPhysicalDevice(BlockDevice):
         if not ok or done.value != len(data):
             raise IoError(f"{offset}에서 쓰기 실패 (Win32 {err})", winerr=err)
 
-    def _scsi_write10(self, absolute_offset: int, data: bytes) -> None:
-        """Fallback raw write using SCSI WRITE(10) through the disk class driver.
+    def _scsi_write10_direct(self, absolute_offset: int, data: bytes) -> None:
+        """Send SCSI WRITE(10) with IOCTL_SCSI_PASS_THROUGH_DIRECT."""
+        from ext4reader.debuglog import LOG
 
-        This path is only used after the normal locked partition WriteFile path
-        returns ERROR_ACCESS_DENIED.  It is useful for USB mass-storage/card
-        readers where Windows opens and locks the partition DASD handle but the
-        filesystem/raw-volume layer still rejects WriteFile.
+        ss = int(self.sector_size or 512)
+        if absolute_offset < 0 or absolute_offset % ss or len(data) % ss:
+            raise IoError(
+                f"SCSI direct 정렬 오류 offset={absolute_offset} len={len(data)} sector={ss}",
+                winerr=87,
+            )
+        lba = absolute_offset // ss
+        blocks = len(data) // ss
+        if lba > 0xFFFFFFFF or blocks <= 0 or blocks > 0xFFFF:
+            raise IoError(
+                f"SCSI WRITE(10) 범위 초과 lba={lba} blocks={blocks}",
+                winerr=87,
+            )
+
+        sense_len = 32
+        hdr_len = ctypes.sizeof(SCSI_PASS_THROUGH_DIRECT)
+        # Keep request+sense in one stable buffer and payload in a separate
+        # aligned Python-owned buffer, as required by *_DIRECT.
+        sense_off = (hdr_len + 3) & ~3
+        packet = ctypes.create_string_buffer(sense_off + sense_len)
+        payload = ctypes.create_string_buffer(data, len(data))
+        sptd = SCSI_PASS_THROUGH_DIRECT.from_buffer(packet)
+        sptd.Length = hdr_len
+        sptd.CdbLength = 10
+        sptd.SenseInfoLength = sense_len
+        sptd.DataIn = SCSI_IOCTL_DATA_OUT
+        sptd.DataTransferLength = len(data)
+        sptd.TimeOutValue = 30
+        sptd.DataBuffer = ctypes.addressof(payload)
+        sptd.SenseInfoOffset = sense_off
+        sptd.Cdb[0] = SCSI_WRITE10
+        sptd.Cdb[2] = (lba >> 24) & 0xFF
+        sptd.Cdb[3] = (lba >> 16) & 0xFF
+        sptd.Cdb[4] = (lba >> 8) & 0xFF
+        sptd.Cdb[5] = lba & 0xFF
+        sptd.Cdb[7] = (blocks >> 8) & 0xFF
+        sptd.Cdb[8] = blocks & 0xFF
+
+        returned = wintypes.DWORD(0)
+        kernel32.SetLastError(0)
+        ok = kernel32.DeviceIoControl(
+            self._handle,
+            IOCTL_SCSI_PASS_THROUGH_DIRECT,
+            packet,
+            len(packet),
+            packet,
+            len(packet),
+            ctypes.byref(returned),
+            None,
+        )
+        err = ctypes.get_last_error()
+        if not ok:
+            raise IoError(
+                f"SCSI WRITE(10) DIRECT 실패 lba={lba} blocks={blocks} (Win32 {err})",
+                winerr=err,
+            )
+
+        sptd2 = SCSI_PASS_THROUGH_DIRECT.from_buffer(packet)
+        if int(sptd2.ScsiStatus) != SCSI_STATUS_GOOD:
+            sense = bytes(packet.raw[sense_off : sense_off + sense_len])
+            sense_key = sense[2] & 0x0F if len(sense) > 2 else 0
+            asc = sense[12] if len(sense) > 12 else 0
+            ascq = sense[13] if len(sense) > 13 else 0
+            raise IoError(
+                "SCSI WRITE(10) DIRECT 장치 오류 "
+                f"status=0x{int(sptd2.ScsiStatus):02X} sense=0x{sense_key:X}/0x{asc:02X}/0x{ascq:02X}",
+                winerr=5,
+            )
+
+        verify = self._read_at(absolute_offset, len(data))
+        if verify != data:
+            raise IoError(
+                f"SCSI WRITE(10) DIRECT 검증 실패 offset={absolute_offset} len={len(data)}",
+                winerr=23,
+            )
+        LOG.warning(
+            "WriteFile Win32 5 우회: SCSI WRITE(10) DIRECT 성공 offset=%s lba=%s blocks=%s",
+            absolute_offset,
+            lba,
+            blocks,
+        )
+
+    def _scsi_write10(self, absolute_offset: int, data: bytes) -> None:
+        """Fallback raw write through the disk class driver.
+
+        Try DIRECT first because USB/card-reader class drivers commonly reject
+        buffered pass-through data-out while accepting the direct form.
         """
         from ext4reader.debuglog import LOG
+
+        try:
+            self._scsi_write10_direct(absolute_offset, data)
+            return
+        except IoError as direct_exc:
+            LOG.warning("SCSI WRITE(10) DIRECT 경로 실패: %s", direct_exc)
 
         ss = int(self.sector_size or 512)
         if absolute_offset < 0 or absolute_offset % ss or len(data) % ss:
@@ -1004,7 +1113,6 @@ class WindowsPhysicalDevice(BlockDevice):
                 winerr=5,
             )
 
-        # Verify through the ordinary disk read path before recovery advances.
         verify = self._read_at(absolute_offset, len(data))
         if verify != data:
             raise IoError(
