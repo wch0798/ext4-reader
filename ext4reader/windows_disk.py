@@ -102,6 +102,14 @@ BUS_KIND = {
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+try:
+    fveapi = ctypes.WinDLL("fveapi", use_last_error=True)
+    _FveEnableRawAccessW = fveapi.FveEnableRawAccessW
+    _FveEnableRawAccessW.argtypes = [wintypes.LPCWSTR, wintypes.BOOL]
+    _FveEnableRawAccessW.restype = ctypes.c_long
+except (OSError, AttributeError):
+    fveapi = None
+    _FveEnableRawAccessW = None
 
 
 kernel32.CreateFileW.argtypes = [
@@ -505,6 +513,8 @@ class _LockedVolume:
     partition_number: int
     locked: bool
     offline: bool = False
+    volume_guid: str | None = None
+    fve_raw: bool = False
 
 
 @dataclass
@@ -823,6 +833,86 @@ def _log_write_environment(disk_handle=None, partition_handle=None) -> list[str]
 
 
 
+def _volume_guid_for_fve(name: str) -> str | None:
+    """Normalize Volume{GUID} aliases for FveEnableRawAccessW."""
+    raw = name.rstrip("\\")
+    if raw.startswith("\\\\?\\Volume{"):
+        return raw + "\\"
+    if raw.startswith("\\\\.\\Volume{"):
+        return "\\\\?\\" + raw[4:] + "\\"
+    if raw.startswith("Volume{"):
+        return "\\\\?\\" + raw + "\\"
+    return None
+
+
+def _dos_device_target(name: str) -> str | None:
+    buf = ctypes.create_unicode_buffer(4096)
+    ctypes.set_last_error(0)
+    n = kernel32.QueryDosDeviceW(name, buf, len(buf))
+    if not n:
+        return None
+    return buf.value
+
+
+def _volume_alias_candidates() -> list[tuple[str, str | None, str | None]]:
+    """Enumerate both Volume{GUID} and HarddiskVolumeN DOS aliases.
+
+    Returns (open_path, fve_volume_guid, NT target). Volume GUID aliases are
+    preferred because they work with FveEnableRawAccessW.
+    """
+    buf = ctypes.create_unicode_buffer(65536)
+    n = kernel32.QueryDosDeviceW(None, buf, len(buf))
+    if not n:
+        return []
+
+    names = [x for x in buf[:n].split("\x00") if x]
+    guids = sorted(x for x in names if x.startswith("Volume{"))
+    hard = sorted(x for x in names if x.startswith("HarddiskVolume"))
+
+    guid_by_target: dict[str, str] = {}
+    for name in guids:
+        target = _dos_device_target(name)
+        if target:
+            guid_by_target[target] = _volume_guid_for_fve(name) or ""
+
+    out: list[tuple[str, str | None, str | None]] = []
+    for name in guids:
+        target = _dos_device_target(name)
+        out.append(("\\\\?\\" + name, _volume_guid_for_fve(name), target))
+    for name in hard:
+        target = _dos_device_target(name)
+        out.append(("\\\\.\\" + name, guid_by_target.get(target) or None, target))
+    return out
+
+
+def _fve_raw_access(volume_guid: str | None, enabled: bool) -> tuple[bool, int]:
+    """Ask Windows' FVE layer to permit raw sector access for a volume."""
+    if not volume_guid or _FveEnableRawAccessW is None:
+        return False, -1
+    hr = int(_FveEnableRawAccessW(volume_guid, bool(enabled)))
+    ok = hr >= 0
+    return ok, hr & 0xFFFFFFFF
+
+
+def _release_locked_volume(item: _LockedVolume) -> None:
+    try:
+        _bring_volume_online(item)
+    except Exception:
+        pass
+    try:
+        kernel32.CloseHandle(item.handle)
+    except Exception:
+        pass
+    if item.fve_raw and item.volume_guid:
+        from ext4reader.debuglog import LOG
+        ok, hr = _fve_raw_access(item.volume_guid, False)
+        if ok:
+            LOG.info("FVE raw-access 해제 성공 %s", item.volume_guid)
+            item.fve_raw = False
+        else:
+            LOG.warning("FVE raw-access 해제 실패 %s HRESULT=0x%08X", item.volume_guid, hr)
+
+
 def _take_volume_offline(handle, name: str) -> bool:
     """Keep a dismounted volume from being automatically remounted.
 
@@ -939,6 +1029,7 @@ def _lock_volumes_for_disk(disk_index: int) -> list[_LockedVolume]:
                                 partition_number=int(num.PartitionNumber),
                                 locked=lock_ok,
                                 offline=offline_ok,
+                                volume_guid=_volume_guid_for_fve(name.value),
                             )
                         )
                         handle = None
@@ -993,30 +1084,33 @@ def _open_handle(path: str, writable: bool):
 
 
 def _open_hidden_volume_alias(disk_index: int, partition_number: int) -> _LockedVolume | None:
-    """Find a matching HarddiskVolumeN DOS device even when FindFirstVolume omits it."""
+    """Find a matching volume through every DOS alias exposed by Windows.
+
+    Some built-in SD/MMC readers expose an EXT4 partition only as
+    HarddiskVolumeN, while others also expose a Volume{GUID} alias.  We try
+    both and enable Windows FVE raw-access mode when a GUID is available.
+    """
     from ext4reader.debuglog import LOG
 
-    buf = ctypes.create_unicode_buffer(65536)
-    n = kernel32.QueryDosDeviceW(None, buf, len(buf))
-    if not n:
-        LOG.warning("QueryDosDeviceW 전체 열거 실패 (Win32 %s)", ctypes.get_last_error())
+    candidates = _volume_alias_candidates()
+    if not candidates:
+        LOG.warning("QueryDosDeviceW 볼륨 별칭 열거 실패 (Win32 %s)", ctypes.get_last_error())
         return None
 
-    names = [x for x in buf[:n].split("\x00") if x.startswith("HarddiskVolume")]
-    for name in names:
-        path = rf"\\.\{name}"
+    for path, volume_guid, target in candidates:
         handle = kernel32.CreateFileW(
             path,
             GENERIC_READ | GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             None,
             OPEN_EXISTING,
-            0,
+            FILE_ATTRIBUTE_NORMAL,
             None,
         )
         if handle == INVALID_HANDLE_VALUE or handle is None:
             continue
-        keep = False
+
+        matched = False
         try:
             raw = _ioctl(
                 handle,
@@ -1024,32 +1118,76 @@ def _open_hidden_volume_alias(disk_index: int, partition_number: int) -> _Locked
                 out_cb=ctypes.sizeof(STORAGE_DEVICE_NUMBER),
             )
             num = STORAGE_DEVICE_NUMBER.from_buffer_copy(raw)
-            if int(num.DeviceNumber) != int(disk_index) or int(num.PartitionNumber) != int(partition_number):
-                continue
+            matched = (
+                int(num.DeviceNumber) == int(disk_index)
+                and int(num.PartitionNumber) == int(partition_number)
+            )
+        except OSError:
+            matched = False
 
+        if not matched:
+            kernel32.CloseHandle(handle)
+            continue
+
+        # FveEnableRawAccessW may need to acquire its own volume lock. Close our
+        # discovery handle first, request raw access, then reopen the volume.
+        kernel32.CloseHandle(handle)
+        fve_ok = False
+        if volume_guid:
+            fve_ok, hr = _fve_raw_access(volume_guid, True)
+            if fve_ok:
+                LOG.info("FVE raw-access 활성화 성공 %s", volume_guid)
+            else:
+                LOG.info(
+                    "FVE raw-access 활성화 생략/실패 %s HRESULT=0x%08X",
+                    volume_guid,
+                    hr,
+                )
+
+        handle = kernel32.CreateFileW(
+            path,
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        if handle == INVALID_HANDLE_VALUE or handle is None:
+            if fve_ok:
+                _fve_raw_access(volume_guid, False)
+            continue
+
+        keep = False
+        try:
             writable_ok, writable_err = _is_writable_ioctl(handle)
             LOG.info(
-                "숨은 볼륨 별칭 발견 %s -> PhysicalDrive%s part=%s writable=%s err=%s",
+                "볼륨 별칭 발견 %s target=%s -> PhysicalDrive%s part=%s "
+                "writable=%s err=%s fve_raw=%s",
                 path,
+                target or "?",
                 disk_index,
                 partition_number,
                 writable_ok,
                 writable_err,
+                fve_ok,
             )
             lock_ok = False
             try:
                 _ioctl(handle, FSCTL_LOCK_VOLUME)
                 lock_ok = True
-                LOG.info("숨은 볼륨 잠금 성공 %s", path)
+                LOG.info("볼륨 잠금 성공 %s", path)
             except OSError as exc:
-                LOG.info("숨은 볼륨 잠금 생략/실패 %s: %s", path, exc)
+                LOG.info("볼륨 잠금 생략/실패 %s: %s", path, exc)
+
             dismount_ok = False
             try:
                 _ioctl(handle, FSCTL_DISMOUNT_VOLUME)
                 dismount_ok = True
-                LOG.info("숨은 볼륨 분리 성공 %s", path)
+                LOG.info("볼륨 분리 성공 %s", path)
             except OSError as exc:
-                LOG.info("숨은 볼륨 분리 생략/실패 %s: %s", path, exc)
+                LOG.info("볼륨 분리 생략/실패 %s: %s", path, exc)
+
             offline_ok = _take_volume_offline(handle, path) if dismount_ok else False
             _allow_extended_io(handle)
             keep = True
@@ -1059,14 +1197,17 @@ def _open_hidden_volume_alias(disk_index: int, partition_number: int) -> _Locked
                 partition_number=int(partition_number),
                 locked=lock_ok,
                 offline=offline_ok,
+                volume_guid=volume_guid,
+                fve_raw=fve_ok,
             )
         except OSError:
             pass
         finally:
             if not keep:
                 kernel32.CloseHandle(handle)
+                if fve_ok:
+                    _fve_raw_access(volume_guid, False)
     return None
-
 
 def _open_partition_device(disk_index: int, partition_number: int) -> _LockedVolume | None:
     """Open a partition DASD handle when Mount Manager exposes no Volume GUID."""
@@ -1136,6 +1277,8 @@ def _open_partition_device(disk_index: int, partition_number: int) -> _LockedVol
                 partition_number=int(partition_number),
                 locked=lock_ok,
                 offline=False,
+                volume_guid=None,
+                fve_raw=False,
             )
         except IoError:
             raise
@@ -1258,7 +1401,7 @@ class WindowsPhysicalDevice(BlockDevice):
                     else:
                         LOG.warning(
                             "PhysicalDrive%s part=%s 에 해당하는 Volume{GUID} 핸들을 찾지 못했습니다. "
-                            "숨은 HarddiskVolume 별칭을 찾습니다.",
+                            "숨은 Volume{GUID}/HarddiskVolume 별칭을 찾습니다.",
                             idx,
                             partition_number,
                         )
@@ -1267,14 +1410,15 @@ class WindowsPhysicalDevice(BlockDevice):
                             self._volume_locks.append(hidden)
                             self._partition_volume = hidden
                             LOG.info(
-                                "파티션 직접 쓰기용 숨은 볼륨 핸들 선택 %s part=%s locked=%s",
+                                "파티션 직접 쓰기용 호환 볼륨 핸들 선택 %s part=%s locked=%s fve_raw=%s",
                                 hidden.name,
                                 hidden.partition_number,
                                 hidden.locked,
+                                hidden.fve_raw,
                             )
                         else:
                             LOG.warning(
-                                "숨은 HarddiskVolume 별칭도 없어 파티션 DASD를 직접 엽니다."
+                                "Volume GUID/HarddiskVolume 별칭도 없어 파티션 DASD를 직접 엽니다."
                             )
                             direct = _open_partition_device(idx, int(partition_number))
                             if direct is not None:
@@ -1287,6 +1431,18 @@ class WindowsPhysicalDevice(BlockDevice):
                                     direct.locked,
                                 )
         self._handle = _open_handle(path, writable)
+        try:
+            _vendor, _product, self._bus_type, self._removable = _query_storage(self._handle)
+        except Exception:
+            _vendor, _product, self._bus_type, self._removable = "", "", 0, False
+        LOG.info(
+            "저장장치 경로 bus=%s(%s) removable=%s model=%s %s",
+            self._bus_type,
+            BUS_NAMES.get(self._bus_type, "알 수 없음"),
+            self._removable,
+            _vendor,
+            _product,
+        )
         if writable:
             self._write_blockers = _log_write_environment(
                 self._handle,
@@ -1369,14 +1525,7 @@ class WindowsPhysicalDevice(BlockDevice):
             idx = _physical_index(self.path)
             if idx is not None:
                 for item in self._volume_locks:
-                    try:
-                        _bring_volume_online(item)
-                    except Exception:
-                        pass
-                    try:
-                        kernel32.CloseHandle(item.handle)
-                    except Exception:
-                        pass
+                    _release_locked_volume(item)
                 self._volume_locks = _lock_volumes_for_disk(idx)
                 self._partition_volume = None
                 if self._partition_number is not None:
@@ -2074,14 +2223,7 @@ class WindowsPhysicalDevice(BlockDevice):
                     pass
                 self._nt_handle = None
             for item in self._volume_locks:
-                try:
-                    _bring_volume_online(item)
-                except Exception:
-                    pass
-                try:
-                    kernel32.CloseHandle(item.handle)
-                except Exception:
-                    pass
+                _release_locked_volume(item)
             self._volume_locks = []
 
     def __enter__(self) -> "WindowsPhysicalDevice":
