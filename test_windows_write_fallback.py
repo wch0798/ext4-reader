@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from ext4reader.io_backend import IoError
 from ext4reader.windows_disk import WindowsPhysicalDevice
@@ -82,3 +83,51 @@ class WriteFallbackTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RawOpenTests(unittest.TestCase):
+    def test_writable_open_prefers_share_read_and_normal_attribute(self):
+        import ext4reader.windows_disk as wd
+
+        calls = []
+
+        class FakeKernel32:
+            def CreateFileW(self, path, access, share, sec, creation, flags, template):
+                calls.append((path, access, share, creation, flags))
+                return 12345
+
+        with patch.object(wd, "kernel32", FakeKernel32()), patch.object(
+            wd, "_allow_extended_io", lambda handle: None
+        ):
+            handle = wd._open_handle(r"\\.\PhysicalDrive9", True)
+
+        self.assertEqual(handle, 12345)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][2], wd.FILE_SHARE_READ)
+        self.assertEqual(calls[0][4], wd.FILE_ATTRIBUTE_NORMAL)
+
+    def test_writable_open_falls_back_to_share_write(self):
+        import ext4reader.windows_disk as wd
+
+        calls = []
+
+        class FakeKernel32:
+            def CreateFileW(self, path, access, share, sec, creation, flags, template):
+                calls.append((share, flags))
+                if len(calls) == 1:
+                    return wd.INVALID_HANDLE_VALUE
+                return 54321
+
+        errors = iter([5])
+
+        with patch.object(wd, "kernel32", FakeKernel32()), patch.object(
+            wd, "_allow_extended_io", lambda handle: None
+        ), patch.object(wd.ctypes, "get_last_error", lambda: next(errors, 5)):
+            handle = wd._open_handle(r"\\.\PhysicalDrive9", True)
+
+        self.assertEqual(handle, 54321)
+        self.assertEqual(calls[0], (wd.FILE_SHARE_READ, wd.FILE_ATTRIBUTE_NORMAL))
+        self.assertEqual(
+            calls[1],
+            (wd.FILE_SHARE_READ | wd.FILE_SHARE_WRITE, wd.FILE_ATTRIBUTE_NORMAL),
+        )

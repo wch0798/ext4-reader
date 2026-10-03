@@ -20,6 +20,7 @@ FILE_SHARE_DELETE = 0x00000004
 OPEN_EXISTING = 3
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 FILE_BEGIN = 0
+FILE_ATTRIBUTE_NORMAL = 0x00000080
 FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 FSCTL_LOCK_VOLUME = 0x00090018
 FSCTL_DISMOUNT_VOLUME = 0x00090020
@@ -526,22 +527,41 @@ def _lock_volumes_for_disk(disk_index: int) -> list[_LockedVolume]:
 
 
 def _open_handle(path: str, writable: bool):
+    """Open a raw disk handle with storage-tool style flags.
+
+    For write access, prefer FILE_SHARE_READ only and FILE_ATTRIBUTE_NORMAL,
+    matching established raw-disk utilities. If Windows refuses the stricter
+    share mode, fall back to FILE_SHARE_READ|FILE_SHARE_WRITE.
+    """
+    from ext4reader.debuglog import LOG
+
     access = GENERIC_READ | (GENERIC_WRITE if writable else 0)
-    share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
-    handle = kernel32.CreateFileW(
-        path,
-        access,
-        share,
-        None,
-        OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS,
-        None,
+    shares = (
+        [FILE_SHARE_READ, FILE_SHARE_READ | FILE_SHARE_WRITE]
+        if writable
+        else [FILE_SHARE_READ | FILE_SHARE_WRITE]
     )
-    if handle == INVALID_HANDLE_VALUE or handle is None:
-        err = ctypes.get_last_error()
-        raise IoError(f"{path} 를 열 수 없습니다. (Win32 {err})", winerr=err)
-    _allow_extended_io(handle)
-    return handle
+    last_err = 0
+    for share in shares:
+        handle = kernel32.CreateFileW(
+            path,
+            access,
+            share,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        if handle != INVALID_HANDLE_VALUE and handle is not None:
+            if writable:
+                LOG.info("RAW 디스크 핸들 열기 성공 share=0x%X flags=FILE_ATTRIBUTE_NORMAL", share)
+            _allow_extended_io(handle)
+            return handle
+        last_err = ctypes.get_last_error()
+        if writable:
+            LOG.warning("RAW 디스크 핸들 열기 재시도 share=0x%X Win32=%s", share, last_err)
+
+    raise IoError(f"{path} 를 열 수 없습니다. (Win32 {last_err})", winerr=last_err)
 
 
 def _open_hidden_volume_alias(disk_index: int, partition_number: int) -> _LockedVolume | None:
@@ -846,7 +866,9 @@ class WindowsPhysicalDevice(BlockDevice):
                         "SD 어댑터 LOCK 스위치 또는 디스크 읽기 전용 속성을 확인하세요. (Win32 19)",
                         winerr=19,
                     )
-        self._use_overlapped = True
+        # Use synchronous seek+WriteFile for writable raw disks. Some USB/card
+        # reader drivers are more reliable with the classic DASD write pattern.
+        self._use_overlapped = not writable
         self._size, geo_ss = _query_geometry(self._handle)
         if geo_ss:
             self.sector_size = geo_ss
@@ -926,7 +948,7 @@ class WindowsPhysicalDevice(BlockDevice):
                             self._volume_locks.append(direct)
                             self._partition_volume = direct
         self._handle = _open_handle(self.path, self._writable)
-        self._use_overlapped = True
+        self._use_overlapped = not self._writable
         self._size, geo_ss = _query_geometry(self._handle)
         if geo_ss:
             self.sector_size = geo_ss
