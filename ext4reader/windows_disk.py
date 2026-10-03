@@ -27,6 +27,14 @@ INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 FILE_BEGIN = 0
 FILE_ATTRIBUTE_NORMAL = 0x00000080
 FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+FILE_FLAG_NO_BUFFERING = 0x20000000
+FILE_FLAG_WRITE_THROUGH = 0x80000000
+
+MEM_COMMIT = 0x00001000
+MEM_RESERVE = 0x00002000
+MEM_RELEASE = 0x00008000
+PAGE_READWRITE = 0x04
+STORAGE_ACCESS_ALIGNMENT_PROPERTY = 6
 
 # Native NT file I/O flags. Rufus' Windows extfs backend uses NtOpenFile /
 # NtWriteFile on raw devices, which avoids extra Win32 file-api translation.
@@ -169,6 +177,19 @@ kernel32.GetOverlappedResult.argtypes = [
     wintypes.BOOL,
 ]
 kernel32.GetOverlappedResult.restype = wintypes.BOOL
+kernel32.VirtualAlloc.argtypes = [
+    wintypes.LPVOID,
+    ctypes.c_size_t,
+    wintypes.DWORD,
+    wintypes.DWORD,
+]
+kernel32.VirtualAlloc.restype = ctypes.c_void_p
+kernel32.VirtualFree.argtypes = [
+    wintypes.LPVOID,
+    ctypes.c_size_t,
+    wintypes.DWORD,
+]
+kernel32.VirtualFree.restype = wintypes.BOOL
 
 # Synchronous handle + OVERLAPPED offset: one call, file pointer stays put.
 class _OVERLAPPED(ctypes.Structure):
@@ -607,6 +628,160 @@ def _query_storage(handle) -> tuple[str, str, int, bool]:
     product = _decode_c_string(data, product_off)
     return vendor, product, bus, removable
 
+
+
+def _query_access_alignment(handle, fallback_sector: int = 512) -> tuple[int, int]:
+    """Return logical and physical sector sizes for unbuffered I/O."""
+    query = bytearray(12)
+    query[0:4] = int(STORAGE_ACCESS_ALIGNMENT_PROPERTY).to_bytes(4, "little")
+    try:
+        raw = _ioctl(
+            handle,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            bytes(query),
+            out_cb=64,
+        )
+    except OSError:
+        sector = int(fallback_sector or 512)
+        return sector, sector
+
+    if len(raw) < 28:
+        sector = int(fallback_sector or 512)
+        return sector, sector
+
+    logical = int.from_bytes(raw[16:20], "little") or int(fallback_sector or 512)
+    physical = int.from_bytes(raw[20:24], "little") or logical
+    return max(1, logical), max(1, physical)
+
+
+def _write_unbuffered_raw_path(
+    path: str,
+    offset: int,
+    data: bytes,
+    fallback_sector: int = 512,
+) -> tuple[int, int]:
+    """Perform aligned raw I/O with FILE_FLAG_NO_BUFFERING.
+
+    Some SD/card-reader stacks reject cached raw writes while accepting direct
+    unbuffered sector I/O. Use VirtualAlloc-backed aligned memory and verify
+    through an unbuffered read on the same fresh device handle.
+    """
+    if not data:
+        return int(fallback_sector or 512), int(fallback_sector or 512)
+
+    handle = kernel32.CreateFileW(
+        path,
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        None,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
+        None,
+    )
+    if handle == INVALID_HANDLE_VALUE or handle is None:
+        err = ctypes.get_last_error()
+        raise IoError(
+            f"NO_BUFFERING CreateFile 실패 path={path} Win32={err}",
+            winerr=err,
+        )
+
+    base = None
+    try:
+        _allow_extended_io(handle)
+        logical, physical = _query_access_alignment(handle, fallback_sector)
+        if offset < 0 or offset % logical or len(data) % logical:
+            raise IoError(
+                f"NO_BUFFERING 정렬 오류 offset={offset} len={len(data)} "
+                f"logical={logical} physical={physical}",
+                winerr=87,
+            )
+
+        alignment = max(int(physical), int(logical), 512)
+        reserve = len(data) + alignment
+        base = kernel32.VirtualAlloc(
+            None,
+            reserve,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        )
+        if not base:
+            err = ctypes.get_last_error()
+            raise IoError(f"NO_BUFFERING VirtualAlloc 실패 Win32={err}", winerr=err)
+
+        base_addr = int(base)
+        aligned_addr = ((base_addr + alignment - 1) // alignment) * alignment
+        if aligned_addr + len(data) > base_addr + reserve:
+            raise IoError("NO_BUFFERING 정렬 버퍼 범위 오류", winerr=87)
+
+        ctypes.memmove(aligned_addr, data, len(data))
+        new_pos = ctypes.c_longlong()
+        if not kernel32.SetFilePointerEx(
+            handle,
+            int(offset),
+            ctypes.byref(new_pos),
+            FILE_BEGIN,
+        ):
+            err = ctypes.get_last_error()
+            raise IoError(f"NO_BUFFERING seek 실패 offset={offset} Win32={err}", winerr=err)
+
+        done = wintypes.DWORD()
+        ctypes.set_last_error(0)
+        ok = kernel32.WriteFile(
+            handle,
+            ctypes.c_void_p(aligned_addr),
+            len(data),
+            ctypes.byref(done),
+            None,
+        )
+        err = ctypes.get_last_error()
+        if not ok or done.value != len(data):
+            raise IoError(
+                f"NO_BUFFERING WriteFile 실패 offset={offset} "
+                f"{done.value}/{len(data)} Win32={err}",
+                winerr=err,
+            )
+        kernel32.FlushFileBuffers(handle)
+
+        ctypes.memset(aligned_addr, 0, len(data))
+        if not kernel32.SetFilePointerEx(
+            handle,
+            int(offset),
+            ctypes.byref(new_pos),
+            FILE_BEGIN,
+        ):
+            err = ctypes.get_last_error()
+            raise IoError(
+                f"NO_BUFFERING read-back seek 실패 offset={offset} Win32={err}",
+                winerr=err,
+            )
+
+        read_done = wintypes.DWORD()
+        ctypes.set_last_error(0)
+        ok = kernel32.ReadFile(
+            handle,
+            ctypes.c_void_p(aligned_addr),
+            len(data),
+            ctypes.byref(read_done),
+            None,
+        )
+        err = ctypes.get_last_error()
+        if not ok or read_done.value != len(data):
+            raise IoError(
+                f"NO_BUFFERING read-back 실패 offset={offset} "
+                f"{read_done.value}/{len(data)} Win32={err}",
+                winerr=err,
+            )
+        verify = ctypes.string_at(aligned_addr, len(data))
+        if verify != data:
+            raise IoError(
+                f"NO_BUFFERING read-back 불일치 offset={offset} len={len(data)}",
+                winerr=23,
+            )
+        return logical, physical
+    finally:
+        if base:
+            kernel32.VirtualFree(base, 0, MEM_RELEASE)
+        kernel32.CloseHandle(handle)
 
 def _physical_index(path: str) -> int | None:
     tag = "PHYSICALDRIVE"
@@ -2282,9 +2457,26 @@ class WindowsPhysicalDevice(BlockDevice):
         self.sector_size = int(sector or old_sector)
         self._use_overlapped = False
         LOG.warning(
-            "LocalSystem fresh-open 준비: PhysicalDrive share=READ|WRITE size=%s sector=%s",
+            "추가 raw handle 준비: PhysicalDrive share=READ|WRITE size=%s sector=%s",
             self._size,
             self.sector_size,
+        )
+
+    def _write_unbuffered_physical(self, offset: int, data: bytes) -> None:
+        from ext4reader.debuglog import LOG
+
+        logical, physical = _write_unbuffered_raw_path(
+            self.path,
+            int(offset),
+            bytes(data),
+            int(self.sector_size or 512),
+        )
+        LOG.warning(
+            "NO_BUFFERING PhysicalDrive 쓰기 성공 absolute=%s len=%s logical=%s physical=%s",
+            offset,
+            len(data),
+            logical,
+            physical,
         )
 
     def _fallback_after_volume_access_denied(self, offset: int, data: bytes) -> None:
@@ -2326,8 +2518,20 @@ class WindowsPhysicalDevice(BlockDevice):
             return
         except IoError as nt_exc:
             LOG.warning(
-                "Native NT write도 실패: %s; SCSI fallback 시도",
+                "Native NT write도 실패: %s; NO_BUFFERING raw write 시도",
                 nt_exc,
+            )
+
+        try:
+            # The fresh unbuffered handle needs existing PhysicalDrive handles
+            # to share write access.
+            self._prepare_system_helper_handle()
+            self._write_unbuffered_physical(absolute, data)
+            return
+        except IoError as direct_exc:
+            LOG.warning(
+                "NO_BUFFERING raw write도 실패: %s; SCSI fallback 시도",
+                direct_exc,
             )
 
         try:
