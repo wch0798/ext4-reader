@@ -2501,7 +2501,22 @@ class WindowsPhysicalDevice(BlockDevice):
 
         self._usbdk = None
         self._stop_ka = threading.Event()
-        self._reopen_locked()
+        last = None
+        for attempt in range(12):
+            try:
+                self._reopen_locked()
+                last = None
+                break
+            except Exception as exc:
+                last = exc
+                # StopRedirect causes USB PnP re-enumeration; PhysicalDrive may
+                # need a short moment before it exists again.
+                time.sleep(0.25)
+        if last is not None:
+            raise IoError(
+                f"UsbDk 실패 후 Windows storage 경로 복구 실패: {last}",
+                winerr=getattr(last, "winerr", 1167) or 1167,
+            ) from last
         if self._size:
             self._ka = threading.Thread(
                 target=self._keepalive,
