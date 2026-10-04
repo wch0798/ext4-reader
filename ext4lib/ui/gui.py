@@ -553,7 +553,7 @@ class App(tk.Tk):
                     "end",
                     text=f"{x.sb.fs_type}  {x.label}",
                     values=(
-                        x.scheme or "파티션",
+                        x.scheme or self._t("partition"),
                         format_bytes(x.sb.blocks_count * x.sb.block_size),
                         self._t("readonly") if x.write_blockers else self._t("writable"),
                         "",
@@ -721,7 +721,7 @@ class App(tk.Tk):
     def mount_selected(self) -> None:
         node = self._selected_volume()
         if not node:
-            messagebox.showinfo("선택", "왼쪽에서 EXT4 볼륨을 선택하세요.")
+            messagebox.showinfo(self._t("select_title"), self._t("select_volume"), parent=self)
             return
         kind, payload = node
         if kind == "vol":
@@ -742,7 +742,7 @@ class App(tk.Tk):
             opener = lambda writable: ImageDevice(path, writable=writable)
             src = path
         else:
-            messagebox.showinfo("선택", "EXT4 볼륨 줄을 선택한 뒤 다시 시도하세요.")
+            messagebox.showinfo(self._t("select_title"), self._t("select_volume_row"), parent=self)
             return
 
         if key in self._mounts:
@@ -751,9 +751,9 @@ class App(tk.Tk):
             if want_write and session.read_only:
                 letter_keep = session.letter
                 if not messagebox.askyesno(
-                    "쓰기로 다시 연결",
-                    f"{letter_keep} 는 지금 읽기 전용입니다.\n"
-                    "연결을 해제하고 같은 문자로 쓰기를 열어 다시 연결할까요?",
+                    self._t("reconnect_write_title"),
+                    self._t("reconnect_write_message", letter=letter_keep),
+                    parent=self,
                 ):
                     open_explorer(letter_keep)
                     return
@@ -770,7 +770,7 @@ class App(tk.Tk):
                     self.drive_var.set(letter_keep)
             else:
                 open_explorer(session.letter)
-                self.set_status(f"이미 {session.letter} 로 연결되어 있습니다.")
+                self.set_status(self._t("already_connected", letter=session.letter))
                 return
 
         if not winfsp_available():
@@ -779,12 +779,12 @@ class App(tk.Tk):
 
         writable = bool(self.write_var.get())
         if writable and kind == "vol" and not is_admin():
-            messagebox.showwarning("권한", "물리 디스크에 쓰려면 관리자 권한으로 다시 시작하세요. 읽기 전용으로 엽니다.")
+            messagebox.showwarning(self._t("permission_title"), self._t("permission_write"), parent=self)
             writable = False
 
         try:
             letter = self._chosen_letter()
-            self.set_status(f"{letter} 드라이브로 연결하는 중…")
+            self.set_status(self._t("mounting", letter=letter))
             self.update_idletasks()
             LOG.info(
                 "마운트 요청 src=%s offset=%s writable=%s admin=%s letter=%s",
@@ -814,13 +814,11 @@ class App(tk.Tk):
                 recovery_stats = None
                 if vol.journal_needs_recovery() or vol.sb.needs_recovery:
                     try:
-                        self.set_status("EXT4 저널을 Windows에서 복구하는 중…")
+                        self.set_status(self._t("journal_recover_status"))
                         self.update_idletasks()
                         recovery_stats = self._run_with_progress(
-                            "EXT4 저널 복구 중",
-                            "저널을 안전하게 재생하고 있습니다.\n"
-                            "Windows raw-write가 차단되면 LocalSystem/UsbDk 경로를 순서대로 확인합니다.\n"
-                            "이 작업 동안 창은 계속 응답합니다.",
+                            self._t("journal_recover_title"),
+                            self._t("journal_recover_message"),
                             vol.recover_pending_journal,
                         )
                         LOG.info(
@@ -836,43 +834,35 @@ class App(tk.Tk):
                         except Exception:
                             LOG.exception("UsbDk 설치 전 장치 닫기 실패")
                         install_now = messagebox.askyesno(
-                            "이 USB 카드리더에는 UsbDk가 필요합니다",
-                            str(exc)
-                            + "\n\n일반 Windows/관리자/LocalSystem raw-write 경로는 이미 모두 실패했습니다. "
-                            "다른 리더기에는 기존 경로를 계속 사용하고, 이 경우에만 UsbDk direct-USB fallback을 사용합니다.\n\n"
-                            "공식 UsbDk를 다운로드하고 설치할까요?",
+                            self._t("usbdk_required_title"),
+                            self._t("usbdk_required_message", error=exc),
                         )
                         if install_now:
                             ready = self.ensure_usbdk(show_success=True)
                             if ready:
-                                self.set_status("UsbDk 준비 완료 — 카드리더를 다시 검색한 뒤 연결을 다시 시도하세요.")
+                                self.set_status(self._t("usbdk_ready_status"))
                         else:
-                            self.set_status("UsbDk 설치를 취소했습니다.")
+                            self.set_status(self._t("usbdk_cancelled"))
                         return
                     except Exception as exc:
                         LOG.exception("Windows JBD2 복구 실패")
                         messagebox.showwarning(
-                            "저널 자동 복구 실패 — 읽기 전용으로 연결",
-                            "EXT4 저널을 Windows에서 안전하게 복구하지 못했습니다.\n"
-                            "원본 보호를 위해 읽기 전용으로 연결합니다.\n\n"
-                            + str(exc),
+                            self._t("journal_fail_title"),
+                            self._t("journal_fail_message", error=exc),
                         )
                 hard = vol.hard_write_blockers()
                 soft = vol.soft_write_warnings()
                 LOG.info("쓰기 검사 hard=%s soft=%s", hard, soft)
                 if hard:
                     messagebox.showwarning(
-                        "쓰기 불가 — 읽기 전용으로 연결",
-                        "쓸 수 없는 이유:\n- " + "\n- ".join(hard),
+                        self._t("write_block_title"),
+                        self._t("write_block_reasons", reasons="\n- ".join(hard)),
                     )
                     read_only = True
                 elif soft:
                     ok = messagebox.askyesno(
-                        "쓰기 주의",
-                        "이 디스크는 리눅스에서 완전히 끄지 않고 뺀 상태일 수 있습니다.\n- "
-                        + "\n- ".join(soft)
-                        + "\n\n그래도 Windows에서 파일을 복사·저장할까요?\n"
-                        "리눅스가 아직 이 USB를 쓰는 중이면 데이터가 깨질 수 있습니다.",
+                        self._t("write_warning_title"),
+                        self._t("write_warning_message", warnings="\n- ".join(soft)),
                     )
                     if ok:
                         LOG.warning("사용자가 쓰기 위험을 감수함: %s", soft)
@@ -883,22 +873,20 @@ class App(tk.Tk):
             label = vol.sb.volume_name or vinfo.label or "EXT4"
             session = mount_volume(vol, read_only=read_only, label=label, letter=letter)
             self._mounts[key] = session
-            mode = "읽기 전용" if read_only else "읽기/쓰기"
-            self.tree.set(self.tree.selection()[0], "state", f"연결됨 ({mode})")
+            mode = self._t("mode_ro") if read_only else self._t("mode_rw")
+            self.tree.set(self.tree.selection()[0], "state", self._t("connected_state", mode=mode))
             self.tree.set(self.tree.selection()[0], "drive", session.letter)
             self.refresh_drive_letters()
             open_explorer(session.letter)
-            self.set_status(
-                f"{session.letter} 드라이브로 연결했습니다 ({mode}). "
-                f"내 PC에서 {session.letter} 를 쓰세요."
-            )
+            self.set_status(self._t("mount_success", letter=session.letter, mode=mode))
         except Exception as exc:
             LOG.exception("연결 실패 src=%s", src)
             messagebox.showerror(
-                "연결 실패",
-                explain_fuse_error(exc) + "\n\n아래 로그를 복사해 주세요. 콘솔 창에도 같은 내용이 있습니다.",
+                self._t("mount_fail_title"),
+                self._t("mount_fail_message", error=explain_fuse_error(exc)),
+                parent=self,
             )
-            self.set_status(f"연결 실패: {exc}")
+            self.set_status(self._t("mount_fail_status", error=exc))
 
     def unmount_selected(self) -> None:
         node = self._selected_volume()
@@ -916,10 +904,10 @@ class App(tk.Tk):
         self._drop_mount(key)
         sel = self.tree.selection()
         if sel:
-            self.tree.set(sel[0], "state", "해제됨")
+            self.tree.set(sel[0], "state", self._t("disconnected"))
             self.tree.set(sel[0], "drive", "")
         self.refresh_drive_letters()
-        self.set_status("연결을 해제했습니다.")
+        self.set_status(self._t("disconnect_done"))
 
     def _drop_mount(self, key: str) -> None:
         session = self._mounts.pop(key, None)
@@ -935,7 +923,7 @@ class App(tk.Tk):
             self.update_idletasks()
             self._drop = DropTarget(self, self.on_drop)
         except Exception:
-            self.set_status("창으로 끌어다 놓기는 사용할 수 없습니다. 탐색기에서 드라이브로 드래그하세요.")
+            self.set_status(self._t("dnd_unavailable"))
 
     def _mount_key_for_node(self, node) -> str | None:
         if not node:
@@ -965,15 +953,15 @@ class App(tk.Tk):
         if not letter:
             if not self.write_var.get():
                 messagebox.showinfo(
-                    "끌어다 넣기",
-                    "탐색기에서 넣으려면 «쓰기 허용»을 켠 뒤 EXT4 볼륨을 연결하세요.\n"
-                    "그다음 내 PC의 드라이브로 파일을 끌어다 놓으면 됩니다.",
+                    self._t("drop_title"),
+                    self._t("drop_message"),
+                    parent=self,
                 )
                 return
             self.mount_selected()
             letter = self._target_letter()
         if not letter:
-            messagebox.showinfo("대상", "먼저 EXT4 볼륨을 선택하고 «탐색기에서 열기»로 연결하세요.")
+            messagebox.showinfo(self._t("target_title"), self._t("target_message"), parent=self)
             return
         dest_root = letter + "\\"
         ok = 0
@@ -990,8 +978,8 @@ class App(tk.Tk):
             except Exception as exc:
                 errors.append(f"{name}: {exc}")
         if errors:
-            messagebox.showerror("복사 실패", "\n".join(errors[:8]))
-        self.set_status(f"{ok}개 항목을 {letter} 로 복사했습니다. 탐색기에서 확인하세요.")
+            messagebox.showerror(self._t("copy_failed"), "\n".join(errors[:8]), parent=self)
+        self.set_status(self._t("copy_done", count=ok, letter=letter))
         try:
             open_explorer(letter)
         except Exception:
@@ -1000,9 +988,9 @@ class App(tk.Tk):
     def on_close(self) -> None:
         if self._operation_active:
             self.bell()
-            self.set_status("저장장치 작업이 끝날 때까지 프로그램을 종료할 수 없습니다.")
+            self.set_status(self._t("busy_close"))
             return
-        self.set_status("드라이브를 해제하는 중…")
+        self.set_status(self._t("unmounting"))
         try:
             self.update_idletasks()
         except Exception:
@@ -1023,6 +1011,6 @@ class App(tk.Tk):
 
 def main() -> None:
     if sys.platform != "win32":
-        print("이 프로그램은 Windows용입니다.")
+        print(tr(load_language(), "windows_only"))
     app = App()
     app.mainloop()
