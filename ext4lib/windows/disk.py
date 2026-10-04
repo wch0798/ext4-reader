@@ -552,6 +552,7 @@ class DiskInfo:
     removable: bool
     size: int
     sector_size: int
+    serial: str = ""
     error: str = ""
 
     @property
@@ -628,6 +629,28 @@ def _query_storage(handle) -> tuple[str, str, int, bool]:
     vendor = _decode_c_string(data, vendor_off)
     product = _decode_c_string(data, product_off)
     return vendor, product, bus, removable
+
+
+def _query_storage_serial(handle) -> str:
+    """Return the STORAGE_DEVICE_DESCRIPTOR serial number when available."""
+    query = ctypes.create_string_buffer(12)
+    out = ctypes.create_string_buffer(1024)
+    returned = wintypes.DWORD(0)
+    ok = kernel32.DeviceIoControl(
+        handle,
+        IOCTL_STORAGE_QUERY_PROPERTY,
+        query,
+        12,
+        out,
+        1024,
+        ctypes.byref(returned),
+        None,
+    )
+    if not ok or returned.value < 32:
+        return ""
+    data = out.raw[: returned.value]
+    serial_off = int.from_bytes(data[24:28], "little")
+    return _decode_c_string(data, serial_off)
 
 
 
@@ -1641,6 +1664,7 @@ def list_physical_disks() -> list[DiskInfo]:
                     removable=removable,
                     size=size,
                     sector_size=sector or 512,
+                    serial=_query_storage_serial(handle),
                 )
             )
         except Exception as exc:
@@ -1654,6 +1678,7 @@ def list_physical_disks() -> list[DiskInfo]:
                     removable=False,
                     size=0,
                     sector_size=512,
+                    serial="",
                     error=str(exc),
                 )
             )
@@ -1754,8 +1779,10 @@ class WindowsPhysicalDevice(BlockDevice):
         self._handle = _open_handle(path, writable)
         try:
             _vendor, _product, self._bus_type, self._removable = _query_storage(self._handle)
+            self._serial = _query_storage_serial(self._handle)
         except Exception:
             _vendor, _product, self._bus_type, self._removable = "", "", 0, False
+            self._serial = ""
         LOG.info(
             "저장장치 경로 bus=%s(%s) removable=%s model=%s %s",
             self._bus_type,
@@ -1802,6 +1829,10 @@ class WindowsPhysicalDevice(BlockDevice):
     @property
     def display_path(self) -> str:
         return self.path
+
+    @property
+    def serial(self) -> str:
+        return self._serial
 
     def size(self) -> int:
         return self._size
@@ -2956,6 +2987,18 @@ class WindowsPhysicalDevice(BlockDevice):
         return b"".join(parts)
 
     def _raw_write_once(self, offset: int, data: bytes) -> None:
+        # When this device was opened for one selected partition, no write is
+        # allowed to escape that partition. Falling back to whole-PhysicalDrive
+        # I/O outside the selected range could corrupt another partition.
+        if self._partition_size > 0:
+            start = self._partition_offset
+            end = start + self._partition_size
+            if offset < start or offset + len(data) > end:
+                raise IoError(
+                    "선택한 EXT4 파티션 범위를 벗어난 raw write를 차단했습니다. "
+                    f"offset={offset} len={len(data)} allowed=[{start},{end})",
+                    winerr=87,
+                )
         pos = 0
         while pos < len(data):
             n = min(IO_CHUNK, len(data) - pos)
