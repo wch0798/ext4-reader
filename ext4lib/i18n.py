@@ -13,12 +13,20 @@ LANGUAGES = {
     "ja": "日本語",
 }
 
+OWNER_MODES = {
+    "deck": (1000, 1000),
+    "root": (0, 0),
+}
+
 _MESSAGES = {
     "ko": {
         "subtitle": "  탐색기 드라이브로 연결",
         "language": "언어",
         "language_changed_title": "언어 설정",
         "language_changed_message": "언어 설정을 저장했습니다. 다음 실행부터 전체 UI에 적용됩니다.",
+        "linux_owner": "Linux 소유자",
+        "owner_deck": "일반 사용자 (deck 1000:1000)",
+        "owner_root": "root (0:0)",
         "write_enable": "쓰기 허용",
         "admin_restart": "관리자 권한으로 다시 시작",
         "admin_running": "관리자 실행 중",
@@ -161,6 +169,9 @@ _MESSAGES = {
         "language": "Language",
         "language_changed_title": "Language",
         "language_changed_message": "Language preference saved. The full UI will use it on the next launch.",
+        "linux_owner": "Linux owner",
+        "owner_deck": "Normal user (deck 1000:1000)",
+        "owner_root": "root (0:0)",
         "write_enable": "Enable write",
         "admin_restart": "Restart as administrator",
         "admin_running": "Running as administrator",
@@ -303,6 +314,9 @@ _MESSAGES = {
         "language": "言語",
         "language_changed_title": "言語設定",
         "language_changed_message": "言語設定を保存しました。次回起動時からUI全体に適用されます。",
+        "linux_owner": "Linux所有者",
+        "owner_deck": "一般ユーザー (deck 1000:1000)",
+        "owner_root": "root (0:0)",
         "write_enable": "書き込みを許可",
         "admin_restart": "管理者権限で再起動",
         "admin_running": "管理者として実行中",
@@ -470,6 +484,39 @@ def load_language() -> str:
     except (OSError, ValueError, TypeError):
         pass
     return detect_language()
+
+
+def load_owner_mode() -> str:
+    path = _settings_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        mode = str(data.get("owner_mode", "")).lower()
+        if mode in OWNER_MODES:
+            return mode
+    except (OSError, ValueError, TypeError):
+        pass
+    return "deck"
+
+
+def save_owner_mode(mode: str) -> None:
+    if mode not in OWNER_MODES:
+        raise ValueError(f"Unsupported owner mode: {mode}")
+    path = _settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {}
+    try:
+        current = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(current, dict):
+            data.update(current)
+    except (OSError, ValueError, TypeError):
+        pass
+    data["owner_mode"] = mode
+    temp = path.with_suffix(".tmp")
+    temp.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temp.replace(path)
 
 
 def save_language(language: str) -> None:
