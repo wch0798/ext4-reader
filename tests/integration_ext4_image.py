@@ -12,7 +12,7 @@ import os
 
 from ext4lib.fs import constants as C
 from ext4lib.fs.journal import _JournalLog
-from ext4lib.fs.volume import Ext4Volume
+from ext4lib.fs.volume import Ext4Volume, discover_volumes
 from ext4lib.fs.writer import (
     create_empty_file,
     lookup_path,
@@ -94,6 +94,12 @@ def journal_replay_roundtrip(path: str) -> None:
 
     root = lookup_path(vol, "/")
     node = create_empty_file(vol, root, "replay.bin")
+    # create_empty_file is a completed namespace operation and now leaves the
+    # medium clean/portable before the next write begins.
+    assert not vol._write_session_active
+    assert vol.journal_start() == 0
+    assert vol.sb.state & C.EXT4_VALID_FS
+    before_crash = _JournalLog(vol).info.sequence
     payload = (b"jbd2-ordered-data-" * 4096) + b"END"
 
     original_checkpoint = vol._checkpoint_metadata_blocks
@@ -122,10 +128,9 @@ def journal_replay_roundtrip(path: str) -> None:
         assert stats.transactions >= 1
         assert stats.replayed_blocks >= 1
 
-        # create_empty_file committed sequence S+1. The injected crash happens
-        # after the next commit (S+2), and Linux recovery restarts at
-        # ++end_transaction, so the clean journal sequence must be S+4.
-        expected_recovery_sequence = (initial_sequence + 4) & 0xFFFFFFFF
+        # The crash transaction starts one ID after the clean journal sequence.
+        # Recovery advances once past end_transaction before resetting.
+        expected_recovery_sequence = (before_crash + 3) & 0xFFFFFFFF
         clean_log = _JournalLog(recovery)
         assert clean_log.info.start == 0
         assert clean_log.info.sequence == expected_recovery_sequence
@@ -165,6 +170,69 @@ def journal_replay_roundtrip(path: str) -> None:
         again.close()
 
 
+
+def gpt_portable_roundtrip(path: str) -> None:
+    """Write inside a GPT partition and prove both GPT copies stay untouched."""
+    size = os.path.getsize(path)
+    guard = 1024 * 1024
+    with open(path, "rb") as fp:
+        prefix_before = fp.read(guard)
+        fp.seek(max(0, size - guard))
+        suffix_before = fp.read(guard)
+
+    dev = ImageDevice(path, writable=True)
+    vols = discover_volumes(dev)
+    if len(vols) != 1:
+        dev.close()
+        raise AssertionError(f"expected one EXT volume in GPT image, found {len(vols)}")
+    info = vols[0]
+    assert info.scheme == "GPT"
+    assert info.offset >= guard
+    vol = Ext4Volume(dev, info.offset, info.size, owns_device=True)
+    blockers = vol.hard_write_blockers()
+    if blockers:
+        vol.close()
+        raise AssertionError("GPT EXT4 image is not writable: " + " | ".join(blockers))
+
+    root = lookup_path(vol, "/")
+    node = create_empty_file(vol, root, "portable.bin")
+    assert not vol._write_session_active
+    assert vol.journal_start() == 0
+    assert not vol.sb.needs_recovery
+    assert vol.sb.state & C.EXT4_VALID_FS
+
+    payload = (b"portable-ext4-" * 8192) + b"END"
+    write_range(vol, node, 0, payload, flush=True)
+    assert not vol._write_session_active
+    assert vol.journal_start() == 0
+    assert not vol.sb.needs_recovery
+    assert vol.sb.state & C.EXT4_VALID_FS
+    vol.close()
+
+    with open(path, "rb") as fp:
+        prefix_after = fp.read(guard)
+        fp.seek(max(0, size - guard))
+        suffix_after = fp.read(guard)
+    assert prefix_after == prefix_before, "primary GPT / pre-partition area changed"
+    assert suffix_after == suffix_before, "backup GPT / end-of-disk area changed"
+
+    check_dev = ImageDevice(path, writable=False)
+    try:
+        current = discover_volumes(check_dev)
+        assert len(current) == 1
+        assert current[0].scheme == "GPT"
+        assert current[0].offset == info.offset
+        assert current[0].size == info.size
+        assert current[0].sb.uuid == info.sb.uuid
+        check = Ext4Volume(check_dev, current[0].offset, current[0].size, owns_device=False)
+        node = lookup_path(check, "/portable.bin")
+        assert read_range(check, node, 0, len(payload)) == payload
+        assert check.sb.state & C.EXT4_VALID_FS
+        assert not check.sb.needs_recovery
+        assert not check.journal_needs_recovery()
+    finally:
+        check_dev.close()
+
 def dirty_marker_roundtrip(path: str) -> None:
     vol = open_volume(path, True)
     blockers = vol.hard_write_blockers()
@@ -190,7 +258,7 @@ def main() -> None:
     parser.add_argument("image")
     parser.add_argument(
         "--mode",
-        choices=("clean", "dirty-marker", "journal-replay"),
+        choices=("clean", "dirty-marker", "journal-replay", "gpt-portable"),
         default="clean",
     )
     args = parser.parse_args()
@@ -199,8 +267,10 @@ def main() -> None:
         clean_roundtrip(args.image)
     elif args.mode == "dirty-marker":
         dirty_marker_roundtrip(args.image)
-    else:
+    elif args.mode == "journal-replay":
         journal_replay_roundtrip(args.image)
+    else:
+        gpt_portable_roundtrip(args.image)
 
 
 if __name__ == "__main__":
