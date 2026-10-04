@@ -76,6 +76,7 @@ class Superblock:
     want_extra_isize: int
     min_extra_isize: int
     checksum_seed: int
+    reserved_gdt_blocks: int = 0
     last_orphan: int = 0
     orphan_file_inum: int = 0
     groups_count: int = 0
@@ -223,6 +224,7 @@ def parse_superblock(data: bytes) -> Superblock:
         want_extra_isize=_u16(data, 0x15C) or 32,
         min_extra_isize=_u16(data, 0x15A) or 32,
         checksum_seed=csum_seed,
+        reserved_gdt_blocks=_u16(data, 0xCE),
         last_orphan=_u32(data, 0xE8),
         orphan_file_inum=_u32(data, 0x280),
         groups_count=groups,
