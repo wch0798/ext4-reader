@@ -141,6 +141,25 @@ jobs:
           truncate -s 256M repair.img
           mkfs.ext4 -F -q -b 4096 -O 64bit,metadata_csum,^orphan_file,^fast_commit repair.img
 
+          # Modern ext4 layout used by Steam Deck-class Linux systems.
+          truncate -s 256M orphan.img
+          mkfs.ext4 -F -q -b 4096 -O 64bit,metadata_csum,orphan_file,^fast_commit orphan.img
+
+          # Build a real indexed (HTREE) directory using Linux/e2fsprogs.
+          mkdir -p htree-src/indexed
+          for i in $(seq 1 1800); do
+            : > "htree-src/indexed/file-$i.txt"
+          done
+          truncate -s 256M htree.img
+          mkfs.ext4 -F -q -b 4096 -O 64bit,metadata_csum,^orphan_file,^fast_commit -d htree-src htree.img
+          set +e
+          sudo e2fsck -fyD htree.img
+          htree_rc=$?
+          set -e
+          if (( htree_rc & (4|8|16|32|128) )); then
+            exit "$htree_rc"
+          fi
+
           # Real disk layout: GPT + one Linux filesystem partition containing EXT4.
           truncate -s 320M gpt.img
           sgdisk -og gpt.img
@@ -155,6 +174,8 @@ jobs:
           python -m tests.integration_ext4_image dirty.img --mode dirty-marker
           python -m tests.integration_ext4_image journal.img --mode journal-replay
           python -m tests.integration_ext4_image repair.img --mode error-repair
+          python -m tests.integration_ext4_image orphan.img --mode orphan-repair
+          python -m tests.integration_ext4_image htree.img --mode htree
           python -m tests.integration_ext4_image gpt.img --mode gpt-portable
 
       - name: Validate clean images with e2fsck
@@ -163,6 +184,14 @@ jobs:
           sudo e2fsck -fn journal.img
           sudo e2fsck -fn repair.img
           debugfs -R "stat /windows-repaired.bin" repair.img
+
+          sudo e2fsck -fn orphan.img
+          debugfs -R "stat /orphan-keep.bin" orphan.img
+
+          # Linux must resolve the Windows-created name through the real HTREE,
+          # not merely by our own directory walker.
+          sudo e2fsck -fn htree.img
+          debugfs -R "stat /indexed/from-windows.bin" htree.img
 
           # Validate that the GPT itself is still valid and that the EXT4
           # partition is independently readable after being moved/extracted.
