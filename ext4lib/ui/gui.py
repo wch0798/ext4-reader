@@ -758,7 +758,8 @@ class App(tk.Tk):
                     open_explorer(letter_keep)
                     return
                 LOG.info("읽기 전용 %s 를 해제하고 쓰기로 다시 연결합니다", letter_keep)
-                self._drop_mount(key)
+                if not self._drop_mount(key, show_error=True):
+                    return
                 deadline = time.time() + 6
                 while time.time() < deadline:
                     self.refresh_drive_letters()
@@ -901,22 +902,36 @@ class App(tk.Tk):
             key = self._vol_key("image", path, vinfo)
         else:
             return
-        self._drop_mount(key)
+        ok = self._drop_mount(key, show_error=True)
         sel = self.tree.selection()
         if sel:
-            self.tree.set(sel[0], "state", self._t("disconnected"))
+            self.tree.set(
+                sel[0],
+                "state",
+                self._t("disconnected") if ok else self._t("unmount_failed_state"),
+            )
             self.tree.set(sel[0], "drive", "")
         self.refresh_drive_letters()
-        self.set_status(self._t("disconnect_done"))
+        if ok:
+            self.set_status(self._t("disconnect_done"))
 
-    def _drop_mount(self, key: str) -> None:
+    def _drop_mount(self, key: str, *, show_error: bool = False) -> bool:
         session = self._mounts.pop(key, None)
         if not session:
-            return
+            return True
         try:
             unmount(session.letter)
-        except Exception:
+            return True
+        except Exception as exc:
             LOG.exception("연결 해제 실패 %s", session.letter)
+            self.set_status(self._t("unmount_failed_status", error=exc))
+            if show_error:
+                messagebox.showerror(
+                    self._t("unmount_failed_title"),
+                    self._t("unmount_failed_message", error=exc),
+                    parent=self,
+                )
+            return False
 
     def _hook_dnd(self) -> None:
         try:
@@ -1001,7 +1016,7 @@ class App(tk.Tk):
             except Exception:
                 pass
         for key in list(self._mounts):
-            self._drop_mount(key)
+            self._drop_mount(key, show_error=True)
         try:
             unmount_all()
         except Exception:
