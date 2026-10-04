@@ -62,11 +62,20 @@ jobs:
             throw "dist\Ext4Reader.exe was not created"
           }
 
-      - name: Upload EXE artifact
+      - name: Create SHA-256 checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash "dist\\Ext4Reader.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  Ext4Reader.exe" | Set-Content -Encoding ascii "dist\\SHA256SUMS.txt"
+          Get-Content "dist\\SHA256SUMS.txt"
+
+      - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
           name: Ext4Reader-${{ steps.version.outputs.version }}-windows
-          path: dist/Ext4Reader.exe
+          path: |
+            dist/Ext4Reader.exe
+            dist/SHA256SUMS.txt
           if-no-files-found: error
 
       - name: Update repository EXE
