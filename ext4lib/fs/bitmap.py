@@ -218,7 +218,7 @@ def write_block_bitmap(vol, gd: GroupDesc, bm: Bitmap) -> None:
         cache[gd.group] = bm
         dirty.add(gd.group)
         return
-    vol.write_metadata_block(gd.block_bitmap, bytes(bm.data[: vol.sb.block_size]).ljust(vol.sb.block_size, b"\x00"))
+    (getattr(vol, "write_metadata_block", None) or vol.write_block)(gd.block_bitmap, bytes(bm.data[: vol.sb.block_size]).ljust(vol.sb.block_size, b"\x00"))
 
 
 def write_inode_bitmap(vol, gd: GroupDesc, bm: Bitmap) -> None:
@@ -229,7 +229,7 @@ def write_inode_bitmap(vol, gd: GroupDesc, bm: Bitmap) -> None:
         cache[gd.group] = bm
         dirty.add(gd.group)
         return
-    vol.write_metadata_block(gd.inode_bitmap, bytes(bm.data[: vol.sb.block_size]).ljust(vol.sb.block_size, b"\x00"))
+    (getattr(vol, "write_metadata_block", None) or vol.write_block)(gd.inode_bitmap, bytes(bm.data[: vol.sb.block_size]).ljust(vol.sb.block_size, b"\x00"))
 
 
 class AllocError(RuntimeError):
