@@ -2,8 +2,8 @@ import struct
 import unittest
 from unittest.mock import patch
 
-from io_backend import IoError
-from usbdk_backend import (
+from ext4lib.io.backend import IoError
+from ext4lib.windows.usbdk import (
     CBW_SIGNATURE,
     CSW_SIGNATURE,
     UsbDkBotBackend,
@@ -141,7 +141,7 @@ class UsbDkBotTests(unittest.TestCase):
                 raise UsbDkError("reader still re-enumerating", winerr=31)
 
         dev.test_unit_ready = tur
-        with patch("usbdk_backend.time.sleep") as sleep:
+        with patch("ext4lib.windows.usbdk.time.sleep") as sleep:
             dev.wait_until_ready(timeout=1.0)
 
         self.assertEqual(attempts["count"], 3)
@@ -155,7 +155,7 @@ class UsbDkBotTests(unittest.TestCase):
         )
 
         with patch(
-            "usbdk_backend.time.monotonic",
+            "ext4lib.windows.usbdk.time.monotonic",
             side_effect=[0.0, 2.0],
         ):
             with self.assertRaises(UsbDkError) as cm:

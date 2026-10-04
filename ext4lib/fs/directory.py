@@ -5,11 +5,11 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
-import constants as C
-from crc32c import crc32c
-from extents import extent_at, file_extents, read_mapped
-from hashdir import dirhash
-from inode import Inode
+from ext4lib.fs import constants as C
+from ext4lib.fs.crc32c import crc32c
+from ext4lib.fs.extents import extent_at, file_extents, read_mapped
+from ext4lib.fs.hashdir import dirhash
+from ext4lib.fs.inode import Inode
 
 
 @dataclass
@@ -403,8 +403,8 @@ class DirError(RuntimeError):
 
 
 def add_dir_entry(vol, dir_inode: Inode, name: str, ino: int, ftype: int) -> Inode:
-    from extents import Extent, build_extent_tree, discard_old_extent_indexes, file_extents
-    from bitmap import alloc_blocks, free_phys_runs
+    from ext4lib.fs.extents import Extent, build_extent_tree, discard_old_extent_indexes, file_extents
+    from ext4lib.fs.bitmap import alloc_blocks, free_phys_runs
 
     name_b = name.encode("utf-8")
     if len(name_b) > C.EXT4_NAME_LEN:

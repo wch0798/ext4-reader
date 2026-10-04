@@ -127,8 +127,8 @@ def setup_logging(queue=None) -> logging.Logger:
     LOG.propagate = False
     if not _configured:
         _configured = True
-        from app_info import __version__
-        from windows_disk import is_admin
+        from ext4lib import __version__
+        from ext4lib.windows.disk import is_admin
 
         LOG.info("==== EXT4 Reader %s ====", __version__)
         LOG.info("pid=%s admin=%s frozen=%s", os.getpid(), "yes" if is_admin() else "no", getattr(sys, "frozen", False))

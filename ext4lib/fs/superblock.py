@@ -6,8 +6,8 @@ import struct
 import uuid
 from dataclasses import dataclass, field
 
-import constants as C
-from crc32c import crc32c, crc32c_seed
+from ext4lib.fs import constants as C
+from ext4lib.fs.crc32c import crc32c, crc32c_seed
 
 
 def _u16(buf: bytes, off: int) -> int:

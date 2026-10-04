@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import struct
 
-import constants as C
+from ext4lib.fs import constants as C
 
 DELTA = 0x9E3779B9
 

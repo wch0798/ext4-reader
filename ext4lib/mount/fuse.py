@@ -13,12 +13,12 @@ import threading
 import time
 from ctypes import wintypes
 
-from debuglog import LOG, exception_chain
-from directory import DirError, list_dir
-from io_backend import IoError
-from volume import Ext4Error, Ext4Volume
-from winfsp_setup import find_winfsp_dll, start_winfsp_services, winfsp_ready
-from writer import (
+from ext4lib.debuglog import LOG, exception_chain
+from ext4lib.fs.directory import DirError, list_dir
+from ext4lib.io.backend import IoError
+from ext4lib.fs.volume import Ext4Error, Ext4Volume
+from ext4lib.windows.winfsp_setup import find_winfsp_dll, start_winfsp_services, winfsp_ready
+from ext4lib.fs.writer import (
     create_empty_file,
     lookup_parent,
     lookup_path,
@@ -258,7 +258,7 @@ def _safe_volname(label: str) -> str:
 def _ensure_fuse():
     dll = find_winfsp_dll()
     if not dll:
-        from winfsp_setup import ensure_winfsp_installed
+        from ext4lib.windows.winfsp_setup import ensure_winfsp_installed
 
         dll = ensure_winfsp_installed()
     ensure_winfsp_services()

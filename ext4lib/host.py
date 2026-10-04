@@ -14,7 +14,7 @@ def is_frozen() -> bool:
 def project_root() -> str:
     if is_frozen():
         return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.abspath(__file__))
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def is_store_python(path: str) -> bool:

@@ -16,7 +16,7 @@ except ImportError:  # pragma: no cover - non-Windows import safety
     winreg = None
 from dataclasses import dataclass
 
-from io_backend import IO_CHUNK, BlockDevice, IoError
+from ext4lib.io.backend import IO_CHUNK, BlockDevice, IoError
 
 GENERIC_READ = 0x80000000
 GENERIC_WRITE = 0x40000000
@@ -495,7 +495,7 @@ def restart_as_admin(hwnd=None) -> tuple[bool, str]:
         return False, "이 프로그램은 Windows용입니다."
     if is_admin():
         return True, ""
-    from host import app_exe, is_frozen, project_root
+    from ext4lib.host import app_exe, is_frozen, project_root
 
     try:
         exe = app_exe()
@@ -895,7 +895,7 @@ def _enable_privilege(name: str) -> tuple[bool, int]:
 
 def _enable_storage_privileges() -> bool:
     """Enable privileges required by Windows volume/disk maintenance paths."""
-    from debuglog import LOG
+    from ext4lib.debuglog import LOG
 
     ok, err = _enable_privilege(SE_MANAGE_VOLUME_NAME)
     if ok:
@@ -1018,7 +1018,7 @@ def _close_locked_volume_without_online(item: _LockedVolume) -> None:
     Do not send IOCTL_VOLUME_ONLINE while the containing disk is intentionally
     offline. FVE raw mode is released separately after the handle is closed.
     """
-    from debuglog import LOG
+    from ext4lib.debuglog import LOG
 
     try:
         kernel32.CloseHandle(item.handle)
@@ -1055,7 +1055,7 @@ def _query_partition_gpt_attributes(handle) -> tuple[int | None, int]:
 
 
 def _log_write_environment(disk_handle=None, partition_handle=None) -> list[str]:
-    from debuglog import LOG
+    from ext4lib.debuglog import LOG
 
     blockers = _windows_write_policy_blockers()
     if blockers:
@@ -1196,7 +1196,7 @@ def _try_enable_fve_raw_access(
     target: str | None,
 ) -> str | None:
     """Enable FVE raw mode using the first volume identifier Windows accepts."""
-    from debuglog import LOG
+    from ext4lib.debuglog import LOG
 
     if _FveEnableRawAccessW is None:
         LOG.info("FVE raw-access API를 사용할 수 없습니다.")
@@ -1231,7 +1231,7 @@ def _release_locked_volume(item: _LockedVolume) -> None:
         pass
     fve_name = item.fve_name or item.volume_guid
     if item.fve_raw and fve_name:
-        from debuglog import LOG
+        from ext4lib.debuglog import LOG
         ok, hr = _fve_raw_access(fve_name, False)
         if ok:
             LOG.info("FVE raw-access 해제 성공 %s", fve_name)
@@ -1247,7 +1247,7 @@ def _take_volume_offline(handle, name: str) -> bool:
     dismount and that taking a volume offline does not block I/O sent to the
     underlying physical disk.
     """
-    from debuglog import LOG
+    from ext4lib.debuglog import LOG
 
     try:
         _ioctl(handle, IOCTL_VOLUME_OFFLINE)
@@ -1261,7 +1261,7 @@ def _take_volume_offline(handle, name: str) -> bool:
 def _bring_volume_online(item: _LockedVolume) -> None:
     if not item.offline:
         return
-    from debuglog import LOG
+    from ext4lib.debuglog import LOG
 
     try:
         _ioctl(item.handle, IOCTL_VOLUME_ONLINE)
@@ -1299,7 +1299,7 @@ def _lock_volumes_for_disk(disk_index: int) -> list[_LockedVolume]:
     be issued through the volume handle itself, which Windows permits for RAW
     filesystems.
     """
-    from debuglog import LOG
+    from ext4lib.debuglog import LOG
 
     locked: list[_LockedVolume] = []
     name = ctypes.create_unicode_buffer(260)
@@ -1379,7 +1379,7 @@ def _open_handle(path: str, writable: bool):
     matching established raw-disk utilities. If Windows refuses the stricter
     share mode, fall back to FILE_SHARE_READ|FILE_SHARE_WRITE.
     """
-    from debuglog import LOG
+    from ext4lib.debuglog import LOG
 
     access = GENERIC_READ | (GENERIC_WRITE if writable else 0)
     shares = (
@@ -1417,7 +1417,7 @@ def _open_hidden_volume_alias(disk_index: int, partition_number: int) -> _Locked
     HarddiskVolumeN, while others also expose a Volume{GUID} alias.  We try
     both and enable Windows FVE raw-access mode when a GUID is available.
     """
-    from debuglog import LOG
+    from ext4lib.debuglog import LOG
 
     candidates = _volume_alias_candidates()
     if not candidates:
@@ -1530,7 +1530,7 @@ def _open_hidden_volume_alias(disk_index: int, partition_number: int) -> _Locked
 
 def _open_partition_device(disk_index: int, partition_number: int) -> _LockedVolume | None:
     """Open a partition DASD handle when Mount Manager exposes no Volume GUID."""
-    from debuglog import LOG
+    from ext4lib.debuglog import LOG
 
     # The Win32 DASD alias is preferable. GLOBALROOT is retained as a fallback
     # because device naming differs across Windows/storage drivers.
@@ -1672,7 +1672,7 @@ class WindowsPhysicalDevice(BlockDevice):
         partition_offset: int = 0,
         partition_size: int = 0,
     ):
-        from debuglog import LOG
+        from ext4lib.debuglog import LOG
 
         self.path = path
         self.sector_size = sector_size or 512
@@ -1807,7 +1807,7 @@ class WindowsPhysicalDevice(BlockDevice):
         return self._size
 
     def _keepalive(self) -> None:
-        from debuglog import LOG
+        from ext4lib.debuglog import LOG
 
         while not self._stop_ka.wait(15):
             try:
@@ -1828,7 +1828,7 @@ class WindowsPhysicalDevice(BlockDevice):
                     pass
 
     def _reopen_locked(self) -> None:
-        from debuglog import LOG
+        from ext4lib.debuglog import LOG
 
         old = self._handle
         try:
@@ -1885,7 +1885,7 @@ class WindowsPhysicalDevice(BlockDevice):
                     last = exc
                     if exc.winerr not in STALE_HANDLE_ERRORS or attempt == 2 or self._closed:
                         raise
-                    from debuglog import LOG
+                    from ext4lib.debuglog import LOG
 
                     LOG.warning("디스크 I/O 재시도 Win32 %s (%s/%s)", exc.winerr, attempt + 1, 3)
                     self._reopen_locked()
@@ -1983,7 +1983,7 @@ class WindowsPhysicalDevice(BlockDevice):
 
     def _nt_write_at(self, absolute_offset: int, data: bytes) -> None:
         """Raw write through NtOpenFile/NtWriteFile and verify by read-back."""
-        from debuglog import LOG
+        from ext4lib.debuglog import LOG
 
         if self._nt_handle is None:
             self._nt_handle = _nt_open_raw_handle(self.path)
@@ -2032,7 +2032,7 @@ class WindowsPhysicalDevice(BlockDevice):
 
     def _scsi_write10_direct(self, absolute_offset: int, data: bytes) -> None:
         """Send SCSI WRITE(10) with IOCTL_SCSI_PASS_THROUGH_DIRECT."""
-        from debuglog import LOG
+        from ext4lib.debuglog import LOG
 
         ss = int(self.sector_size or 512)
         if absolute_offset < 0 or absolute_offset % ss or len(data) % ss:
@@ -2122,7 +2122,7 @@ class WindowsPhysicalDevice(BlockDevice):
         Try DIRECT first because USB/card-reader class drivers commonly reject
         buffered pass-through data-out while accepting the direct form.
         """
-        from debuglog import LOG
+        from ext4lib.debuglog import LOG
 
         try:
             self._scsi_write10_direct(absolute_offset, data)
@@ -2220,7 +2220,7 @@ class WindowsPhysicalDevice(BlockDevice):
         different device objects.  Retry the partition PDO only after the
         matching volume lock/dismount has succeeded.
         """
-        from debuglog import LOG
+        from ext4lib.debuglog import LOG
 
         disk_index = _physical_index(self.path)
         part = self._partition_number
@@ -2354,7 +2354,7 @@ class WindowsPhysicalDevice(BlockDevice):
 
     def _adopt_whole_disk_offline(self) -> None:
         """Switch the instance to PhysicalDrive-only I/O while disk is offline."""
-        from debuglog import LOG
+        from ext4lib.debuglog import LOG
 
         self._disk_offline = True
         self._partition_volume = None
@@ -2381,7 +2381,7 @@ class WindowsPhysicalDevice(BlockDevice):
 
     def _activate_whole_disk_offline(self) -> tuple[bool, int]:
         """Take only a removable data disk offline, non-persistently."""
-        from debuglog import LOG
+        from ext4lib.debuglog import LOG
 
         if self._disk_offline:
             return True, 0
@@ -2402,7 +2402,7 @@ class WindowsPhysicalDevice(BlockDevice):
 
     def _restore_whole_disk_online(self) -> tuple[bool, int]:
         """Clear the temporary whole-disk OFFLINE state before closing."""
-        from debuglog import LOG
+        from ext4lib.debuglog import LOG
 
         if not self._disk_offline:
             return True, 0
@@ -2436,7 +2436,7 @@ class WindowsPhysicalDevice(BlockDevice):
         FILE_SHARE_READ|FILE_SHARE_WRITE so SYSTEM can create a fresh file
         object under its own security context.
         """
-        from debuglog import LOG
+        from ext4lib.debuglog import LOG
 
         old = self._handle
         old_size = int(self._size or 0)
@@ -2498,7 +2498,7 @@ class WindowsPhysicalDevice(BlockDevice):
 
     def _restore_windows_after_usbdk_failure(self) -> None:
         """Reopen the Windows storage path after a failed UsbDk redirect attempt."""
-        from debuglog import LOG
+        from ext4lib.debuglog import LOG
 
         self._usbdk = None
         self._stop_ka = threading.Event()
@@ -2533,8 +2533,8 @@ class WindowsPhysicalDevice(BlockDevice):
         Normal readers never enter this path. It is reached only after all
         native/admin/LocalSystem write routes have failed.
         """
-        from debuglog import LOG
-        from usbdk_setup import UsbDkRequiredError, usbdk_ready
+        from ext4lib.debuglog import LOG
+        from ext4lib.windows.usbdk_setup import UsbDkRequiredError, usbdk_ready
 
         if self._usbdk is not None:
             return
@@ -2584,7 +2584,7 @@ class WindowsPhysicalDevice(BlockDevice):
 
         backend = None
         try:
-            from usbdk_backend import UsbDkBotBackend
+            from ext4lib.windows.usbdk import UsbDkBotBackend
 
             backend = UsbDkBotBackend(
                 self.path,
@@ -2620,7 +2620,7 @@ class WindowsPhysicalDevice(BlockDevice):
             raise
 
     def _write_unbuffered_physical(self, offset: int, data: bytes) -> None:
-        from debuglog import LOG
+        from ext4lib.debuglog import LOG
 
         logical, physical = _write_unbuffered_raw_path(
             self.path,
@@ -2642,7 +2642,7 @@ class WindowsPhysicalDevice(BlockDevice):
         SCSI passthrough is used only if the PhysicalDrive write is still denied.
         Kept separate so the routing can be unit-tested without real hardware.
         """
-        from debuglog import LOG
+        from ext4lib.debuglog import LOG
 
         absolute = self._partition_offset + offset
 
@@ -2734,7 +2734,7 @@ class WindowsPhysicalDevice(BlockDevice):
                 )
 
             LOG.warning("LocalSystem helper 시도")
-            from system_raw_helper import run_system_raw_write
+            from ext4lib.windows.system_raw import run_system_raw_write
 
             self._prepare_system_helper_handle()
             item = self._partition_volume
@@ -2768,7 +2768,7 @@ class WindowsPhysicalDevice(BlockDevice):
                         )
                         return
                     except Exception as usb_exc:
-                        from usbdk_setup import UsbDkRequiredError
+                        from ext4lib.windows.usbdk_setup import UsbDkRequiredError
 
                         if isinstance(usb_exc, UsbDkRequiredError):
                             raise
@@ -2814,7 +2814,7 @@ class WindowsPhysicalDevice(BlockDevice):
         and lock.  It is useful on card-reader stacks where the partition PDO
         cannot be opened directly even though HarddiskVolumeN is writable.
         """
-        from debuglog import LOG
+        from ext4lib.debuglog import LOG
 
         iosb = _IO_STATUS_BLOCK()
         nt_offset = ctypes.c_longlong(int(offset))
@@ -2867,7 +2867,7 @@ class WindowsPhysicalDevice(BlockDevice):
     def _write_volume_seek(self, item: _LockedVolume, offset: int, data: bytes) -> None:
         """Write relative to a locked/dismounted volume handle."""
         if item.offline:
-            from debuglog import LOG
+            from ext4lib.debuglog import LOG
             LOG.info(
                 "오프라인 볼륨은 직접 쓰지 않고 PhysicalDrive 경로 사용 %s offset=%s",
                 item.name,
@@ -2896,7 +2896,7 @@ class WindowsPhysicalDevice(BlockDevice):
         err = ctypes.get_last_error()
         if not ok or done.value != len(data):
             if err == 5:
-                from debuglog import LOG
+                from ext4lib.debuglog import LOG
                 try:
                     self._nt_write_volume_handle(item, offset, data)
                     return
@@ -2996,7 +2996,7 @@ class WindowsPhysicalDevice(BlockDevice):
                 iosb = _IO_STATUS_BLOCK()
                 status = ntdll.NtFlushBuffersFile(self._nt_handle, ctypes.byref(iosb))
                 if not _nt_success(status):
-                    from debuglog import LOG
+                    from ext4lib.debuglog import LOG
                     LOG.warning(
                         "Native NT flush 실패 NTSTATUS=%s",
                         _nt_status_hex(status),

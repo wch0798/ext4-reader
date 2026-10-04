@@ -7,12 +7,12 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
-import constants as C
-from debuglog import LOG
-from inode import Inode, parse_inode
-from io_backend import BlockDevice
-from partitions import list_partitions
-from superblock import (
+from ext4lib.fs import constants as C
+from ext4lib.debuglog import LOG
+from ext4lib.fs.inode import Inode, parse_inode
+from ext4lib.io.backend import BlockDevice
+from ext4lib.fs.partitions import list_partitions
+from ext4lib.fs.superblock import (
     Superblock,
     parse_group_desc,
     parse_superblock,
@@ -255,7 +255,7 @@ class Ext4Volume:
         if not self.sb.has_journal or not self.sb.journal_inum:
             return 0
         try:
-            from extents import file_extents
+            from ext4lib.fs.extents import file_extents
 
             j = self.read_inode(self.sb.journal_inum)
             ex = file_extents(self, j)
@@ -292,10 +292,10 @@ class Ext4Volume:
         if not self.dev.writable:
             raise Ext4Error("저널 복구를 하려면 장치를 쓰기 가능으로 열어야 합니다.")
         if not self.journal_needs_recovery() and not self.sb.needs_recovery:
-            from journal import ReplayStats
+            from ext4lib.fs.journal import ReplayStats
             return ReplayStats(0, 0, 0, 0)
         try:
-            from journal import JournalRecoveryError, recover_journal
+            from ext4lib.fs.journal import JournalRecoveryError, recover_journal
             return recover_journal(self)
         except JournalRecoveryError as exc:
             raise Ext4Error(f"Windows 저널 복구 실패: {exc}") from exc

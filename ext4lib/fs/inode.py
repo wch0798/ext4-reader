@@ -8,9 +8,9 @@ import struct
 import time
 from dataclasses import dataclass
 
-import constants as C
-from crc32c import crc32c
-from superblock import Superblock
+from ext4lib.fs import constants as C
+from ext4lib.fs.crc32c import crc32c
+from ext4lib.fs.superblock import Superblock
 
 
 def _u16(buf: bytes, off: int) -> int:

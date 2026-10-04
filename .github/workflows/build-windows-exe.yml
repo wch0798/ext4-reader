@@ -49,7 +49,7 @@ jobs:
         id: version
         shell: pwsh
         run: |
-          $version = python -c "import app_info; print(app_info.__version__)"
+          $version = python -c "import ext4lib; print(ext4lib.__version__)"
           "version=$version" >> $env:GITHUB_OUTPUT
           "tag=v$version" >> $env:GITHUB_OUTPUT
           Write-Host "Building EXT4 Reader $version"
@@ -100,5 +100,5 @@ jobs:
             gh release create "$env:TAG" "dist\Ext4Reader.exe#Ext4Reader.exe" `
               --target "${{ github.sha }}" `
               --title "EXT4 Reader $env:VERSION" `
-              --notes "Windows EXE 자동 빌드. 단일 루트 소스 구조, EXT4 JBD2 저널 복구 및 UsbDk fallback 포함."
+              --notes "Windows EXE 자동 빌드. main.py 단일 진입점 + ext4lib 라이브러리 구조, EXT4 JBD2 복구 및 UsbDk fallback 포함."
           }

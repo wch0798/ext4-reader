@@ -22,7 +22,7 @@ import time
 import uuid
 from ctypes import wintypes
 
-from io_backend import IoError
+from ext4lib.io.backend import IoError
 
 PROCESS_DUP_HANDLE = 0x0040
 DUPLICATE_SAME_ACCESS = 0x00000002
@@ -92,8 +92,8 @@ def run_system_raw_write(
     timeout: float = 25.0,
 ) -> dict:
     """Run one raw-write attempt in a LocalSystem scheduled task."""
-    from debuglog import LOG
-    from host import app_exe
+    from ext4lib.debuglog import LOG
+    from ext4lib.host import app_exe
 
     if not _PHYSICAL_RE.match(physical_path):
         raise IoError(f"지원하지 않는 raw 장치 경로: {physical_path}", winerr=87)
@@ -203,7 +203,7 @@ def run_system_raw_write(
 
 
 def _duplicate_handle(parent_pid: int, source_value: int) -> int:
-    from windows_disk import kernel32
+    from ext4lib.windows.disk import kernel32
 
     kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     kernel32.OpenProcess.restype = wintypes.HANDLE
@@ -248,7 +248,7 @@ def _duplicate_handle(parent_pid: int, source_value: int) -> int:
 
 
 def _write_win32(handle: int, offset: int, data: bytes) -> None:
-    from windows_disk import FILE_BEGIN, kernel32
+    from ext4lib.windows.disk import FILE_BEGIN, kernel32
 
     pos = ctypes.c_longlong()
     ctypes.set_last_error(0)
@@ -282,7 +282,7 @@ def _write_win32(handle: int, offset: int, data: bytes) -> None:
 
 
 def _write_nt(handle: int, offset: int, data: bytes) -> None:
-    from windows_disk import (
+    from ext4lib.windows.disk import (
         _IO_STATUS_BLOCK,
         _nt_status_hex,
         _nt_success,
@@ -321,7 +321,7 @@ def _write_nt(handle: int, offset: int, data: bytes) -> None:
 
 
 def _read_win32(handle: int, offset: int, length: int) -> bytes:
-    from windows_disk import FILE_BEGIN, kernel32
+    from ext4lib.windows.disk import FILE_BEGIN, kernel32
 
     pos = ctypes.c_longlong()
     if not kernel32.SetFilePointerEx(
@@ -353,7 +353,7 @@ def _read_win32(handle: int, offset: int, length: int) -> bytes:
 
 
 def _execute_request(req: dict) -> dict:
-    from windows_disk import (
+    from ext4lib.windows.disk import (
         IOCTL_DISK_UPDATE_PROPERTIES,
         IOCTL_STORAGE_GET_DEVICE_NUMBER,
         STORAGE_DEVICE_NUMBER,

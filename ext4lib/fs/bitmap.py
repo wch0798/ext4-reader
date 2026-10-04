@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import constants as C
-from crc32c import crc32c
-from superblock import GroupDesc, update_group_desc_fields
+from ext4lib.fs import constants as C
+from ext4lib.fs.crc32c import crc32c
+from ext4lib.fs.superblock import GroupDesc, update_group_desc_fields
 
 
 class Bitmap:

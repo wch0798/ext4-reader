@@ -21,8 +21,8 @@ import time
 from ctypes import wintypes
 from dataclasses import dataclass
 
-from io_backend import IO_CHUNK, IoError
-from usbdk_setup import UsbDkRequiredError, find_usbdk_helper, usbdk_ready
+from ext4lib.io.backend import IO_CHUNK, IoError
+from ext4lib.windows.usbdk_setup import UsbDkRequiredError, find_usbdk_helper, usbdk_ready
 
 MAX_DEVICE_ID_LEN = 200
 TRANSFER_FAILURE = 0
@@ -572,7 +572,7 @@ class UsbDkBotBackend:
         partition_size: int,
         expected_prefix: bytes,
     ):
-        from debuglog import LOG
+        from ext4lib.debuglog import LOG
 
         if not usbdk_ready():
             raise UsbDkRequiredError(
@@ -960,7 +960,7 @@ class UsbDkBotBackend:
         is still responsive, and remember not to resend the unsupported command.
         Other SCSI errors remain fatal.
         """
-        from debuglog import LOG
+        from ext4lib.debuglog import LOG
 
         if getattr(self, "_sync_cache_supported", None) is False:
             self.test_unit_ready()
