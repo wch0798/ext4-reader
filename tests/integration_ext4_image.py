@@ -94,11 +94,11 @@ def journal_replay_roundtrip(path: str) -> None:
 
     root = lookup_path(vol, "/")
     node = create_empty_file(vol, root, "replay.bin")
-    # create_empty_file is a completed namespace operation and now leaves the
-    # medium clean/portable before the next write begins.
-    assert not vol._write_session_active
-    assert vol.journal_start() == 0
-    assert vol.sb.state & C.EXT4_VALID_FS
+    # Operation boundaries are durable, but the mount-wide JBD2 write session
+    # intentionally stays active until clean close/unmount.
+    assert vol._write_session_active
+    assert vol.journal_start() != 0
+    assert not (vol.sb.state & C.EXT4_VALID_FS)
     before_crash = _JournalLog(vol).info.sequence
     payload = (b"jbd2-ordered-data-" * 4096) + b"END"
 
@@ -118,8 +118,9 @@ def journal_replay_roundtrip(path: str) -> None:
     finally:
         vol._checkpoint_metadata_blocks = original_checkpoint
 
-    # close() must not manufacture another transaction on an unclean path.
-    vol.close()
+    # An interrupted/crashed path must explicitly abort. A normal close is a
+    # clean boundary and would correctly finish the healthy session.
+    vol.close(abort=True)
 
     recovery = open_volume(path, True)
     try:
