@@ -650,7 +650,7 @@ class JournalWriter:
         self.last_sequence = sequence
         self.sequence = (sequence + 1) & 0xFFFFFFFF
         self.committed = True
-        LOG.info(
+        LOG.debug(
             "JBD2 write commit 완료 sequence=%s metadata_blocks=%s next_head=%s",
             sequence,
             len(metadata),

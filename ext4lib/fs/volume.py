@@ -387,16 +387,15 @@ class Ext4Volume:
                 self._data_dirty = False
 
     def flush_metadata(self) -> None:
-        """Durably commit metadata and leave the volume portable/clean.
+        """Durably commit pending metadata without closing the mount session.
 
-        High-level namespace operations use this at operation boundaries.  A
-        later write will lazily open a fresh dirty/JBD2 session via
-        require_write(), so the medium is clean between completed operations.
+        Namespace operations call this at durability boundaries.  Keep the same
+        JBD2 writer/session alive across a burst of file operations so we do not
+        flip EXT4 clean/dirty state and rebuild the journal writer for every
+        Explorer create/rename/truncate.  Normal close/unmount performs the one
+        final clean transition via finish_write_session().
         """
-        if self._write_session_active:
-            self.finish_write_session()
-        else:
-            self.commit_metadata(sync=True)
+        self.commit_metadata(sync=True)
 
     def _write_super_state(self) -> None:
         struct.pack_into("<H", self.sb.raw, 0x3A, self.sb.state & 0xFFFF)
@@ -428,7 +427,7 @@ class Ext4Volume:
         else:
             self._set_home_super_flags(valid=False, flush=True)
         self._write_session_active = True
-        LOG.warning(
+        LOG.info(
             "RW 세션 시작: EXT4 clean 플래그 해제, JBD2 write=%s",
             "on" if writer is not None else "off",
         )
@@ -570,11 +569,12 @@ class Ext4Volume:
                     "이전 쓰기 오류가 있어 close 단계의 추가 flush/commit을 생략합니다."
                 )
             elif self._write_session_active:
-                LOG.warning(
-                    "RW 세션이 clean 완료 없이 닫힙니다. pending metadata를 추가 commit하지 않습니다."
-                )
+                # A normal close is a clean filesystem boundary.  All ordinary
+                # operation-level commits stay inside one JBD2 session and only
+                # this final boundary clears RECOVER/restores EXT4_VALID_FS.
+                self.finish_write_session()
             else:
-                self.flush_metadata()
+                self.commit_metadata(sync=True)
         finally:
             if self.owns_device:
                 self.dev.close()
