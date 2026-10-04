@@ -252,6 +252,39 @@ def _insert_into_block(block: bytearray, usable: int, ino: int, name: bytes, fty
     return False
 
 
+def _dx_csum_set(vol, inode: Inode, block: bytearray, entries_off: int) -> None:
+    """Set Linux-compatible metadata checksum on an HTREE root/index node."""
+    if not vol.sb.has_metadata_csum:
+        return
+    if entries_off < 0 or entries_off + 8 > len(block):
+        raise DirError("HTREE checksum 위치가 잘못되었습니다.")
+    limit, count = struct.unpack_from("<HH", block, entries_off)
+    if count < 1 or count > limit:
+        raise DirError("HTREE checksum 대상 count/limit가 잘못되었습니다.")
+    tail_off = entries_off + limit * 8
+    if tail_off + 8 > len(block):
+        raise DirError("HTREE checksum tail이 block 범위를 벗어났습니다.")
+
+    # Linux ext4_dx_csum(): checksum valid index bytes, then the 4-byte
+    # reserved field in dx_tail, then a zero checksum field.
+    struct.pack_into("<I", block, tail_off, 0)
+    struct.pack_into("<I", block, tail_off + 4, 0)
+    seed = crc32c(vol.sb.csum_seed(), struct.pack("<I", inode.ino))
+    seed = crc32c(seed, struct.pack("<I", inode.generation))
+    size = entries_off + count * 8
+    crc = crc32c(seed, block[:size])
+    crc = crc32c(crc, block[tail_off:tail_off + 4])
+    crc = crc32c(crc, b"\x00\x00\x00\x00")
+    struct.pack_into("<I", block, tail_off + 4, crc)
+
+
+def _dx_entries_off(block: bytes, lblk: int) -> int:
+    if lblk == 0:
+        info_length = block[29] or 8
+        return 24 + info_length
+    return 8
+
+
 def _empty_dirent_block(bs: int, usable: int) -> bytearray:
     buf = bytearray(bs)
     struct.pack_into("<IHBB", buf, 0, 0, usable, 0, 0)
@@ -305,7 +338,10 @@ def _dx_place(entries: list[tuple[int, int]], h: int, blk: int) -> list[tuple[in
     return out
 
 
-def _dx_node_limit(bs: int, entries_off: int, tail: int) -> int:
+def _dx_node_limit(bs: int, entries_off: int, metadata_csum: bool) -> int:
+    # HTREE index blocks use struct dx_tail (8 bytes), not the 12-byte
+    # ext4_dir_entry_tail used by ordinary directory leaf blocks.
+    tail = 8 if metadata_csum else 0
     return max(0, (bs - tail - entries_off) // 8)
 
 
@@ -320,15 +356,25 @@ def _write_dx_entries(block: bytearray, off: int, limit: int, entries: list[tupl
         struct.pack_into("<II", block, off + i * 8, eh & 0xFFFFFFFF, blk & 0xFFFFFFFF)
 
 
-def _format_dx_node(bs: int, tail: int, entries: list[tuple[int, int]]) -> bytearray:
-    limit = _dx_node_limit(bs, 8, tail)
+def _format_dx_node(
+    bs: int, metadata_csum: bool, entries: list[tuple[int, int]]
+) -> bytearray:
+    limit = _dx_node_limit(bs, 8, metadata_csum)
     buf = bytearray(bs)
     struct.pack_into("<IHBB", buf, 0, 0, bs & 0xFFFF, 0, 0)
     _write_dx_entries(buf, 8, limit, entries)
     return buf
 
 
-def _dx_insert_pointer(load_block, root: bytearray, h: int, target: int, bs: int, tail: int, alloc_logical) -> dict[int, bytearray]:
+def _dx_insert_pointer(
+    load_block,
+    root: bytearray,
+    h: int,
+    target: int,
+    bs: int,
+    metadata_csum: bool,
+    alloc_logical,
+) -> dict[int, bytearray]:
     """Link ``target`` under ``h``. Grows index levels in memory and returns dirty blocks.
 
     Nothing is written here. The caller allocates the new logical blocks and
@@ -367,11 +413,11 @@ def _dx_insert_pointer(load_block, root: bytearray, h: int, target: int, bs: int
         if lblk == 0:
             if block[30] >= 255:
                 raise DirError("디렉터리 인덱스 단계가 너무 깊습니다.")
-            node_limit = _dx_node_limit(bs, 8, tail)
+            node_limit = _dx_node_limit(bs, 8, metadata_csum)
             if len(items) < 1 or len(items) > node_limit:
                 raise DirError("디렉터리 인덱스를 한 단계 올릴 수 없습니다.")
             child_l = alloc_logical()
-            child = _format_dx_node(bs, tail, items)
+            child = _format_dx_node(bs, metadata_csum, items)
             _write_dx_entries(block, off, limit, [(0, child_l)])
             block[30] = block[30] + 1
             dirty[0] = block
@@ -391,7 +437,7 @@ def _dx_insert_pointer(load_block, root: bytearray, h: int, target: int, bs: int
         _write_dx_entries(block, off, limit, left)
         dirty[lblk] = block
         new_l = alloc_logical()
-        right_b = _format_dx_node(bs, tail, right)
+        right_b = _format_dx_node(bs, metadata_csum, right)
         dirty[new_l] = right_b
         cache[new_l] = right_b
         path.pop()
@@ -448,6 +494,18 @@ def add_dir_entry(vol, dir_inode: Inode, name: str, ino: int, ftype: int) -> Ino
             raise DirError("디렉터리 블록을 찾을 수 없습니다.")
         (getattr(vol, "write_metadata_block", None) or vol.write_block)(phys, bytes(data))
 
+    def write_index_lblock(inode: Inode, lblk: int, data: bytearray) -> None:
+        drop = getattr(vol, "drop_dir_cache", None)
+        if drop is not None:
+            drop(inode.ino)
+        _dx_csum_set(vol, inode, data, _dx_entries_off(data, lblk))
+        phys = logical_to_phys(vol, inode, lblk)
+        if phys is None:
+            raise DirError("HTREE index 블록을 찾을 수 없습니다.")
+        (getattr(vol, "write_metadata_block", None) or vol.write_block)(
+            phys, bytes(data)
+        )
+
     if dir_inode.is_indexed:
         lblk, _root, h = _probe_leaf(vol, dir_inode, name_b)
         leaf = bytearray(read_dir_lblock(vol, dir_inode, lblk))
@@ -457,23 +515,49 @@ def add_dir_entry(vol, dir_inode: Inode, name: str, ino: int, ftype: int) -> Ino
             vol.write_inode(dir_inode)
             return dir_inode
         # split: new leaf + dx entry. The leaf is rewritten only after the index plan succeeds.
-        old_ents = [e for e in parse_dirent_block(bytes(leaf), usable) if e.name not in (".", "..")]
-        dummy = DirEntry(name=name, inode=ino, file_type=ftype)
-        old_ents.append(dummy)
+        old_ents = [
+            e
+            for e in parse_dirent_block(bytes(leaf), usable)
+            if e.name not in (".", "..")
+        ]
         hv = read_dir_lblock(vol, dir_inode, 0)[28]
-        hashed = []
+        hashed: list[tuple[int, DirEntry, int]] = []
         for e in old_ents:
             try:
                 hh = dirhash(e.name.encode("utf-8"), hv, vol.sb.hash_seed)
-            except Exception:
-                hh = 0
-            hashed.append((hh, e))
+            except Exception as exc:
+                raise DirError(f"디렉터리 이름 hash 계산 실패: {e.name}") from exc
+            hashed.append((hh, e, rec_len_needed(len(e.name.encode("utf-8")))))
         hashed.sort(key=lambda x: x[0])
-        mid = max(1, len(hashed) // 2)
-        left, right = hashed[:mid], hashed[mid:]
-        if not right:
-            raise DirError("디렉터리 분할에 실패했습니다.")
-        split_hash = right[0][0]
+        if len(hashed) < 2:
+            raise DirError("디렉터리 분할에 필요한 기존 항목이 부족합니다.")
+
+        # Mirror Linux ext4/namei.c do_split(): split the EXISTING full leaf by
+        # packed byte size, then place the new entry into the appropriate half.
+        packed = 0
+        move = 0
+        split_i = len(hashed) - 1
+        while split_i >= 0:
+            entry_size = hashed[split_i][2]
+            if packed + entry_size // 2 > bs // 2:
+                break
+            packed += entry_size
+            move += 1
+            split_i -= 1
+        split = len(hashed) - move if split_i >= 0 else len(hashed) // 2
+        if split <= 0 or split >= len(hashed):
+            raise DirError("디렉터리 HTREE 분할 위치가 올바르지 않습니다.")
+
+        split_hash = hashed[split][0]
+        continued = 1 if split_hash == hashed[split - 1][0] else 0
+        index_hash = (split_hash + continued) & 0xFFFFFFFF
+        left_entries = [e for _h, e, _sz in hashed[:split]]
+        right_entries = [e for _h, e, _sz in hashed[split:]]
+        new_entry = DirEntry(name=name, inode=ino, file_type=ftype)
+        if h >= split_hash:
+            right_entries.append(new_entry)
+        else:
+            left_entries.append(new_entry)
 
         def pack_ents(ents: list[DirEntry]) -> bytearray:
             buf = _empty_dirent_block(bs, usable)
@@ -483,8 +567,8 @@ def add_dir_entry(vol, dir_inode: Inode, name: str, ino: int, ftype: int) -> Ino
                     raise DirError("디렉터리 분할에 실패했습니다.")
             return buf
 
-        left_b = pack_ents([e for _h, e in left])
-        right_b = pack_ents([e for _h, e in right])
+        left_b = pack_ents(left_entries)
+        right_b = pack_ents(right_entries)
         # Plan the index link before any leaf is rewritten. A full root grows
         # another level; a failed plan leaves the old leaf intact.
         exts = file_extents(vol, dir_inode)
@@ -503,10 +587,10 @@ def add_dir_entry(vol, dir_inode: Inode, name: str, ino: int, ftype: int) -> Ino
         dirty = _dx_insert_pointer(
             lambda lb: read_dir_lblock(vol, dir_inode, lb),
             root,
-            split_hash,
+            index_hash,
             next_l,
             bs,
-            tail,
+            vol.sb.has_metadata_csum,
             alloc_logical,
         )
         new_logicals = [next_l, *range(next_l + 1, cursor)]
@@ -533,9 +617,9 @@ def add_dir_entry(vol, dir_inode: Inode, name: str, ino: int, ftype: int) -> Ino
         discard_old_extent_indexes(vol, dir_inode)
         for logical, data in dirty.items():
             if logical != 0:
-                write_lblock(dir_inode, logical, data)
+                write_index_lblock(dir_inode, logical, data)
         write_lblock(dir_inode, next_l, right_b)
-        write_lblock(dir_inode, 0, dirty[0])
+        write_index_lblock(dir_inode, 0, dirty[0])
         write_lblock(dir_inode, lblk, left_b)
         return dir_inode
 
