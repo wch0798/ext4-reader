@@ -5,10 +5,10 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
-from ext4reader import constants as C
-from ext4reader.crc32c import crc32c
-from ext4reader.inode import Inode
-from ext4reader.superblock import Superblock
+import constants as C
+from crc32c import crc32c
+from inode import Inode
+from superblock import Superblock
 
 # Avoid circular import: volume passed as protocol
 
@@ -165,7 +165,7 @@ def read_mapped(vol, inode: Inode, offset: int, length: int) -> bytes:
     """Read ``length`` bytes at file offset, holes and unwritten extents as zeros."""
     if length <= 0:
         return b""
-    from ext4reader.io_backend import IO_CHUNK
+    from io_backend import IO_CHUNK
 
     bs = vol.sb.block_size
     out = bytearray(length)
@@ -280,13 +280,13 @@ def discard_old_extent_indexes(vol, inode: Inode) -> None:
     if not old:
         return
     inode._extent_index_old = []
-    from ext4reader.bitmap import free_phys_runs
+    from bitmap import free_phys_runs
 
     free_phys_runs(vol, [(block, 1) for block in old])
 
 
 def _write_extent_node(vol, inode: Inode, records: list[bytes], depth: int, cap: int, allocated: list[int]) -> int:
-    from ext4reader.bitmap import alloc_blocks
+    from bitmap import alloc_blocks
 
     phys = alloc_blocks(vol, 1, metadata=True)[0]
     allocated.append(phys)
@@ -345,7 +345,7 @@ def build_extent_tree(vol, inode: Inode, extents: list[Extent]) -> bytes:
             body = bytes(body_buf)
     except Exception:
         if allocated:
-            from ext4reader.bitmap import free_phys_runs
+            from bitmap import free_phys_runs
 
             try:
                 free_phys_runs(vol, [(block, 1) for block in allocated])

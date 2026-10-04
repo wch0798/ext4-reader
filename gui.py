@@ -12,10 +12,10 @@ import tkinter as tk
 import webbrowser
 from tkinter import filedialog, messagebox, ttk
 
-from ext4reader import __app_name__, __version__
-from ext4reader.debuglog import LOG, setup_logging
-from ext4reader.dnd import DropTarget
-from ext4reader.fuse_mount import (
+from app_info import __app_name__, __version__
+from debuglog import LOG, setup_logging
+from dnd import DropTarget
+from fuse_mount import (
     MountSession,
     _ensure_fuse,
     cleanup_stale_mounts,
@@ -27,17 +27,17 @@ from ext4reader.fuse_mount import (
     unmount_all,
     winfsp_available,
 )
-from ext4reader.io_backend import ImageDevice
-from ext4reader.volume import Ext4Volume, VolumeInfo, discover_volumes, format_bytes
-from ext4reader.windows_disk import (
+from io_backend import ImageDevice
+from volume import Ext4Volume, VolumeInfo, discover_volumes, format_bytes
+from windows_disk import (
     DiskInfo,
     WindowsPhysicalDevice,
     is_admin,
     list_physical_disks,
     restart_as_admin,
 )
-from ext4reader.winfsp_setup import WinFspSetupError, ensure_winfsp_installed, find_winfsp_dll, winfsp_ready
-from ext4reader.usbdk_setup import (
+from winfsp_setup import WinFspSetupError, ensure_winfsp_installed, find_winfsp_dll, winfsp_ready
+from usbdk_setup import (
     USBDK_RELEASE_URL,
     UsbDkRequiredError,
     UsbDkSetupError,

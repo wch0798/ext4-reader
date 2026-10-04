@@ -12,14 +12,14 @@ import struct
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from ext4reader import constants as C
-from ext4reader.crc32c import crc32c
-from ext4reader.debuglog import LOG
-from ext4reader.extents import Extent, file_extents
-from ext4reader.superblock import parse_superblock
+import constants as C
+from crc32c import crc32c
+from debuglog import LOG
+from extents import Extent, file_extents
+from superblock import parse_superblock
 
 if TYPE_CHECKING:
-    from ext4reader.volume import Ext4Volume
+    from volume import Ext4Volume
 
 
 JBD2_DESCRIPTOR_BLOCK = 1

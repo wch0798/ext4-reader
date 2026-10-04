@@ -14,7 +14,7 @@ def is_frozen() -> bool:
 def project_root() -> str:
     if is_frozen():
         return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.dirname(os.path.abspath(__file__))
 
 
 def is_store_python(path: str) -> bool:
@@ -71,4 +71,4 @@ def relaunch_as_host() -> None:
     env = os.environ.copy()
     env["EXT4READER_HOST"] = "1"
     env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
-    os.execve(host, [host, "-m", "ext4reader", *sys.argv[1:]], env)
+    os.execve(host, [host, os.path.join(root, "main.py"), *sys.argv[1:]], env)

@@ -7,9 +7,9 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from ext4reader import constants as C
-from ext4reader.bitmap import AllocError, alloc_blocks, alloc_inode, free_inode, free_phys_runs
-from ext4reader.directory import (
+import constants as C
+from bitmap import AllocError, alloc_blocks, alloc_inode, free_inode, free_phys_runs
+from directory import (
     DirError,
     add_dir_entry,
     init_directory_block,
@@ -17,7 +17,7 @@ from ext4reader.directory import (
     lookup_dir_name,
     remove_dir_entry,
 )
-from ext4reader.extents import (
+from extents import (
     Extent,
     _collect_index_blocks,
     build_extent_tree,
@@ -26,9 +26,9 @@ from ext4reader.extents import (
     file_extents,
     read_mapped,
 )
-from ext4reader.io_backend import IO_CHUNK
-from ext4reader.inode import Inode, file_type_from_mode, new_inode_raw
-from ext4reader.volume import Ext4Error, Ext4Volume
+from io_backend import IO_CHUNK
+from inode import Inode, file_type_from_mode, new_inode_raw
+from volume import Ext4Error, Ext4Volume
 
 ProgressCb = Callable[[int, int], None]
 

@@ -1,8 +1,8 @@
 import unittest
 from unittest.mock import patch
 
-from ext4reader.io_backend import IoError
-from ext4reader.windows_disk import WindowsPhysicalDevice, _LockedVolume
+from io_backend import IoError
+from windows_disk import WindowsPhysicalDevice, _LockedVolume
 
 
 class WriteFallbackTests(unittest.TestCase):
@@ -214,7 +214,7 @@ class WriteFallbackTests(unittest.TestCase):
         dev._activate_whole_disk_offline = activate
 
         with patch(
-            "ext4reader.system_raw_helper.run_system_raw_write",
+            "system_raw_helper.run_system_raw_write",
             side_effect=AssertionError("LocalSystem must not run after offline write succeeds"),
         ):
             dev._fallback_after_volume_access_denied(4755456, payload)
@@ -246,7 +246,7 @@ class WriteFallbackTests(unittest.TestCase):
         dev._read_at = lambda offset, length: payload if (offset, length) == (absolute, len(payload)) else b""
 
         with patch(
-            "ext4reader.system_raw_helper.run_system_raw_write",
+            "system_raw_helper.run_system_raw_write",
             return_value={"ok": True, "method": "SYSTEM duplicated-volume NtWriteFile"},
         ) as helper:
             dev._fallback_after_volume_access_denied(4755456, payload)
@@ -292,7 +292,7 @@ class WriteFallbackTests(unittest.TestCase):
         dev._activate_usbdk_backend = activate
 
         with patch(
-            "ext4reader.system_raw_helper.run_system_raw_write",
+            "system_raw_helper.run_system_raw_write",
             return_value={"ok": False, "error": "SYSTEM denied"},
         ):
             dev._fallback_after_volume_access_denied(4755456, payload)
@@ -323,7 +323,7 @@ class WriteFallbackTests(unittest.TestCase):
         )
 
         with patch(
-            "ext4reader.system_raw_helper.run_system_raw_write",
+            "system_raw_helper.run_system_raw_write",
             return_value={"ok": False, "error": "SYSTEM denied"},
         ):
             with self.assertRaises(IoError) as cm:
@@ -332,7 +332,7 @@ class WriteFallbackTests(unittest.TestCase):
         self.assertIn("LocalSystem raw helper 실패", str(cm.exception))
 
     def test_usbdk_failure_restore_retries_during_pnp_reenumeration(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
 
         dev = WindowsPhysicalDevice.__new__(WindowsPhysicalDevice)
         dev.path = r"\\.\PhysicalDrive1"
@@ -357,7 +357,7 @@ class WriteFallbackTests(unittest.TestCase):
 
     def test_usbdk_activation_preserves_original_probe_error_after_restore(self):
         import threading
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
 
         dev = WindowsPhysicalDevice.__new__(WindowsPhysicalDevice)
         dev.path = r"\\.\PhysicalDrive1"
@@ -379,8 +379,8 @@ class WriteFallbackTests(unittest.TestCase):
         restored = []
         dev._restore_windows_after_usbdk_failure = lambda: restored.append(True)
 
-        with patch("ext4reader.usbdk_setup.usbdk_ready", return_value=True), patch(
-            "ext4reader.usbdk_backend.UsbDkBotBackend",
+        with patch("usbdk_setup.usbdk_ready", return_value=True), patch(
+            "usbdk_backend.UsbDkBotBackend",
             side_effect=IoError("BOT probe failed", winerr=31),
         ), patch.object(wd.kernel32, "CloseHandle", return_value=True):
             with self.assertRaises(IoError) as cm:
@@ -431,7 +431,7 @@ class WriteFallbackTests(unittest.TestCase):
         self.assertEqual(calls, [(4755456, payload)])
 
     def test_volume_access_denied_tries_native_nt_on_same_handle_first(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
 
         dev = self.make_dev()
         calls = []
@@ -471,7 +471,7 @@ class WriteFallbackTests(unittest.TestCase):
         )
 
     def test_volume_native_nt_failure_continues_to_other_raw_paths(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
 
         dev = self.make_dev()
         calls = []
@@ -518,7 +518,7 @@ if __name__ == "__main__":
 
 class RawOpenTests(unittest.TestCase):
     def test_writable_open_prefers_share_read_and_normal_attribute(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
 
         calls = []
 
@@ -538,7 +538,7 @@ class RawOpenTests(unittest.TestCase):
         self.assertEqual(calls[0][4], wd.FILE_ATTRIBUTE_NORMAL)
 
     def test_writable_open_falls_back_to_share_write(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
 
         calls = []
 
@@ -566,14 +566,14 @@ class RawOpenTests(unittest.TestCase):
 
 class NativePathTests(unittest.TestCase):
     def test_win32_physicaldrive_path_converts_to_nt_dos_device(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
         self.assertEqual(
             wd._nt_native_path(r"\\.\PhysicalDrive1"),
             r"\??\PhysicalDrive1",
         )
 
     def test_globalroot_path_converts_to_device_path(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
         self.assertEqual(
             wd._nt_native_path(r"\\?\GLOBALROOT\Device\HarddiskVolume26"),
             r"\Device\HarddiskVolume26",
@@ -582,7 +582,7 @@ class NativePathTests(unittest.TestCase):
 
 class VolumeOfflineTests(unittest.TestCase):
     def test_take_volume_offline_uses_documented_ioctl(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
 
         calls = []
         with patch.object(wd, "_ioctl", lambda handle, code: calls.append((handle, code)) or b""):
@@ -591,7 +591,7 @@ class VolumeOfflineTests(unittest.TestCase):
         self.assertEqual(calls, [(77, wd.IOCTL_VOLUME_OFFLINE)])
 
     def test_bring_volume_online_clears_offline_state(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
 
         item = _LockedVolume(
             handle=88,
@@ -610,7 +610,7 @@ class VolumeOfflineTests(unittest.TestCase):
 
 class StoragePrivilegeTests(unittest.TestCase):
     def test_storage_privilege_requests_manage_volume(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
 
         calls = []
         with patch.object(
@@ -623,7 +623,7 @@ class StoragePrivilegeTests(unittest.TestCase):
         self.assertEqual(calls, [wd.SE_MANAGE_VOLUME_NAME])
 
     def test_storage_privilege_failure_is_reported(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
 
         with patch.object(wd, "_enable_privilege", return_value=(False, wd.ERROR_NOT_ALL_ASSIGNED)):
             self.assertFalse(wd._enable_storage_privileges())
@@ -631,7 +631,7 @@ class StoragePrivilegeTests(unittest.TestCase):
 
 class UnbufferedRawIoTests(unittest.TestCase):
     def test_access_alignment_parser_prefers_device_values(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
 
         raw = bytearray(28)
         raw[0:4] = (28).to_bytes(4, "little")
@@ -646,7 +646,7 @@ class UnbufferedRawIoTests(unittest.TestCase):
         self.assertEqual(physical, 4096)
 
     def test_access_alignment_falls_back_when_query_fails(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
 
         with patch.object(wd, "_ioctl", side_effect=OSError(5)):
             logical, physical = wd._query_access_alignment(123, 4096)
@@ -656,7 +656,7 @@ class UnbufferedRawIoTests(unittest.TestCase):
 
 class WholeDiskOfflineTests(unittest.TestCase):
     def test_set_disk_offline_uses_nonpersistent_attribute_mask_and_verifies(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
 
         calls = []
 
@@ -688,7 +688,7 @@ class WholeDiskOfflineTests(unittest.TestCase):
         )
 
     def test_set_disk_online_clears_only_offline_attribute(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
 
         sent = []
 
@@ -714,7 +714,7 @@ class WholeDiskOfflineTests(unittest.TestCase):
 
 class WindowsWritePolicyTests(unittest.TestCase):
     def test_policy_detector_reports_removable_disk_deny_write(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
 
         values = {
             ("HKLM", r"SOFTWARE\Policies\Microsoft\Windows\RemovableStorageDevices\{53f5630d-b6bf-11d0-94f2-00a0c91efb8b}", "Deny_Write"): 1,
@@ -730,7 +730,7 @@ class WindowsWritePolicyTests(unittest.TestCase):
         self.assertTrue(any("이동식 디스크 쓰기 액세스 거부" in x for x in blockers))
 
     def test_policy_detector_reports_bitlocker_removable_write_policy(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
 
         def fake_read(root, path, name):
             if (
@@ -747,7 +747,7 @@ class WindowsWritePolicyTests(unittest.TestCase):
         self.assertTrue(any("BitLocker 정책" in x for x in blockers))
 
     def test_disk_attribute_parser_detects_read_only(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
 
         raw = (
             (16).to_bytes(4, "little")
@@ -761,7 +761,7 @@ class WindowsWritePolicyTests(unittest.TestCase):
         self.assertEqual(attrs, wd.DISK_ATTRIBUTE_READ_ONLY)
 
     def test_gpt_attribute_parser_detects_read_only(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
 
         raw = bytearray(160)
         raw[0:4] = wd.PARTITION_STYLE_GPT.to_bytes(4, "little")
@@ -795,7 +795,7 @@ class ReaderCompatibilityTests(unittest.TestCase):
     VOLUME_GUID = "\\\\?\\Volume{01234567-89ab-cdef-0123-456789abcdef}\\"
 
     def test_volume_guid_normalization_for_fve(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
 
         self.assertEqual(
             wd._volume_guid_for_fve("Volume{01234567-89ab-cdef-0123-456789abcdef}"),
@@ -808,7 +808,7 @@ class ReaderCompatibilityTests(unittest.TestCase):
         self.assertIsNone(wd._volume_guid_for_fve("\\\\.\\HarddiskVolume27"))
 
     def test_hidden_volume_fve_candidates_include_globalroot_and_nt_target(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
 
         values = wd._fve_raw_candidates(
             r"\\.\HarddiskVolume27",
@@ -821,7 +821,7 @@ class ReaderCompatibilityTests(unittest.TestCase):
         self.assertIn(r"\\.\HarddiskVolume27", values)
 
     def test_hidden_volume_fve_tries_multiple_identifiers_until_one_works(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
 
         calls = []
 
@@ -845,7 +845,7 @@ class ReaderCompatibilityTests(unittest.TestCase):
         self.assertEqual(calls[0][1], True)
 
     def test_fve_raw_access_success_and_hresult(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
 
         calls = []
 
@@ -861,7 +861,7 @@ class ReaderCompatibilityTests(unittest.TestCase):
         self.assertEqual(calls, [(self.VOLUME_GUID, True)])
 
     def test_fve_raw_access_reports_access_denied_hresult(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
 
         with patch.object(wd, "_FveEnableRawAccessW", lambda name, enabled: -2147024891):
             ok, hr = wd._fve_raw_access(self.VOLUME_GUID, True)
@@ -870,7 +870,7 @@ class ReaderCompatibilityTests(unittest.TestCase):
         self.assertEqual(hr, 0x80070005)
 
     def test_release_disables_fve_raw_access_after_closing_volume(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
 
         hidden_fve_name = r"\\?\GLOBALROOT\Device\HarddiskVolume27"
         item = _LockedVolume(
@@ -897,7 +897,7 @@ class ReaderCompatibilityTests(unittest.TestCase):
         self.assertFalse(item.fve_raw)
 
     def test_bus_names_cover_usb_sd_and_mmc_readers(self):
-        import ext4reader.windows_disk as wd
+        import windows_disk as wd
 
         self.assertEqual(wd.BUS_NAMES[7], "USB")
         self.assertEqual(wd.BUS_NAMES[12], "SD")

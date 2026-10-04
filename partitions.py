@@ -6,8 +6,8 @@ import struct
 import uuid
 from dataclasses import dataclass
 
-from ext4reader.constants import LINUX_GPT_GUIDS, MBR_LINUX
-from ext4reader.io_backend import BlockDevice
+from constants import LINUX_GPT_GUIDS, MBR_LINUX
+from io_backend import BlockDevice
 
 
 @dataclass

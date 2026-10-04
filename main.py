@@ -1,8 +1,8 @@
 import os
 import sys
 
-from ext4reader.debuglog import setup_logging
-from ext4reader.host import project_root, relaunch_as_host
+from debuglog import setup_logging
+from host import project_root, relaunch_as_host
 
 
 def run() -> None:
@@ -12,7 +12,7 @@ def run() -> None:
             request_path = sys.argv[idx + 1]
         except (ValueError, IndexError):
             raise SystemExit(2)
-        from ext4reader.system_raw_helper import run_helper_request
+        from system_raw_helper import run_helper_request
 
         raise SystemExit(run_helper_request(request_path))
 
@@ -22,11 +22,11 @@ def run() -> None:
         pass
     relaunch_as_host()
     setup_logging()
-    from ext4reader.fuse_mount import cleanup_stale_mounts
+    from fuse_mount import cleanup_stale_mounts
 
     cleanup_stale_mounts()
     if "--install-winfsp" in sys.argv:
-        from ext4reader.winfsp_setup import ensure_winfsp_installed
+        from winfsp_setup import ensure_winfsp_installed
 
         def _progress(msg: str) -> None:
             try:
@@ -38,7 +38,7 @@ def run() -> None:
             progress=_progress,
             force="--reinstall-winfsp" in sys.argv,
         )
-    from ext4reader.gui import main
+    from gui import main
 
     main()
 

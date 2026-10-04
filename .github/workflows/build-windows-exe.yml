@@ -14,6 +14,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: ext4reader-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-latest
@@ -38,13 +42,14 @@ jobs:
       - name: Run regression tests
         shell: pwsh
         run: |
-          python -m unittest discover -v -p "test_*.py"
+          python -m unittest discover -v -s tests -p "test_*.py"
+          python -c "import runpy; runpy.run_path('tests/test_extent_tree.py', run_name='__main__')"
 
       - name: Read application version
         id: version
         shell: pwsh
         run: |
-          $version = python -c "import ext4reader; print(ext4reader.__version__)"
+          $version = python -c "import app_info; print(app_info.__version__)"
           "version=$version" >> $env:GITHUB_OUTPUT
           "tag=v$version" >> $env:GITHUB_OUTPUT
           Write-Host "Building EXT4 Reader $version"
@@ -95,5 +100,5 @@ jobs:
             gh release create "$env:TAG" "dist\Ext4Reader.exe#Ext4Reader.exe" `
               --target "${{ github.sha }}" `
               --title "EXT4 Reader $env:VERSION" `
-              --notes "Windows EXE 자동 빌드. EXT4 JBD2 저널 자동 복구 기능 포함."
+              --notes "Windows EXE 자동 빌드. 단일 루트 소스 구조, EXT4 JBD2 저널 복구 및 UsbDk fallback 포함."
           }
