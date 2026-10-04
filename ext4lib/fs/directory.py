@@ -48,6 +48,24 @@ def _dir_csum_set(vol, inode: Inode, block: bytearray) -> None:
     struct.pack_into("<I", block, tail_off + 8, crc)
 
 
+
+
+def dir_block_checksum_valid(vol, inode: Inode, block: bytes) -> bool:
+    if not vol.sb.has_metadata_csum:
+        return True
+    bs = vol.sb.block_size
+    if len(block) != bs or bs < 12:
+        return False
+    tail_off = bs - 12
+    ino, rec_len, name_len, file_type = struct.unpack_from("<IHBB", block, tail_off)
+    if ino != 0 or rec_len != 12 or name_len != 0 or file_type != C.EXT4_FT_DIR_CSUM:
+        return False
+    stored = struct.unpack_from("<I", block, tail_off + 8)[0]
+    crc = crc32c(vol.sb.csum_seed(), struct.pack("<I", inode.ino))
+    crc = crc32c(crc, struct.pack("<I", inode.generation))
+    crc = crc32c(crc, block[:tail_off])
+    return stored == crc
+
 def parse_dirent_block(data: bytes, max_off: int | None = None) -> list[DirEntry]:
     if max_off is None:
         max_off = len(data)

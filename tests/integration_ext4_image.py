@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import struct
 
 from ext4lib.fs import constants as C
 from ext4lib.fs.journal import _JournalLog
+from ext4lib.fs.superblock import parse_superblock
 from ext4lib.fs.volume import Ext4Volume, discover_volumes
 from ext4lib.fs.writer import (
     create_empty_file,
@@ -236,6 +238,58 @@ def gpt_portable_roundtrip(path: str) -> None:
     finally:
         check_dev.close()
 
+
+
+def error_repair_roundtrip(path: str) -> None:
+    """Inject a stale ERROR_FS bit and repair it entirely in Windows-side code."""
+    dev = ImageDevice(path, writable=True)
+    vol = Ext4Volume(dev, 0, os.path.getsize(path), owns_device=True)
+    try:
+        raw = bytearray(dev.read(1024, 1024))
+        sb = parse_superblock(raw)
+        sb.state |= C.EXT4_ERROR_FS | C.EXT4_VALID_FS
+        struct.pack_into("<H", sb.raw, 0x3A, sb.state & 0xFFFF)
+        # Preserve realistic historical diagnostics; the repair clears only the
+        # active ERROR_FS state after structural validation.
+        struct.pack_into("<I", sb.raw, 0x194, 2)
+        struct.pack_into("<I", sb.raw, 0x19C, C.EXT4_ROOT_INO)
+        struct.pack_into("<Q", sb.raw, 0x1A0, 1)
+        sb.write_checksum()
+        dev.write(1024, bytes(sb.raw[:1024]))
+        dev.flush()
+    finally:
+        vol.close(abort=True)
+
+    check = open_volume(path, True)
+    try:
+        assert check.sb.state & C.EXT4_ERROR_FS
+        assert not check.journal_needs_recovery()
+        stats = check.repair_error_state_if_safe()
+        assert stats.repaired
+        assert stats.groups_checked == check.sb.groups_count
+        assert stats.bitmaps_checked > 0
+        assert not (check.sb.state & C.EXT4_ERROR_FS)
+        assert check.sb.state & C.EXT4_VALID_FS
+
+        root = lookup_path(check, "/")
+        node = create_empty_file(check, root, "windows-repaired.bin")
+        payload = b"windows-ext4-error-repair" * 128
+        write_range(check, node, 0, payload, flush=True)
+        check.close()
+    except Exception:
+        check.close(abort=True)
+        raise
+
+    final = open_volume(path, False)
+    try:
+        assert not (final.sb.state & C.EXT4_ERROR_FS)
+        assert not final.sb.needs_recovery
+        assert final.sb.state & C.EXT4_VALID_FS
+        node = lookup_path(final, "/windows-repaired.bin")
+        assert read_range(final, node, 0, len(payload)) == payload
+    finally:
+        final.close()
+
 def dirty_marker_roundtrip(path: str) -> None:
     vol = open_volume(path, True)
     blockers = vol.hard_write_blockers()
@@ -263,7 +317,7 @@ def main() -> None:
     parser.add_argument("image")
     parser.add_argument(
         "--mode",
-        choices=("clean", "dirty-marker", "journal-replay", "gpt-portable"),
+        choices=("clean", "dirty-marker", "journal-replay", "gpt-portable", "error-repair"),
         default="clean",
     )
     args = parser.parse_args()
@@ -274,8 +328,10 @@ def main() -> None:
         dirty_marker_roundtrip(args.image)
     elif args.mode == "journal-replay":
         journal_replay_roundtrip(args.image)
-    else:
+    elif args.mode == "gpt-portable":
         gpt_portable_roundtrip(args.image)
+    else:
+        error_repair_roundtrip(args.image)
 
 
 if __name__ == "__main__":
