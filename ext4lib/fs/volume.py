@@ -387,7 +387,16 @@ class Ext4Volume:
                 self._data_dirty = False
 
     def flush_metadata(self) -> None:
-        self.commit_metadata(sync=True)
+        """Durably commit metadata and leave the volume portable/clean.
+
+        High-level namespace operations use this at operation boundaries.  A
+        later write will lazily open a fresh dirty/JBD2 session via
+        require_write(), so the medium is clean between completed operations.
+        """
+        if self._write_session_active:
+            self.finish_write_session()
+        else:
+            self.commit_metadata(sync=True)
 
     def _write_super_state(self) -> None:
         struct.pack_into("<H", self.sb.raw, 0x3A, self.sb.state & 0xFFFF)
@@ -551,6 +560,8 @@ class Ext4Volume:
         reasons.extend(self.hard_write_blockers())
         if reasons:
             raise Ext4Error("쓸 수 없습니다:\n- " + "\n- ".join(reasons))
+        if not self._write_session_active:
+            self.begin_write_session()
 
     def close(self) -> None:
         try:

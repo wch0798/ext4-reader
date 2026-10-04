@@ -8,11 +8,12 @@ from ext4lib.mount import fuse as fm
 
 
 class DummyVolume:
-    def __init__(self, *, fail_sync=False):
+    def __init__(self, *, fail_sync=False, active=False):
         self.fail_sync = fail_sync
         self.sync_calls = []
         self.closed = False
         self.finished = False
+        self._write_session_active = active
 
     def commit_metadata(self, sync=True):
         self.sync_calls.append(bool(sync))
@@ -24,6 +25,7 @@ class DummyVolume:
 
     def finish_write_session(self):
         self.finished = True
+        self._write_session_active = False
 
     def close(self):
         self.closed = True
@@ -47,6 +49,16 @@ class WriteSafetyTests(unittest.TestCase):
             ops.sync_pending()
         self.assertIn("이전 디스크 쓰기/flush 오류", str(cm.exception))
         self.assertEqual(vol.sync_calls, [True])
+
+    def test_sync_finishes_active_session_to_leave_media_clean(self):
+        vol = DummyVolume(active=True)
+        ops = fm.Ext4FuseOps(vol, read_only=False)
+
+        ops.sync_pending()
+
+        self.assertTrue(vol.finished)
+        self.assertFalse(vol._write_session_active)
+        self.assertEqual(vol.sync_calls, [])
 
     def test_buffered_write_failure_keeps_buffer_and_latches_error(self):
         vol = DummyVolume()

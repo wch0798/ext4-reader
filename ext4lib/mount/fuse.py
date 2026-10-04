@@ -346,20 +346,19 @@ class Ext4FuseOps:
         self._wb = None
 
     def sync_pending(self) -> None:
-        """Durably flush pending file and metadata writes.
-
-        This method intentionally raises the original failure so unmount/GUI
-        code can tell the user that a copy was not safely committed.
-        """
+        """Durably flush pending writes and leave the on-disk EXT4 clean."""
         with self._lock:
             self._ensure_write_healthy()
             try:
                 self._wb_flush()
-                self.vol.commit_metadata(sync=True)
+                if getattr(self.vol, "_write_session_active", False):
+                    self.vol.finish_write_session()
+                else:
+                    self.vol.commit_metadata(sync=True)
             except Exception as exc:
                 self._latch_write_failure(exc, "sync")
                 raise
-            LOG.info("최종 디스크 flush 성공")
+            LOG.info("최종 디스크 flush/EXT4 clean 성공")
 
     def _drop_paths(self) -> None:
         self._wb_flush()
@@ -726,12 +725,15 @@ class Ext4FuseOps:
         self._ensure_write_healthy()
         try:
             self._wb_flush()
-            self.vol.commit_metadata(sync=sync)
+            if sync and self.vol._write_session_active:
+                self.vol.finish_write_session()
+            else:
+                self.vol.commit_metadata(sync=sync)
         except Exception as exc:
             self._latch_write_failure(exc, "fsync" if sync else "flush")
             raise
         if sync:
-            LOG.info("파일 데이터/메타데이터 flush 성공")
+            LOG.info("파일 데이터/메타데이터 flush + EXT4 clean 성공")
         return 0
 
     def flush(self, path, fh):
@@ -752,6 +754,7 @@ class Ext4FuseOps:
         return 0
 
     def utimens(self, path, times=None):
+        self._ro()
         return self._wrap(self._utimens, self._fuse_path(path), times)
 
     def _utimens(self, path, times):
@@ -1341,9 +1344,9 @@ def mount_volume(vol: Ext4Volume, read_only: bool, letter: str | None = None, la
         if not cand.endswith(":"):
             cand = cand + ":"
         if not read_only:
-            # Persist the unclean state before Windows can issue the first
-            # writable FUSE request. A clean flag is restored only by unmount().
-            vol.begin_write_session()
+            # Keep the medium clean until the first real mutation. require_write()
+            # lazily opens a dirty/JBD2 session, and fsync/release closes it again.
+            LOG.info("쓰기 마운트 준비: 첫 실제 쓰기 전까지 EXT4 clean 상태 유지")
         ops = Ext4FuseOps(vol, read_only)
         session = MountSession(cand, vol, threading.Thread(daemon=True), read_only=read_only)
         ops._stop = session.stop

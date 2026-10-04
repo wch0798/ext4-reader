@@ -630,7 +630,7 @@ def write_range(vol: Ext4Volume, inode: Inode, offset: int, data: bytes, flush: 
     vol.write_inode(inode)
     discard_old_extent_indexes(vol, inode)
     if flush:
-        vol.commit_metadata(sync=True)
+        vol.flush_metadata()
     return len(data)
 
 
@@ -662,7 +662,7 @@ def set_file_size(vol: Ext4Volume, inode: Inode, new_size: int) -> Inode:
     inode.set_times()
     vol.write_inode(inode)
     discard_old_extent_indexes(vol, inode)
-    vol.commit_metadata(sync=True)
+    vol.flush_metadata()
     return inode
 
 
