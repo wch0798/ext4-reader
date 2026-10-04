@@ -86,6 +86,7 @@ class Ext4Volume:
         self._alloc_hint: dict[int, int] = {}
         self._dir_list: dict = {}
         self._dir_index: dict = {}
+        self._write_session_active = False
         self._load_groups()
 
     def reload_metadata(self) -> None:
@@ -251,6 +252,39 @@ class Ext4Volume:
     def flush_metadata(self) -> None:
         self.commit_metadata(sync=True)
 
+    def _write_super_state(self) -> None:
+        struct.pack_into("<H", self.sb.raw, 0x3A, self.sb.state & 0xFFFF)
+        self.sb.write_checksum()
+        self.dev.write(self.part_offset + 1024, bytes(self.sb.raw[:1024]))
+        self.dev.flush()
+        self._data_dirty = False
+
+    def begin_write_session(self) -> None:
+        """Mark the filesystem unclean before exposing a writable mount.
+
+        We do not yet journal new Windows metadata transactions, so a crash or
+        surprise removal must never leave the superblock claiming a clean
+        unmount. A clean flag is restored only after the final durable flush.
+        """
+        if self._write_session_active:
+            return
+        if not self.dev.writable:
+            raise Ext4Error("쓰기 세션을 시작하려면 장치를 쓰기 가능으로 열어야 합니다.")
+        self.sb.state &= ~C.EXT4_VALID_FS
+        self._write_super_state()
+        self._write_session_active = True
+        LOG.warning("RW 세션 시작: EXT4 clean 플래그를 해제했습니다.")
+
+    def finish_write_session(self) -> None:
+        """Durably flush and mark the filesystem clean after a safe unmount."""
+        if not self._write_session_active:
+            return
+        self.commit_metadata(sync=True)
+        self.sb.state |= C.EXT4_VALID_FS
+        self._write_super_state()
+        self._write_session_active = False
+        LOG.info("RW 세션 정상 종료: EXT4 clean 플래그를 복원했습니다.")
+
     def journal_start(self) -> int | None:
         if not self.sb.has_journal or not self.sb.journal_inum:
             return 0
@@ -361,6 +395,10 @@ class Ext4Volume:
         try:
             self.flush_metadata()
         finally:
+            if self._write_session_active:
+                LOG.warning(
+                    "RW 세션이 clean 완료 없이 닫힙니다. EXT4 clean 플래그를 복원하지 않습니다."
+                )
             if self.owns_device:
                 self.dev.close()
 

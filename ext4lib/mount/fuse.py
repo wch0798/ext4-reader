@@ -285,6 +285,7 @@ class Ext4FuseOps:
         self._wb: list | None = None
         self._win_flags: dict[str, int] = {}
         self._st_flags = 0
+        self._write_failure: BaseException | None = None
 
     def _node(self, path: str):
         ino = self._path_ino.get(path)
@@ -309,6 +310,24 @@ class Ext4FuseOps:
                 size = end
         return size
 
+    def _latch_write_failure(self, exc: BaseException, operation: str) -> None:
+        if self._write_failure is None:
+            self._write_failure = exc
+            self.read_only = True
+            LOG.error(
+                "쓰기 경로 중단 operation=%s error=%s; 이후 쓰기를 EIO로 거부합니다",
+                operation,
+                exc,
+            )
+
+    def _ensure_write_healthy(self) -> None:
+        if self._write_failure is not None:
+            raise IoError(
+                "이전 디스크 쓰기/flush 오류로 안전을 위해 쓰기를 중단했습니다: "
+                + str(self._write_failure),
+                winerr=getattr(self._write_failure, "winerr", 0) or 0,
+            )
+
     def _wb_flush(self) -> None:
         wb = self._wb
         if not wb:
@@ -317,9 +336,30 @@ class Ext4FuseOps:
         if not buf:
             self._wb = None
             return
-        node = self.vol.read_inode(ino)
-        write_range(self.vol, node, off, bytes(buf), flush=False)
+        self._ensure_write_healthy()
+        try:
+            node = self.vol.read_inode(ino)
+            write_range(self.vol, node, off, bytes(buf), flush=False)
+        except Exception as exc:
+            self._latch_write_failure(exc, "buffered-write")
+            raise
         self._wb = None
+
+    def sync_pending(self) -> None:
+        """Durably flush pending file and metadata writes.
+
+        This method intentionally raises the original failure so unmount/GUI
+        code can tell the user that a copy was not safely committed.
+        """
+        with self._lock:
+            self._ensure_write_healthy()
+            try:
+                self._wb_flush()
+                self.vol.commit_metadata(sync=True)
+            except Exception as exc:
+                self._latch_write_failure(exc, "sync")
+                raise
+            LOG.info("최종 디스크 flush 성공")
 
     def _drop_paths(self) -> None:
         self._wb_flush()
@@ -327,6 +367,10 @@ class Ext4FuseOps:
         self._ra = None
 
     def _ro(self) -> None:
+        try:
+            self._ensure_write_healthy()
+        except IoError as exc:
+            raise self._err(errno.EIO) from exc
         if self.read_only:
             raise self._err(errno.EROFS)
 
@@ -381,6 +425,7 @@ class Ext4FuseOps:
             LOG.warning("Ext4Error %s %s: %s", getattr(fn, "__name__", fn), args, exc)
             raise self._err(errno.EROFS if "쓸 수 없" in str(exc) else errno.EIO) from exc
         except IoError as exc:
+            self._latch_write_failure(exc, getattr(fn, "__name__", str(fn)))
             key = (getattr(fn, "__name__", str(fn)), type(exc).__name__, str(exc)[:200])
             if key not in self._logged:
                 self._logged.add(key)
@@ -391,6 +436,7 @@ class Ext4FuseOps:
 
             if isinstance(exc, FuseOSError):
                 raise
+            self._latch_write_failure(exc, getattr(fn, "__name__", str(fn)))
             LOG.exception("OSError %s %s", getattr(fn, "__name__", fn), _brief_args(args))
             raise self._err(getattr(exc, "errno", errno.EIO) or errno.EIO) from exc
         except Exception as exc:
@@ -519,8 +565,8 @@ class Ext4FuseOps:
         trunc = bool(flags & os.O_TRUNC)
         excl = bool(flags & os.O_EXCL)
         writing = bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_TRUNC | os.O_CREAT))
-        if self.read_only and writing:
-            raise self._err(errno.EROFS)
+        if writing:
+            self._ro()
         try:
             node = self._node(path)
         except FileNotFoundError:
@@ -676,29 +722,28 @@ class Ext4FuseOps:
         self._discard_wb(node.ino)
         set_file_size(self.vol, self.vol.read_inode(node.ino), length)
 
-    def flush(self, path, fh):
-        with self._lock:
+    def _flush_file(self, sync: bool) -> int:
+        self._ensure_write_healthy()
+        try:
             self._wb_flush()
-            self.vol.commit_metadata(sync=False)
+            self.vol.commit_metadata(sync=sync)
+        except Exception as exc:
+            self._latch_write_failure(exc, "fsync" if sync else "flush")
+            raise
+        if sync:
+            LOG.info("파일 데이터/메타데이터 flush 성공")
         return 0
+
+    def flush(self, path, fh):
+        return self._wrap(self._flush_file, False)
 
     def fsync(self, path, datasync, fh):
-        with self._lock:
-            self._wb_flush()
-            self.vol.commit_metadata(sync=True)
-        return 0
+        return self._wrap(self._flush_file, True)
 
     def release(self, path, fh):
-        with self._lock:
-            try:
-                self._wb_flush()
-            except Exception:
-                LOG.exception("파일 닫기 전 쓰기 반영 실패")
-            try:
-                self.vol.commit_metadata(sync=True)
-            except Exception:
-                LOG.exception("파일 닫기 전 디스크 반영 실패")
-        return 0
+        # Never swallow the final write/flush error. Explorer must receive EIO
+        # instead of reporting a successful copy when the device did not commit.
+        return self._wrap(self._flush_file, True)
 
     def chmod(self, path, mode):
         return 0
@@ -725,10 +770,7 @@ class Ext4FuseOps:
         return 0
 
     def fsyncdir(self, path, datasync, fh):
-        with self._lock:
-            self._wb_flush()
-            self.vol.commit_metadata(sync=True)
-        return 0
+        return self._wrap(self._flush_file, True)
 
     def statfs(self, path):
         sb = self.vol.sb
@@ -945,6 +987,19 @@ def unmount(letter: str) -> None:
     letter = normalize_drive_letter(letter)
     LOG.info("언마운트 시작 %s", letter)
     session = _SESSIONS.pop(letter, None)
+    sync_error: BaseException | None = None
+    close_error: BaseException | None = None
+
+    # Flush before asking WinFsp to stop. Once the mount is torn down we can no
+    # longer honestly report a final write failure back through Explorer.
+    if session and not session.read_only and session.ops is not None:
+        try:
+            session.ops.sync_pending()
+            session.volume.finish_write_session()
+        except Exception as exc:
+            sync_error = exc
+            LOG.exception("언마운트 전 최종 디스크 flush/clean 처리 실패 %s", letter)
+
     if session:
         session.stop.set()
         if session.ops is not None:
@@ -969,8 +1024,18 @@ def unmount(letter: str) -> None:
     if session:
         try:
             session.volume.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            close_error = exc
+            LOG.exception("언마운트 중 볼륨 close/flush 실패 %s", letter)
+
+    failure = sync_error or close_error
+    if failure is not None:
+        raise IoError(
+            f"{letter} 연결 해제 중 마지막 디스크 반영이 실패했습니다: {failure}",
+            winerr=getattr(failure, "winerr", 0) or 0,
+        ) from failure
+    if not gone:
+        raise RuntimeError(f"{letter} 드라이브 연결을 완전히 해제하지 못했습니다.")
 
 
 def unmount_all() -> None:
@@ -1275,6 +1340,10 @@ def mount_volume(vol: Ext4Volume, read_only: bool, letter: str | None = None, la
     for cand in letters:
         if not cand.endswith(":"):
             cand = cand + ":"
+        if not read_only:
+            # Persist the unclean state before Windows can issue the first
+            # writable FUSE request. A clean flag is restored only by unmount().
+            vol.begin_write_session()
         ops = Ext4FuseOps(vol, read_only)
         session = MountSession(cand, vol, threading.Thread(daemon=True), read_only=read_only)
         ops._stop = session.stop
