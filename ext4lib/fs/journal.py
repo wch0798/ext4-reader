@@ -208,6 +208,10 @@ class _JournalLog:
         csum3 = bool(i.feature_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3)
         if csum2 and csum3:
             raise JournalRecoveryError("JBD2 checksum v2와 v3가 동시에 설정되어 있습니다.")
+        if (i.feature_compat & JBD2_FEATURE_COMPAT_CHECKSUM) and (csum2 or csum3):
+            raise JournalRecoveryError(
+                "JBD2 checksum v1과 v2/v3 기능이 동시에 설정된 잘못된 저널입니다."
+            )
         if (csum2 or csum3) and i.checksum_type != JBD2_CRC32C_CHKSUM:
             raise JournalRecoveryError(
                 f"지원하지 않는 JBD2 checksum 형식입니다: {i.checksum_type}"
@@ -658,7 +662,11 @@ class JournalWriter:
         """Mark the journal empty after the final metadata checkpoint."""
         if not self.committed and not self.vol.sb.needs_recovery:
             return
-        self.log.mark_clean(self.last_sequence, head=self.head)
+        # Linux advances the tail sequence to the next unused transaction ID
+        # before marking an empty journal.  Persisting last_sequence here would
+        # allow a later clean mount to reuse a transaction ID too early and can
+        # make stale ring contents look current after enough reuse/wraparound.
+        self.log.mark_clean(self.sequence, head=self.head)
         self.vol.dev.flush()
         self.vol._data_dirty = False
         self.committed = False
@@ -702,14 +710,19 @@ def recover_journal(vol: "Ext4Volume") -> ReplayStats:
     transactions, next_sequence, _head = log.scan_transactions()
     if not transactions:
         # A declared transaction without a commit record is intentionally
-        # discarded by JBD2. No metadata from it has reached home through our
-        # writer, so invalidate the incomplete log and clear RECOVER.
-        log.mark_clean(log.info.sequence, head=_head or log.info.first)
+        # discarded by JBD2. Linux restarts recovery at ++end_transaction so
+        # the incomplete transaction ID cannot be reused immediately.
+        restart_sequence = (next_sequence + 1) & 0xFFFFFFFF
+        log.mark_clean(restart_sequence, head=_head or log.info.first)
         _clear_ext4_recovery_flag(vol)
         vol.dev.flush()
         vol.reload_metadata()
-        LOG.warning("미완료 JBD2 transaction을 버리고 저널을 clean 상태로 되돌렸습니다.")
-        return ReplayStats(0, 0, 0, log.info.sequence)
+        LOG.warning(
+            "미완료 JBD2 transaction을 버리고 저널을 clean 상태로 되돌렸습니다. "
+            "restart_sequence=%s",
+            restart_sequence,
+        )
+        return ReplayStats(0, 0, 0, restart_sequence)
 
     # Recovery uses a separate revoke pass. A revoke from a later transaction
     # suppresses replay of the same filesystem block from an earlier transaction.
@@ -739,16 +752,20 @@ def recover_journal(vol: "Ext4Volume") -> ReplayStats:
     # First make replayed metadata durable. If power is lost here, repeating the
     # replay is safe. Only afterwards clear the journal and EXT4 recovery flag.
     vol.dev.flush()
-    log.mark_clean(next_sequence, head=_head)
+    # Linux recovery sets j_transaction_sequence = ++end_transaction before
+    # resetting the journal.  Keep the same one-ID gap so stale commit records
+    # cannot be mistaken for a new transaction after recovery.
+    restart_sequence = (next_sequence + 1) & 0xFFFFFFFF
+    log.mark_clean(restart_sequence, head=_head)
     _clear_ext4_recovery_flag(vol)
     vol.dev.flush()
     vol.reload_metadata()
 
     LOG.info(
-        "JBD2 복구 완료 transactions=%s replayed=%s revoked=%s next_sequence=%s",
+        "JBD2 복구 완료 transactions=%s replayed=%s revoked=%s restart_sequence=%s",
         len(transactions),
         replayed,
         revoked,
-        next_sequence,
+        restart_sequence,
     )
-    return ReplayStats(len(transactions), replayed, revoked, next_sequence)
+    return ReplayStats(len(transactions), replayed, revoked, restart_sequence)
