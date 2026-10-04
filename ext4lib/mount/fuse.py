@@ -995,9 +995,10 @@ def unmount(letter: str) -> None:
     if session and not session.read_only and session.ops is not None:
         try:
             session.ops.sync_pending()
+            session.volume.finish_write_session()
         except Exception as exc:
             sync_error = exc
-            LOG.exception("언마운트 전 최종 디스크 flush 실패 %s", letter)
+            LOG.exception("언마운트 전 최종 디스크 flush/clean 처리 실패 %s", letter)
 
     if session:
         session.stop.set()
@@ -1339,6 +1340,10 @@ def mount_volume(vol: Ext4Volume, read_only: bool, letter: str | None = None, la
     for cand in letters:
         if not cand.endswith(":"):
             cand = cand + ":"
+        if not read_only:
+            # Persist the unclean state before Windows can issue the first
+            # writable FUSE request. A clean flag is restored only by unmount().
+            vol.begin_write_session()
         ops = Ext4FuseOps(vol, read_only)
         session = MountSession(cand, vol, threading.Thread(daemon=True), read_only=read_only)
         ops._stop = session.stop
