@@ -132,7 +132,13 @@ def inode_table_blocks(vol) -> int:
 def apply_bitmap_csum(vol, gd: GroupDesc, which: str, bitmap: Bitmap) -> None:
     if not vol.sb.has_metadata_csum:
         return
-    crc = crc32c(vol.sb.csum_seed(), bitmap.data[: vol.sb.block_size])
+    if which == "block":
+        # EXT4_CLUSTERS_PER_GROUP / 8. bigalloc is rejected by the writer,
+        # therefore clusters == blocks here.
+        csum_len = vol.sb.blocks_per_group // 8
+    else:
+        csum_len = vol.sb.inodes_per_group // 8
+    crc = crc32c(vol.sb.csum_seed(), bitmap.data[:csum_len])
     if which == "block":
         # 0x18 lo, 0x34 hi
         gd.raw[0x18:0x1A] = (crc & 0xFFFF).to_bytes(2, "little")
