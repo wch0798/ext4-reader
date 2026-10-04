@@ -928,11 +928,16 @@ class App(tk.Tk):
         if kind == "vol":
             disk, vinfo = payload
             key = self._vol_key("disk", disk.path, vinfo)
+            partition_number = (
+                int(vinfo.partition_index)
+                if int(vinfo.partition_index or 0) > 0
+                else None
+            )
             opener = lambda writable: WindowsPhysicalDevice(
                 disk.path,
                 disk.sector_size,
                 writable=writable,
-                partition_number=vinfo.partition_index,
+                partition_number=partition_number,
                 partition_offset=vinfo.offset,
                 partition_size=vinfo.size,
                 expected_size=disk.size,
@@ -993,11 +998,13 @@ class App(tk.Tk):
                 self.update_idletasks()
                 self._verify_physical_selection(disk, vinfo)
                 LOG.info(
-                    "선택 장치 재검증 성공 path=%s offset=%s uuid=%s serial=%s",
+                    "선택 장치 재검증 성공 path=%s offset=%s uuid=%s serial=%s scheme=%s part=%s",
                     disk.path,
                     vinfo.offset,
                     vinfo.sb.uuid.hex(),
                     disk.serial or "-",
+                    vinfo.scheme,
+                    vinfo.partition_index or "-",
                 )
             letter = self._chosen_letter()
             self.set_status(self._t("mounting", letter=letter))
