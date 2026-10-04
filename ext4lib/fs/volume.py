@@ -511,6 +511,15 @@ class Ext4Volume:
         except JournalRecoveryError as exc:
             raise Ext4Error(f"Windows 저널 복구 실패: {exc}") from exc
 
+    def recover_pending_orphans(self, progress=None):
+        """Recover EXT4 orphan-file / legacy orphan state on Windows."""
+        try:
+            from ext4lib.fs.orphan import OrphanRecoveryError, recover_orphans
+
+            return recover_orphans(self, progress)
+        except OrphanRecoveryError as exc:
+            raise Ext4Error(f"Windows orphan 복구 실패: {exc}") from exc
+
     def repair_error_state_if_safe(self, progress=None) -> ErrorRepairStats:
         """Clear a stale EXT4_ERROR_FS only after a conservative metadata scrub.
 
@@ -526,9 +535,11 @@ class Ext4Volume:
         if self.journal_needs_recovery() or self.sb.needs_recovery:
             raise Ext4Error("JBD2 저널이 아직 clean 상태가 아니어서 ERROR_FS를 복구할 수 없습니다.")
         if self.sb.state & C.EXT4_ORPHAN_FS:
-            raise Ext4Error("orphan inode 처리가 필요한 EXT4 상태라 자동 복구를 중단합니다.")
+            raise Ext4Error("orphan 복구 진행 상태가 남아 있어 ERROR_FS 검사를 중단합니다.")
         if self.sb.feature_ro_compat & C.EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT:
-            raise Ext4Error("orphan file 처리가 필요한 EXT4 상태라 자동 복구를 중단합니다.")
+            raise Ext4Error("ORPHAN_PRESENT 상태가 남아 있어 ERROR_FS 검사를 중단합니다.")
+        if self.sb.last_orphan:
+            raise Ext4Error("legacy orphan list가 남아 있어 ERROR_FS 검사를 중단합니다.")
         if not superblock_checksum_valid(self.sb):
             raise Ext4Error("EXT4 superblock checksum이 일치하지 않습니다.")
 
@@ -729,6 +740,10 @@ class Ext4Volume:
             reasons.append("다중 마운트 보호(MMP)가 켜져 있습니다.")
         if self.sb.state & C.EXT4_ERROR_FS:
             reasons.append("EXT4 슈퍼블록에 파일시스템 오류 상태가 기록되어 있습니다.")
+        if self.sb.feature_ro_compat & C.EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT:
+            reasons.append("EXT4 orphan file 정리가 필요합니다.")
+        if self.sb.last_orphan:
+            reasons.append("EXT4 legacy orphan list 정리가 필요합니다.")
         if self.sb.feature_ro_compat & C.EXT4_FEATURE_RO_COMPAT_BIGALLOC:
             reasons.append("bigalloc 파일시스템은 쓰기를 지원하지 않습니다.")
         if self.sb.feature_ro_compat & C.EXT4_FEATURE_RO_COMPAT_READONLY:
