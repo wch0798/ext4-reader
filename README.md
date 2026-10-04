@@ -14,7 +14,7 @@ HDD, SSD, USB, SD 카드의 **EXT4** 파티션을 **Windows 탐색기 드라이�
 python -m pip install -r requirements.txt
 ```
 
-탐색기 연결에 필요한 **WinFsp**는 프로그램이 없으면 자동으로 받아 설치합니다. 관리자 확인 창이 뜨면 허용하세요. 설치 직후 드라이버가 안 켜지면 PC를 한 번 재시작하면 됩니다.
+탐색기 연결에 필요한 **WinFsp**는 프로그램이 없으면 자동으로 받아 설치합니다. 관리자 확인 창이 뜨면 허용하세요. 설치 직후 드라이버가 안 켜지면 PC를 한 번 재시작하면 됩니다.\n\n일부 USB 카드리더가 Windows raw-write를 전부 거부하면 **UsbDk가 필요하다는 안내가 자동으로 뜹니다.** 사용자가 설치를 승인하면 공식 UsbDk MSI를 자동 다운로드하고 SHA-256을 검증한 뒤 자동 설치합니다. 일반 리더기에는 UsbDk를 사용하지 않습니다.
 
 ## 실행
 
@@ -41,3 +41,16 @@ python -m pip install -r requirements.txt
 | --- | --- | --- |
 | HDD / SSD / USB / SD | 관리자 + WinFsp | 쓰기 허용 |
 | `.img` / `.raw` 파일 | WinFsp | 쓰기 허용 |
+
+
+## 소스 구조
+
+소스는 별도 `ext4reader/` 패키지 복사본 없이 **저장소 루트 한 곳**만 사용합니다.
+
+- `main.py`: 실행 진입점
+- `gui.py`, `windows_disk.py`, `volume.py`, `journal.py` 등: 핵심 모듈
+- `tests/`: 회귀 테스트
+- `Ext4Reader.spec`: PyInstaller 빌드 정의
+- `Ext4Reader.exe`: GitHub Actions가 최신 소스로 자동 생성한 실행 파일
+
+소스 실행은 `python main.py` 또는 `run_as_admin.bat`을 사용합니다.
