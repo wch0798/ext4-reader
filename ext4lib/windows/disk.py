@@ -68,6 +68,7 @@ SCSI_IOCTL_DATA_UNSPECIFIED = 2
 SCSI_STATUS_GOOD = 0x00
 SCSI_WRITE10 = 0x2A
 SCSI_SYNCHRONIZE_CACHE10 = 0x35
+SCSI_WRITE_FUA = 0x08
 
 TOKEN_QUERY = 0x0008
 TOKEN_ADJUST_PRIVILEGES = 0x0020
@@ -1880,10 +1881,13 @@ class WindowsPhysicalDevice(BlockDevice):
         self._write_blockers: list[str] = []
         self._disk_offline = False
         self._usbdk = None
-        # SCSI passthrough writes may sit in the USB/card-reader device cache.
-        # FlushFileBuffers() only flushes Windows file objects, so track these
-        # writes separately and issue SYNCHRONIZE CACHE(10) at fsync boundaries.
+        # USB/SD bridges differ widely in SCSI cache semantics. Learn the
+        # working durability method once per device instead of retrying a chain
+        # of known-failing commands for every filesystem write.
         self._scsi_dirty = False
+        self._scsi_fua_supported: bool | None = None
+        self._scsi_sync_cache_supported: bool | None = None
+        self._fallback_write_route: str | None = None
         LOG.info(
             "디스크 열기 %s writable=%s sector=%s part=%s part_offset=%s part_size=%s",
             path,
@@ -2276,123 +2280,151 @@ class WindowsPhysicalDevice(BlockDevice):
             len(data),
         )
 
-    def _scsi_synchronize_cache(self) -> None:
-        """Force prior SCSI passthrough writes onto stable media.
+    @staticmethod
+    def _scsi_sense_from_error(exc: BaseException) -> tuple[int, int, int] | None:
+        sense = getattr(exc, "scsi_sense", None)
+        if (
+            isinstance(sense, tuple)
+            and len(sense) == 3
+            and all(isinstance(v, int) for v in sense)
+        ):
+            return sense
+        return None
 
-        Immediate read-back after WRITE(10) may be satisfied from a USB/SD
-        bridge cache. Try the same DIRECT transport that this reader accepts
-        for writes, then fall back to buffered pass-through. Failure is fatal:
-        EXT4/JBD2 must not report a clean durable state without this barrier.
+    @staticmethod
+    def _scsi_field_unsupported(exc: BaseException) -> bool:
+        """Return True for ILLEGAL REQUEST / unsupported CDB field/opcode."""
+        sense = WindowsPhysicalDevice._scsi_sense_from_error(exc)
+        return bool(sense and sense[0] == 0x05 and sense[1] in (0x20, 0x24))
+
+    def _scsi_sync_cache_once(
+        self, direct: bool
+    ) -> tuple[bool, tuple[int, int, int] | None, str]:
+        """Issue one SYNCHRONIZE CACHE(10) command and return its status."""
+        sense_len = 32
+        returned = wintypes.DWORD(0)
+
+        if direct:
+            hdr_len = ctypes.sizeof(SCSI_PASS_THROUGH_DIRECT)
+            sense_off = (hdr_len + 3) & ~3
+            packet = ctypes.create_string_buffer(sense_off + sense_len)
+            req = SCSI_PASS_THROUGH_DIRECT.from_buffer(packet)
+            req.Length = hdr_len
+            req.CdbLength = 10
+            req.SenseInfoLength = sense_len
+            req.DataIn = SCSI_IOCTL_DATA_UNSPECIFIED
+            req.DataTransferLength = 0
+            req.TimeOutValue = 60
+            req.DataBuffer = None
+            req.SenseInfoOffset = sense_off
+            req.Cdb[0] = SCSI_SYNCHRONIZE_CACHE10
+            ioctl = IOCTL_SCSI_PASS_THROUGH_DIRECT
+            label = "DIRECT"
+        else:
+            hdr_len = ctypes.sizeof(SCSI_PASS_THROUGH)
+            sense_off = (hdr_len + 3) & ~3
+            packet = ctypes.create_string_buffer(sense_off + sense_len)
+            req = SCSI_PASS_THROUGH.from_buffer(packet)
+            req.Length = hdr_len
+            req.CdbLength = 10
+            req.SenseInfoLength = sense_len
+            req.DataIn = SCSI_IOCTL_DATA_UNSPECIFIED
+            req.DataTransferLength = 0
+            req.TimeOutValue = 60
+            req.DataBufferOffset = 0
+            req.SenseInfoOffset = sense_off
+            req.Cdb[0] = SCSI_SYNCHRONIZE_CACHE10
+            ioctl = IOCTL_SCSI_PASS_THROUGH
+            label = "BUFFERED"
+
+        kernel32.SetLastError(0)
+        ok = kernel32.DeviceIoControl(
+            self._handle,
+            ioctl,
+            packet,
+            len(packet),
+            packet,
+            len(packet),
+            ctypes.byref(returned),
+            None,
+        )
+        err = ctypes.get_last_error()
+        result = (
+            SCSI_PASS_THROUGH_DIRECT.from_buffer(packet)
+            if direct
+            else SCSI_PASS_THROUGH.from_buffer(packet)
+        )
+        status = int(result.ScsiStatus)
+        if ok and status == SCSI_STATUS_GOOD:
+            return True, None, label
+
+        if ok:
+            sense = bytes(packet.raw[sense_off : sense_off + sense_len])
+            parsed = (
+                sense[2] & 0x0F if len(sense) > 2 else 0,
+                sense[12] if len(sense) > 12 else 0,
+                sense[13] if len(sense) > 13 else 0,
+            )
+            detail = (
+                f"{label} status=0x{status:02X} "
+                f"sense=0x{parsed[0]:X}/0x{parsed[1]:02X}/0x{parsed[2]:02X}"
+            )
+            return False, parsed, detail
+
+        return False, None, f"{label} Win32={err}"
+
+    def _scsi_synchronize_cache(self) -> None:
+        """Flush plain WRITE(10) cache when the bridge supports that command.
+
+        Some SD/MMC USB readers legitimately expose WRITE(10) but not
+        SYNCHRONIZE CACHE(10). That capability mismatch must not turn every file
+        operation into EIO. Prefer FUA writes; if both FUA and cache-sync are not
+        implemented by the bridge, use serialized command-completion mode and
+        report the compatibility choice once.
         """
         from ext4lib.debuglog import LOG
 
         if not self._scsi_dirty:
             return
+        if self._scsi_sync_cache_supported is False:
+            # Capability was already learned. Plain WRITE(10) on these simple
+            # removable bridges is serialized by BOT; avoid repeating a command
+            # the device has explicitly rejected as unsupported.
+            self._scsi_dirty = False
+            return
 
-        sense_len = 32
-        errors: list[str] = []
+        results = [
+            self._scsi_sync_cache_once(True),
+            self._scsi_sync_cache_once(False),
+        ]
+        for ok, _sense, label in results:
+            if ok:
+                self._scsi_sync_cache_supported = True
+                self._scsi_dirty = False
+                LOG.debug("SCSI SYNCHRONIZE CACHE(10) %s 성공", label)
+                return
 
-        # First use PASS_THROUGH_DIRECT because the affected card readers accept
-        # WRITE(10) only through this transport.
-        hdr_len = ctypes.sizeof(SCSI_PASS_THROUGH_DIRECT)
-        sense_off = (hdr_len + 3) & ~3
-        packet = ctypes.create_string_buffer(sense_off + sense_len)
-        sptd = SCSI_PASS_THROUGH_DIRECT.from_buffer(packet)
-        sptd.Length = hdr_len
-        sptd.CdbLength = 10
-        sptd.SenseInfoLength = sense_len
-        sptd.DataIn = SCSI_IOCTL_DATA_UNSPECIFIED
-        sptd.DataTransferLength = 0
-        sptd.TimeOutValue = 60
-        sptd.DataBuffer = None
-        sptd.SenseInfoOffset = sense_off
-        sptd.Cdb[0] = SCSI_SYNCHRONIZE_CACHE10
-
-        returned = wintypes.DWORD(0)
-        kernel32.SetLastError(0)
-        ok = kernel32.DeviceIoControl(
-            self._handle,
-            IOCTL_SCSI_PASS_THROUGH_DIRECT,
-            packet,
-            len(packet),
-            packet,
-            len(packet),
-            ctypes.byref(returned),
-            None,
+        unsupported = any(
+            sense is not None
+            and sense[0] == 0x05
+            and sense[1] in (0x20, 0x24)
+            for _ok, sense, _detail in results
         )
-        err = ctypes.get_last_error()
-        result = SCSI_PASS_THROUGH_DIRECT.from_buffer(packet)
-        if ok and int(result.ScsiStatus) == SCSI_STATUS_GOOD:
+        if unsupported:
+            self._scsi_sync_cache_supported = False
             self._scsi_dirty = False
             LOG.info(
-                "SCSI SYNCHRONIZE CACHE(10) DIRECT 성공 — 장치 write cache 영구 반영 완료"
+                "SCSI cache-sync 명령 미지원 장치 — 반복 오류 없이 "
+                "WRITE(10) 호환 모드로 계속합니다."
             )
             return
-        if ok:
-            sense = bytes(packet.raw[sense_off : sense_off + sense_len])
-            sense_key = sense[2] & 0x0F if len(sense) > 2 else 0
-            asc = sense[12] if len(sense) > 12 else 0
-            ascq = sense[13] if len(sense) > 13 else 0
-            errors.append(
-                f"DIRECT status=0x{int(result.ScsiStatus):02X} "
-                f"sense=0x{sense_key:X}/0x{asc:02X}/0x{ascq:02X}"
-            )
-        else:
-            errors.append(f"DIRECT Win32={err}")
 
-        # Some bridges accept no-data commands only through buffered passthrough.
-        hdr_len = ctypes.sizeof(SCSI_PASS_THROUGH)
-        sense_off = (hdr_len + 3) & ~3
-        packet = ctypes.create_string_buffer(sense_off + sense_len)
-        spt = SCSI_PASS_THROUGH.from_buffer(packet)
-        spt.Length = hdr_len
-        spt.CdbLength = 10
-        spt.SenseInfoLength = sense_len
-        spt.DataIn = SCSI_IOCTL_DATA_UNSPECIFIED
-        spt.DataTransferLength = 0
-        spt.TimeOutValue = 60
-        spt.DataBufferOffset = 0
-        spt.SenseInfoOffset = sense_off
-        spt.Cdb[0] = SCSI_SYNCHRONIZE_CACHE10
+        details = " | ".join(detail for _ok, _sense, detail in results)
+        raise IoError("SCSI SYNCHRONIZE CACHE(10) 실패: " + details, winerr=31)
 
-        returned = wintypes.DWORD(0)
-        kernel32.SetLastError(0)
-        ok = kernel32.DeviceIoControl(
-            self._handle,
-            IOCTL_SCSI_PASS_THROUGH,
-            packet,
-            len(packet),
-            packet,
-            len(packet),
-            ctypes.byref(returned),
-            None,
-        )
-        err = ctypes.get_last_error()
-        result = SCSI_PASS_THROUGH.from_buffer(packet)
-        if ok and int(result.ScsiStatus) == SCSI_STATUS_GOOD:
-            self._scsi_dirty = False
-            LOG.info(
-                "SCSI SYNCHRONIZE CACHE(10) 성공 — 장치 write cache 영구 반영 완료"
-            )
-            return
-        if ok:
-            sense = bytes(packet.raw[sense_off : sense_off + sense_len])
-            sense_key = sense[2] & 0x0F if len(sense) > 2 else 0
-            asc = sense[12] if len(sense) > 12 else 0
-            ascq = sense[13] if len(sense) > 13 else 0
-            errors.append(
-                f"BUFFERED status=0x{int(result.ScsiStatus):02X} "
-                f"sense=0x{sense_key:X}/0x{asc:02X}/0x{ascq:02X}"
-            )
-        else:
-            errors.append(f"BUFFERED Win32={err}")
-
-        raise IoError(
-            "SCSI SYNCHRONIZE CACHE(10) 실패: " + " | ".join(errors),
-            winerr=err or 31,
-        )
-
-    def _scsi_write10_direct(self, absolute_offset: int, data: bytes) -> None:
+    def _scsi_write10_direct(
+        self, absolute_offset: int, data: bytes, *, fua: bool = True
+    ) -> None:
         """Send SCSI WRITE(10) with IOCTL_SCSI_PASS_THROUGH_DIRECT."""
         from ext4lib.debuglog import LOG
 
@@ -2412,8 +2444,6 @@ class WindowsPhysicalDevice(BlockDevice):
 
         sense_len = 32
         hdr_len = ctypes.sizeof(SCSI_PASS_THROUGH_DIRECT)
-        # Keep request+sense in one stable buffer and payload in a separate
-        # aligned Python-owned buffer, as required by *_DIRECT.
         sense_off = (hdr_len + 3) & ~3
         packet = ctypes.create_string_buffer(sense_off + sense_len)
         payload = ctypes.create_string_buffer(data, len(data))
@@ -2427,6 +2457,7 @@ class WindowsPhysicalDevice(BlockDevice):
         sptd.DataBuffer = ctypes.addressof(payload)
         sptd.SenseInfoOffset = sense_off
         sptd.Cdb[0] = SCSI_WRITE10
+        sptd.Cdb[1] = SCSI_WRITE_FUA if fua else 0
         sptd.Cdb[2] = (lba >> 24) & 0xFF
         sptd.Cdb[3] = (lba >> 16) & 0xFF
         sptd.Cdb[4] = (lba >> 8) & 0xFF
@@ -2453,17 +2484,22 @@ class WindowsPhysicalDevice(BlockDevice):
                 winerr=err,
             )
 
-        sptd2 = SCSI_PASS_THROUGH_DIRECT.from_buffer(packet)
-        if int(sptd2.ScsiStatus) != SCSI_STATUS_GOOD:
+        result = SCSI_PASS_THROUGH_DIRECT.from_buffer(packet)
+        if int(result.ScsiStatus) != SCSI_STATUS_GOOD:
             sense = bytes(packet.raw[sense_off : sense_off + sense_len])
-            sense_key = sense[2] & 0x0F if len(sense) > 2 else 0
-            asc = sense[12] if len(sense) > 12 else 0
-            ascq = sense[13] if len(sense) > 13 else 0
-            raise IoError(
+            parsed = (
+                sense[2] & 0x0F if len(sense) > 2 else 0,
+                sense[12] if len(sense) > 12 else 0,
+                sense[13] if len(sense) > 13 else 0,
+            )
+            exc = IoError(
                 "SCSI WRITE(10) DIRECT 장치 오류 "
-                f"status=0x{int(sptd2.ScsiStatus):02X} sense=0x{sense_key:X}/0x{asc:02X}/0x{ascq:02X}",
+                f"status=0x{int(result.ScsiStatus):02X} "
+                f"sense=0x{parsed[0]:X}/0x{parsed[1]:02X}/0x{parsed[2]:02X}",
                 winerr=5,
             )
+            exc.scsi_sense = parsed
+            raise exc
 
         verify = self._read_at(absolute_offset, len(data))
         if verify != data:
@@ -2471,27 +2507,23 @@ class WindowsPhysicalDevice(BlockDevice):
                 f"SCSI WRITE(10) DIRECT 검증 실패 offset={absolute_offset} len={len(data)}",
                 winerr=23,
             )
-        self._scsi_dirty = True
-        LOG.warning(
-            "WriteFile Win32 5 우회: SCSI WRITE(10) DIRECT 성공 offset=%s lba=%s blocks=%s",
+        if fua:
+            self._scsi_fua_supported = True
+        else:
+            self._scsi_dirty = True
+        LOG.debug(
+            "SCSI WRITE(10) DIRECT%s 성공 offset=%s lba=%s blocks=%s",
+            "+FUA" if fua else "",
             absolute_offset,
             lba,
             blocks,
         )
 
-    def _scsi_write10(self, absolute_offset: int, data: bytes) -> None:
-        """Fallback raw write through the disk class driver.
-
-        Try DIRECT first because USB/card-reader class drivers commonly reject
-        buffered pass-through data-out while accepting the direct form.
-        """
+    def _scsi_write10_buffered(
+        self, absolute_offset: int, data: bytes, *, fua: bool = True
+    ) -> None:
+        """Send SCSI WRITE(10) with buffered IOCTL_SCSI_PASS_THROUGH."""
         from ext4lib.debuglog import LOG
-
-        try:
-            self._scsi_write10_direct(absolute_offset, data)
-            return
-        except IoError as direct_exc:
-            LOG.warning("SCSI WRITE(10) DIRECT 경로 실패: %s", direct_exc)
 
         ss = int(self.sector_size or 512)
         if absolute_offset < 0 or absolute_offset % ss or len(data) % ss:
@@ -2523,6 +2555,7 @@ class WindowsPhysicalDevice(BlockDevice):
         spt.DataBufferOffset = data_off
         spt.SenseInfoOffset = sense_off
         spt.Cdb[0] = SCSI_WRITE10
+        spt.Cdb[1] = SCSI_WRITE_FUA if fua else 0
         spt.Cdb[2] = (lba >> 24) & 0xFF
         spt.Cdb[3] = (lba >> 16) & 0xFF
         spt.Cdb[4] = (lba >> 8) & 0xFF
@@ -2550,17 +2583,22 @@ class WindowsPhysicalDevice(BlockDevice):
                 winerr=err,
             )
 
-        spt2 = SCSI_PASS_THROUGH.from_buffer(packet)
-        if int(spt2.ScsiStatus) != SCSI_STATUS_GOOD:
+        result = SCSI_PASS_THROUGH.from_buffer(packet)
+        if int(result.ScsiStatus) != SCSI_STATUS_GOOD:
             sense = bytes(packet.raw[sense_off : sense_off + sense_len])
-            sense_key = sense[2] & 0x0F if len(sense) > 2 else 0
-            asc = sense[12] if len(sense) > 12 else 0
-            ascq = sense[13] if len(sense) > 13 else 0
-            raise IoError(
+            parsed = (
+                sense[2] & 0x0F if len(sense) > 2 else 0,
+                sense[12] if len(sense) > 12 else 0,
+                sense[13] if len(sense) > 13 else 0,
+            )
+            exc = IoError(
                 "SCSI WRITE(10) 장치 오류 "
-                f"status=0x{int(spt2.ScsiStatus):02X} sense=0x{sense_key:X}/0x{asc:02X}/0x{ascq:02X}",
+                f"status=0x{int(result.ScsiStatus):02X} "
+                f"sense=0x{parsed[0]:X}/0x{parsed[1]:02X}/0x{parsed[2]:02X}",
                 winerr=5,
             )
+            exc.scsi_sense = parsed
+            raise exc
 
         verify = self._read_at(absolute_offset, len(data))
         if verify != data:
@@ -2568,13 +2606,67 @@ class WindowsPhysicalDevice(BlockDevice):
                 f"SCSI WRITE(10) 검증 실패 offset={absolute_offset} len={len(data)}",
                 winerr=23,
             )
-        self._scsi_dirty = True
-        LOG.warning(
-            "WriteFile Win32 5 우회: SCSI WRITE(10) 성공 offset=%s lba=%s blocks=%s",
+        if fua:
+            self._scsi_fua_supported = True
+        else:
+            self._scsi_dirty = True
+        LOG.debug(
+            "SCSI WRITE(10)%s 성공 offset=%s lba=%s blocks=%s",
+            "+FUA" if fua else "",
             absolute_offset,
             lba,
             blocks,
         )
+
+    def _scsi_write10(self, absolute_offset: int, data: bytes) -> None:
+        """Adaptive SCSI write for USB/SD bridges.
+
+        Prefer FUA so successful command completion is itself the durability
+        barrier. If the bridge rejects only the FUA field, remember that once
+        and retry plain WRITE(10), using SYNCHRONIZE CACHE when available.
+        """
+        from ext4lib.debuglog import LOG
+
+        use_fua = self._scsi_fua_supported is not False
+        direct_error: IoError | None = None
+
+        try:
+            self._scsi_write10_direct(absolute_offset, data, fua=use_fua)
+            return
+        except IoError as exc:
+            if use_fua and self._scsi_field_unsupported(exc):
+                self._scsi_fua_supported = False
+                LOG.info(
+                    "이 카드리더는 WRITE(10) FUA를 지원하지 않습니다. "
+                    "일반 WRITE(10) 호환 모드로 자동 전환합니다."
+                )
+                try:
+                    self._scsi_write10_direct(absolute_offset, data, fua=False)
+                    return
+                except IoError as plain_exc:
+                    direct_error = plain_exc
+            else:
+                direct_error = exc
+
+        LOG.debug("SCSI WRITE(10) DIRECT 경로 실패: %s", direct_error)
+
+        use_fua = self._scsi_fua_supported is not False
+        try:
+            self._scsi_write10_buffered(absolute_offset, data, fua=use_fua)
+            return
+        except IoError as exc:
+            if use_fua and self._scsi_field_unsupported(exc):
+                self._scsi_fua_supported = False
+                LOG.info(
+                    "버퍼드 SCSI에서도 FUA 미지원 확인 — 일반 WRITE(10)으로 전환합니다."
+                )
+                self._scsi_write10_buffered(absolute_offset, data, fua=False)
+                return
+            raise IoError(
+                "SCSI WRITE(10) 경로 실패: "
+                f"DIRECT={direct_error} | BUFFERED={exc}",
+                winerr=getattr(exc, "winerr", 5) or 5,
+            ) from exc
 
     def _write_locked_partition_device(self, offset: int, data: bytes) -> None:
         """Write via the partition device after the real matching volume is locked.
@@ -3010,11 +3102,18 @@ class WindowsPhysicalDevice(BlockDevice):
 
         absolute = self._partition_offset + offset
 
+        # Do not rediscover the same failing Windows routes on every 512-byte
+        # metadata write. Once this bridge has proven that SCSI passthrough is
+        # the working route, keep using it for the lifetime of this device.
+        if self._fallback_write_route == "scsi":
+            self._scsi_write10(absolute, data)
+            return
+
         try:
             self._write_locked_partition_device(offset, data)
             return
         except IoError as part_exc:
-            LOG.warning(
+            LOG.info(
                 "잠금된 파티션 장치 쓰기도 실패: %s; PhysicalDrive write 시도",
                 part_exc,
             )
@@ -3029,7 +3128,7 @@ class WindowsPhysicalDevice(BlockDevice):
             )
             return
         except IoError as phys_exc:
-            LOG.warning(
+            LOG.info(
                 "잠금 후 PhysicalDrive Win32 쓰기 실패: %s; Native NT write 시도",
                 phys_exc,
             )
@@ -3038,7 +3137,7 @@ class WindowsPhysicalDevice(BlockDevice):
             self._nt_write_at(absolute, data)
             return
         except IoError as nt_exc:
-            LOG.warning(
+            LOG.info(
                 "Native NT write도 실패: %s; NO_BUFFERING raw write 시도",
                 nt_exc,
             )
@@ -3050,13 +3149,18 @@ class WindowsPhysicalDevice(BlockDevice):
             self._write_unbuffered_physical(absolute, data)
             return
         except IoError as direct_exc:
-            LOG.warning(
+            LOG.info(
                 "NO_BUFFERING raw write도 실패: %s; SCSI fallback 시도",
                 direct_exc,
             )
 
         try:
             self._scsi_write10(absolute, data)
+            self._fallback_write_route = "scsi"
+            LOG.info(
+                "USB/SD 쓰기 경로 고정: SCSI WRITE(10)%s",
+                "+FUA" if self._scsi_fua_supported else " compatibility",
+            )
             return
         except IoError as scsi_exc:
             blockers = list(self._write_blockers)
