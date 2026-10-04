@@ -988,11 +988,13 @@ class App(tk.Tk):
                         )
                         if repair_stats.repaired:
                             LOG.warning(
-                                "Windows EXT4 ERROR_FS 자동 복구 성공 groups=%s bitmaps=%s root_entries=%s historical_errors=%s",
+                                "Windows EXT4 ERROR_FS 자동 복구 성공 groups=%s bitmaps=%s "
+                                "root_entries=%s historical_errors=%s bitmap_checksum_repairs=%s",
                                 repair_stats.groups_checked,
                                 repair_stats.bitmaps_checked,
                                 repair_stats.root_entries_checked,
                                 repair_stats.error_count,
+                                repair_stats.bitmap_checksums_repaired,
                             )
                             self.set_status(self._t("error_repair_done"))
                     except Exception as exc:

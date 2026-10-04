@@ -141,6 +141,9 @@ jobs:
           truncate -s 256M repair.img
           mkfs.ext4 -F -q -b 4096 -O 64bit,metadata_csum,^orphan_file,^fast_commit repair.img
 
+          truncate -s 256M legacy-bitmap.img
+          mkfs.ext4 -F -q -b 4096 -O 64bit,metadata_csum,^orphan_file,^fast_commit legacy-bitmap.img
+
           # Modern ext4 layout used by Steam Deck-class Linux systems.
           truncate -s 256M orphan.img
           mkfs.ext4 -F -q -b 4096 -O 64bit,metadata_csum,orphan_file,^fast_commit orphan.img
@@ -174,6 +177,7 @@ jobs:
           python -m tests.integration_ext4_image dirty.img --mode dirty-marker
           python -m tests.integration_ext4_image journal.img --mode journal-replay
           python -m tests.integration_ext4_image repair.img --mode error-repair
+          python -m tests.integration_ext4_image legacy-bitmap.img --mode legacy-bitmap-repair
           python -m tests.integration_ext4_image orphan.img --mode orphan-repair
           python -m tests.integration_ext4_image htree.img --mode htree
           python -m tests.integration_ext4_image gpt.img --mode gpt-portable
@@ -184,6 +188,10 @@ jobs:
           sudo e2fsck -fn journal.img
           sudo e2fsck -fn repair.img
           debugfs -R "stat /windows-repaired.bin" repair.img
+
+          # Recovered media that exactly reproduced the old Ext4Reader
+          # bitmap-checksum placement bug must be clean to Linux/e2fsck.
+          sudo e2fsck -fn legacy-bitmap.img
 
           sudo e2fsck -fn orphan.img
           debugfs -R "stat /orphan-keep.bin" orphan.img

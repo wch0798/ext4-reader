@@ -26,6 +26,7 @@ class SuperblockLayoutTests(unittest.TestCase):
         raw[0xEC:0xFC] = bytes.fromhex("00112233445566778899aabbccddeeff")
         raw[0xFC] = C.DX_HASH_HALF_MD4
         struct.pack_into("<H", raw, 0xFE, 64)
+        struct.pack_into("<I", raw, 0x100, 0xA1B2C3D4)
         struct.pack_into("<I", raw, 0x280, 1234)
         return raw
 
@@ -37,6 +38,8 @@ class SuperblockLayoutTests(unittest.TestCase):
             bytes.fromhex("00112233445566778899aabbccddeeff"),
         )
         self.assertEqual(sb.orphan_file_inum, 1234)
+        self.assertEqual(sb.def_hash_version, C.DX_HASH_HALF_MD4)
+        self.assertEqual(sb.default_mount_opts, 0xA1B2C3D4)
 
 
 if __name__ == "__main__":

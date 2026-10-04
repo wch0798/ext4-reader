@@ -1,4 +1,4 @@
 """EXT4 Reader library package."""
 
-__version__ = "1.0.41"
+__version__ = "1.0.42"
 __app_name__ = "EXT4 Reader"

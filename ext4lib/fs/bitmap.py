@@ -153,23 +153,94 @@ def apply_bitmap_csum(vol, gd: GroupDesc, which: str, bitmap: Bitmap) -> None:
 
 
 
-def bitmap_checksum_valid(vol, gd: GroupDesc, which: str, data: bytes) -> bool:
-    if not vol.sb.has_metadata_csum:
-        return True
+def bitmap_checksum_values(
+    vol, gd: GroupDesc, which: str, data: bytes
+) -> tuple[int, int]:
+    """Return (stored, calculated) using the Linux/e2fsprogs layout."""
     if which == "block":
         csum_len = vol.sb.blocks_per_group // 8
-        low_off, high_off = 0x18, 0x38
+        low_off, high_off, hi_end = 0x18, 0x38, 0x3A
     elif which == "inode":
         csum_len = vol.sb.inodes_per_group // 8
-        low_off, high_off = 0x1A, 0x3A
+        low_off, high_off, hi_end = 0x1A, 0x3A, 0x3C
     else:
         raise ValueError("which must be block or inode")
     crc = crc32c(vol.sb.csum_seed(), data[:csum_len])
     stored = int.from_bytes(gd.raw[low_off:low_off + 2], "little")
-    if vol.sb.desc_size >= 64:
+    if vol.sb.desc_size >= hi_end:
         stored |= int.from_bytes(gd.raw[high_off:high_off + 2], "little") << 16
-        return stored == crc
-    return stored == (crc & 0xFFFF)
+        return stored, crc
+    return stored, crc & 0xFFFF
+
+
+def bitmap_checksum_valid(vol, gd: GroupDesc, which: str, data: bytes) -> bool:
+    if not vol.sb.has_metadata_csum:
+        return True
+    stored, calculated = bitmap_checksum_values(vol, gd, which, data)
+    return stored == calculated
+
+
+def legacy_bitmap_checksum_signature(
+    vol, gd: GroupDesc, which: str, data: bytes
+) -> bool:
+    """Detect the exact checksum-layout bug written by older Ext4Reader builds.
+
+    Older builds put the high 16 bits inside bg_exclude_bitmap_hi:
+      block: 0x34 instead of 0x38
+      inode: 0x36 instead of 0x3A
+    They also checksummed a full filesystem block for inode bitmaps.
+
+    Requiring both the old low half and misplaced high half to match the
+    calculated legacy CRC gives a 32-bit fingerprint.  We therefore repair
+    only media produced by this known bug, not arbitrary checksum failures.
+    """
+    if not vol.sb.has_metadata_csum or vol.sb.desc_size < 64:
+        return False
+    legacy_crc = crc32c(
+        vol.sb.csum_seed(),
+        data[: vol.sb.block_size],
+    )
+    if which == "block":
+        low_off, misplaced_hi_off = 0x18, 0x34
+    elif which == "inode":
+        low_off, misplaced_hi_off = 0x1A, 0x36
+    else:
+        raise ValueError("which must be block or inode")
+    low = int.from_bytes(gd.raw[low_off:low_off + 2], "little")
+    misplaced_hi = int.from_bytes(
+        gd.raw[misplaced_hi_off:misplaced_hi_off + 2], "little"
+    )
+    return (
+        low == (legacy_crc & 0xFFFF)
+        and misplaced_hi == ((legacy_crc >> 16) & 0xFFFF)
+    )
+
+
+def apply_legacy_bitmap_checksum_repair(
+    vol, gd: GroupDesc, which: str, data: bytes
+) -> None:
+    """Repair only the known pre-JBD2 Ext4Reader bitmap checksum layout bug."""
+    if not legacy_bitmap_checksum_signature(vol, gd, which, data):
+        raise ValueError("known legacy bitmap checksum signature not present")
+    if which == "block":
+        gd.raw[0x34:0x36] = b"\x00\x00"
+        nbits = vol.sb.blocks_per_group
+    elif which == "inode":
+        gd.raw[0x36:0x38] = b"\x00\x00"
+        nbits = vol.sb.inodes_per_group
+    else:
+        raise ValueError("which must be block or inode")
+    apply_bitmap_csum(vol, gd, which, Bitmap(bytearray(data), nbits))
+
+
+def bitmap_padding_is_set(data: bytes, used_bits: int, total_bits: int) -> bool:
+    """Linux requires bitmap padding bits outside the real group to be set."""
+    if used_bits < 0 or total_bits < used_bits or total_bits > len(data) * 8:
+        return False
+    for bit in range(used_bits, total_bits):
+        if not (data[bit >> 3] & (1 << (bit & 7))):
+            return False
+    return True
 
 
 def bitmap_free_count(data: bytes, nbits: int) -> int:

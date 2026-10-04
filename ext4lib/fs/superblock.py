@@ -215,8 +215,8 @@ def parse_superblock(data: bytes) -> Superblock:
         desc_size=desc_size,
         # 0xE8 is s_last_orphan. HTREE s_hash_seed starts at 0xEC.
         hash_seed=bytes(data[0xEC:0xFC]),
-        def_hash_version=data[0xF8],
-        default_mount_opts=_u32(data, 0xFC),
+        def_hash_version=data[0xFC],
+        default_mount_opts=_u32(data, 0x100),
         first_meta_bg=_u32(data, 0x104),
         mkfs_time=_u32(data, 0x108),
         journal_inum=_u32(data, 0xE0),
