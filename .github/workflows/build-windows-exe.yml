@@ -128,8 +128,8 @@ jobs:
 
       - name: Exercise EXT4 writer
         run: |
-          python tests/integration_ext4_image.py clean.img --mode clean
-          python tests/integration_ext4_image.py dirty.img --mode dirty-marker
+          python -m tests.integration_ext4_image clean.img --mode clean
+          python -m tests.integration_ext4_image dirty.img --mode dirty-marker
 
       - name: Validate clean image with e2fsck
         run: |
