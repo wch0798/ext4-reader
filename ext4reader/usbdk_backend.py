@@ -621,7 +621,12 @@ class UsbDkBotBackend:
 
         self._redirect = self._api.start_redirect(_copy_device_id(info.ID))
         try:
+            # Redirect detaches this reader from the Windows storage stack.
+            # Real card readers can need a few seconds before BOT/SCSI commands
+            # are accepted again, so wait for TEST UNIT READY instead of
+            # assuming one fixed 250 ms sleep is enough.
             time.sleep(0.25)
+            self.wait_until_ready()
             inquiry = self.inquiry()
             self.capacity = self.read_capacity()
             self.sector_size = self.capacity.block_size
@@ -794,6 +799,29 @@ class UsbDkBotBackend:
     def request_sense(self) -> bytes:
         cdb = bytes([SCSI_REQUEST_SENSE, 0, 0, 0, 18, 0])
         return self._bot(cdb, data_in_len=18, sense_on_error=False)
+
+    def test_unit_ready(self) -> None:
+        cdb = bytes([SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0])
+        self._bot(cdb)
+
+    def wait_until_ready(self, timeout: float = 5.0) -> None:
+        """Wait for the redirected USB mass-storage device to become BOT/SCSI ready."""
+        deadline = time.monotonic() + max(0.5, float(timeout))
+        last: UsbDkError | None = None
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                self.test_unit_ready()
+                return
+            except UsbDkError as exc:
+                last = exc
+                if time.monotonic() >= deadline:
+                    raise UsbDkError(
+                        f"UsbDk redirect 후 장치 준비 시간 초과 attempts={attempts}: {exc}",
+                        winerr=getattr(exc, "winerr", 31) or 31,
+                    ) from exc
+                time.sleep(0.20)
 
     def inquiry(self) -> bytes:
         cdb = bytes([SCSI_INQUIRY, 0, 0, 0, 36, 0])
