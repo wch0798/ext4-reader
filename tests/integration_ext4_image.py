@@ -47,6 +47,9 @@ def clean_roundtrip(path: str) -> None:
     root = lookup_path(vol, "/")
 
     node = create_empty_file(vol, root, "alpha.bin")
+    assert node.uid == C.DEFAULT_LINUX_UID == 1000
+    assert node.gid == C.DEFAULT_LINUX_GID == 1000
+    assert (node.mode & 0o777) == C.DEFAULT_LINUX_FILE_MODE == 0o755
     payload = (bytes(range(256)) * 8193) + b"EXT4-READER-END"
     written = write_range(vol, node, 0, payload, flush=True)
     assert written == len(payload)
@@ -66,7 +69,12 @@ def clean_roundtrip(path: str) -> None:
 
     root = lookup_path(vol, "/")
     sub = mkdir(vol, root, "subdir")
+    assert sub.uid == C.DEFAULT_LINUX_UID == 1000
+    assert sub.gid == C.DEFAULT_LINUX_GID == 1000
+    assert (sub.mode & 0o777) == C.DEFAULT_LINUX_DIR_MODE == 0o755
     temp = create_empty_file(vol, sub, "temp.txt")
+    assert temp.uid == 1000 and temp.gid == 1000
+    assert (temp.mode & 0o777) == 0o755
     write_range(vol, temp, 0, b"temporary-data" * 4096, flush=True)
     sub = lookup_path(vol, "/subdir")
     unlink_checked(vol, sub, "temp.txt")
@@ -80,6 +88,8 @@ def clean_roundtrip(path: str) -> None:
     check = open_volume(path, False)
     try:
         node = lookup_path(check, "/renamed.bin")
+        assert node.uid == 1000 and node.gid == 1000
+        assert (node.mode & 0o777) == 0o755
         assert node.size == shrink
         assert read_range(check, node, 0, shrink) == payload[:shrink]
         assert check.sb.state & C.EXT4_VALID_FS
