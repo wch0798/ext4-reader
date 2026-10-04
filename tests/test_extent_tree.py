@@ -268,7 +268,11 @@ def test_journal_recovery_blocks_writes():
 def test_stat_ex_slot():
     import ctypes
 
-    import fuse
+    try:
+        import fuse
+    except OSError as exc:
+        print("stat ex slot skipped (WinFsp/libfuse unavailable):", exc)
+        return
 
     from fuse_mount import _install_winfsp_stat_ex
 
