@@ -302,6 +302,36 @@ class Ext4FuseOps:
             self._path_ino[path] = node.ino
         return node
 
+    def _apply_linux_defaults(self, node, *, directory: bool) -> None:
+        """Normalize an existing Windows-touched inode for Steam Deck use."""
+        uid = int(getattr(self.vol, "default_uid", 1000))
+        gid = int(getattr(self.vol, "default_gid", 1000))
+        perm = int(
+            getattr(
+                self.vol,
+                "default_dir_mode" if directory else "default_file_mode",
+                0o755,
+            )
+        ) & 0o777
+        changed = False
+        if node.uid != uid or node.gid != gid:
+            node.set_owner(uid, gid)
+            changed = True
+        desired_mode = stat.S_IFMT(node.mode) | perm
+        if node.mode != desired_mode:
+            node.set_mode(desired_mode)
+            changed = True
+        if changed:
+            node.set_times()
+            self.vol.write_inode(node)
+            LOG.info(
+                "Linux 권한 정상화 path inode=%s uid=%s gid=%s mode=%04o",
+                node.ino,
+                uid,
+                gid,
+                perm,
+            )
+
     def _visible_size(self, node) -> int:
         size = node.size
         wb = self._wb
@@ -590,7 +620,7 @@ class Ext4FuseOps:
         except FileNotFoundError:
             if not creat:
                 raise
-            self._create(path, 0o644)
+            self._create(path, None)
             return 0
         if excl and creat:
             raise self._err(errno.EEXIST)
@@ -634,11 +664,15 @@ class Ext4FuseOps:
         except FileNotFoundError:
             self._drop_paths()
             parent, name = lookup_parent(self.vol, path)
-            create_empty_file(self.vol, parent, name, mode & 0o777)
+            # Windows has no POSIX execute-bit semantics. Use the volume's
+            # Linux/Steam Deck default mode rather than letting WinFsp's
+            # synthetic 0644/0666 mode make native binaries non-executable.
+            create_empty_file(self.vol, parent, name, None)
             return 0
         if node.is_dir:
             raise self._err(errno.EISDIR)
         self._discard_wb(node.ino)
+        self._apply_linux_defaults(node, directory=False)
         self._drop_paths()
         set_file_size(self.vol, self.vol.read_inode(node.ino), 0)
         return 0
@@ -651,6 +685,7 @@ class Ext4FuseOps:
         try:
             node = lookup_path(self.vol, path)
             if node.is_dir:
+                self._apply_linux_defaults(node, directory=True)
                 return 0
             raise self._err(errno.EEXIST)
         except FileNotFoundError:

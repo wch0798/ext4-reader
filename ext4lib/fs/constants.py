@@ -20,6 +20,13 @@ EXT4_JOURNAL_INO = 8
 
 EXT4_NAME_LEN = 255
 
+# Steam Deck default desktop user ("deck"). EXT4 stores numeric ownership,
+# not account names, so newly created Windows-side content defaults to 1000:1000.
+DEFAULT_LINUX_UID = 1000
+DEFAULT_LINUX_GID = 1000
+DEFAULT_LINUX_FILE_MODE = 0o755
+DEFAULT_LINUX_DIR_MODE = 0o755
+
 EXT4_FT_UNKNOWN = 0
 EXT4_FT_REG_FILE = 1
 EXT4_FT_DIR = 2

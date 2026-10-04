@@ -62,6 +62,13 @@ class Ext4Volume:
         self.owns_device = owns_device
         self.part_offset = offset
         self.part_size = size or max(0, dev.size() - offset)
+        # Defaults for content created from Windows. These are instance fields
+        # so a future GUI preference can override them without changing writer
+        # APIs or on-disk parsing.
+        self.default_uid = C.DEFAULT_LINUX_UID
+        self.default_gid = C.DEFAULT_LINUX_GID
+        self.default_file_mode = C.DEFAULT_LINUX_FILE_MODE
+        self.default_dir_mode = C.DEFAULT_LINUX_DIR_MODE
         raw = self.dev.read(offset + 1024, 1024)
         self.sb = parse_superblock(raw)
         LOG.info(
@@ -83,6 +90,13 @@ class Ext4Volume:
         )
         if self.sb.feature_incompat & C.EXT4_FEATURE_INCOMPAT_CASEFOLD:
             LOG.info("casefold 볼륨 — 파일 이름 대소문자는 구분하지 않습니다. 쓰기는 가능합니다.")
+        LOG.info(
+            "Linux 신규 inode 기본값 uid=%s gid=%s file_mode=%04o dir_mode=%04o",
+            self.default_uid,
+            self.default_gid,
+            self.default_file_mode,
+            self.default_dir_mode,
+        )
         self.dirty_groups: set[int] = set()
         self.dirty_super = False
         self._data_dirty = False
