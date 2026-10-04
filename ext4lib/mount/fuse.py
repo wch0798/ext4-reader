@@ -351,7 +351,7 @@ class Ext4FuseOps:
             self._ensure_write_healthy()
             try:
                 self._wb_flush()
-                if self.vol._write_session_active:
+                if getattr(self.vol, "_write_session_active", False):
                     self.vol.finish_write_session()
                 else:
                     self.vol.commit_metadata(sync=True)
