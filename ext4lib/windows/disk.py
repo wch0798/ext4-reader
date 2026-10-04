@@ -2279,10 +2279,10 @@ class WindowsPhysicalDevice(BlockDevice):
     def _scsi_synchronize_cache(self) -> None:
         """Force prior SCSI passthrough writes onto stable media.
 
-        A successful WRITE(10) followed by immediate read-back only proves that
-        the device accepted the data; many USB/SD bridges can satisfy that read
-        from their own volatile cache.  SYNCHRONIZE CACHE is therefore required
-        before EXT4/JBD2 is allowed to report a durable clean state.
+        Immediate read-back after WRITE(10) may be satisfied from a USB/SD
+        bridge cache. Try the same DIRECT transport that this reader accepts
+        for writes, then fall back to buffered pass-through. Failure is fatal:
+        EXT4/JBD2 must not report a clean durable state without this barrier.
         """
         from ext4lib.debuglog import LOG
 
@@ -2290,6 +2290,57 @@ class WindowsPhysicalDevice(BlockDevice):
             return
 
         sense_len = 32
+        errors: list[str] = []
+
+        # First use PASS_THROUGH_DIRECT because the affected card readers accept
+        # WRITE(10) only through this transport.
+        hdr_len = ctypes.sizeof(SCSI_PASS_THROUGH_DIRECT)
+        sense_off = (hdr_len + 3) & ~3
+        packet = ctypes.create_string_buffer(sense_off + sense_len)
+        sptd = SCSI_PASS_THROUGH_DIRECT.from_buffer(packet)
+        sptd.Length = hdr_len
+        sptd.CdbLength = 10
+        sptd.SenseInfoLength = sense_len
+        sptd.DataIn = SCSI_IOCTL_DATA_UNSPECIFIED
+        sptd.DataTransferLength = 0
+        sptd.TimeOutValue = 60
+        sptd.DataBuffer = None
+        sptd.SenseInfoOffset = sense_off
+        sptd.Cdb[0] = SCSI_SYNCHRONIZE_CACHE10
+
+        returned = wintypes.DWORD(0)
+        kernel32.SetLastError(0)
+        ok = kernel32.DeviceIoControl(
+            self._handle,
+            IOCTL_SCSI_PASS_THROUGH_DIRECT,
+            packet,
+            len(packet),
+            packet,
+            len(packet),
+            ctypes.byref(returned),
+            None,
+        )
+        err = ctypes.get_last_error()
+        result = SCSI_PASS_THROUGH_DIRECT.from_buffer(packet)
+        if ok and int(result.ScsiStatus) == SCSI_STATUS_GOOD:
+            self._scsi_dirty = False
+            LOG.info(
+                "SCSI SYNCHRONIZE CACHE(10) DIRECT 성공 — 장치 write cache 영구 반영 완료"
+            )
+            return
+        if ok:
+            sense = bytes(packet.raw[sense_off : sense_off + sense_len])
+            sense_key = sense[2] & 0x0F if len(sense) > 2 else 0
+            asc = sense[12] if len(sense) > 12 else 0
+            ascq = sense[13] if len(sense) > 13 else 0
+            errors.append(
+                f"DIRECT status=0x{int(result.ScsiStatus):02X} "
+                f"sense=0x{sense_key:X}/0x{asc:02X}/0x{ascq:02X}"
+            )
+        else:
+            errors.append(f"DIRECT Win32={err}")
+
+        # Some bridges accept no-data commands only through buffered passthrough.
         hdr_len = ctypes.sizeof(SCSI_PASS_THROUGH)
         sense_off = (hdr_len + 3) & ~3
         packet = ctypes.create_string_buffer(sense_off + sense_len)
@@ -2317,27 +2368,29 @@ class WindowsPhysicalDevice(BlockDevice):
             None,
         )
         err = ctypes.get_last_error()
-        if not ok:
-            raise IoError(
-                f"SCSI SYNCHRONIZE CACHE(10) 실패 (Win32 {err})",
-                winerr=err or 31,
-            )
-
         result = SCSI_PASS_THROUGH.from_buffer(packet)
-        if int(result.ScsiStatus) != SCSI_STATUS_GOOD:
+        if ok and int(result.ScsiStatus) == SCSI_STATUS_GOOD:
+            self._scsi_dirty = False
+            LOG.info(
+                "SCSI SYNCHRONIZE CACHE(10) 성공 — 장치 write cache 영구 반영 완료"
+            )
+            return
+        if ok:
             sense = bytes(packet.raw[sense_off : sense_off + sense_len])
             sense_key = sense[2] & 0x0F if len(sense) > 2 else 0
             asc = sense[12] if len(sense) > 12 else 0
             ascq = sense[13] if len(sense) > 13 else 0
-            raise IoError(
-                "SCSI SYNCHRONIZE CACHE(10) 장치 오류 "
-                f"status=0x{int(result.ScsiStatus):02X} "
-                f"sense=0x{sense_key:X}/0x{asc:02X}/0x{ascq:02X}",
-                winerr=31,
+            errors.append(
+                f"BUFFERED status=0x{int(result.ScsiStatus):02X} "
+                f"sense=0x{sense_key:X}/0x{asc:02X}/0x{ascq:02X}"
             )
+        else:
+            errors.append(f"BUFFERED Win32={err}")
 
-        self._scsi_dirty = False
-        LOG.info("SCSI SYNCHRONIZE CACHE(10) 성공 — 장치 write cache 영구 반영 완료")
+        raise IoError(
+            "SCSI SYNCHRONIZE CACHE(10) 실패: " + " | ".join(errors),
+            winerr=err or 31,
+        )
 
     def _scsi_write10_direct(self, absolute_offset: int, data: bytes) -> None:
         """Send SCSI WRITE(10) with IOCTL_SCSI_PASS_THROUGH_DIRECT."""
