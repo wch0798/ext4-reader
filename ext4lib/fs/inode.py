@@ -152,6 +152,30 @@ def apply_inode_checksum(sb: Superblock, inode: Inode) -> None:
         struct.pack_into("<H", raw, 0x82, (crc >> 16) & 0xFFFF)
 
 
+
+
+def inode_checksum_valid(sb: Superblock, inode: Inode) -> bool:
+    if not sb.has_metadata_csum:
+        return True
+    raw = bytearray(inode.raw)
+    stored_lo = _u16(raw, 0x7C) if len(raw) >= 0x7E else 0
+    stored_hi = (
+        _u16(raw, 0x82)
+        if inode.extra_isize >= 2 and len(raw) >= 0x84
+        else None
+    )
+    struct.pack_into("<H", raw, 0x7C, 0)
+    if stored_hi is not None:
+        struct.pack_into("<H", raw, 0x82, 0)
+    crc = crc32c(sb.csum_seed(), struct.pack("<I", inode.ino))
+    crc = crc32c(crc, struct.pack("<I", inode.generation))
+    crc = crc32c(crc, raw)
+    if stored_lo != (crc & 0xFFFF):
+        return False
+    if stored_hi is not None and stored_hi != ((crc >> 16) & 0xFFFF):
+        return False
+    return True
+
 def parse_inode(sb: Superblock, ino: int, raw: bytes) -> Inode:
     size = max(int(sb.inode_size or 128), 128)
     buf = bytearray(raw[:size].ljust(size, b"\x00"))
