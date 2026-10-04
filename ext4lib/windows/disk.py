@@ -1888,6 +1888,8 @@ class WindowsPhysicalDevice(BlockDevice):
         self._scsi_fua_supported: bool | None = None
         self._scsi_sync_cache_supported: bool | None = None
         self._fallback_write_route: str | None = None
+        self._scsi_write_count = 0
+        self._scsi_write_bytes = 0
         LOG.info(
             "디스크 열기 %s writable=%s sector=%s part=%s part_offset=%s part_size=%s",
             path,
@@ -2436,6 +2438,19 @@ class WindowsPhysicalDevice(BlockDevice):
         details = " | ".join(detail for _ok, _sense, detail in results)
         raise IoError("SCSI SYNCHRONIZE CACHE(10) 실패: " + details, winerr=31)
 
+    def _note_scsi_write(self, length: int) -> None:
+        """Keep high-frequency SCSI traffic out of the normal GUI log."""
+        from ext4lib.debuglog import LOG
+
+        self._scsi_write_count += 1
+        self._scsi_write_bytes += max(0, int(length))
+        if self._scsi_write_count % 256 == 0:
+            LOG.debug(
+                "SCSI 쓰기 진행 count=%s bytes=%s",
+                self._scsi_write_count,
+                self._scsi_write_bytes,
+            )
+
     def _scsi_write10_direct(
         self, absolute_offset: int, data: bytes, *, fua: bool = True
     ) -> None:
@@ -2521,13 +2536,7 @@ class WindowsPhysicalDevice(BlockDevice):
             self._scsi_fua_supported = True
         else:
             self._scsi_dirty = True
-        LOG.debug(
-            "SCSI WRITE(10) DIRECT%s 성공 offset=%s lba=%s blocks=%s",
-            "+FUA" if fua else "",
-            absolute_offset,
-            lba,
-            blocks,
-        )
+        self._note_scsi_write(len(data))
 
     def _scsi_write10_buffered(
         self, absolute_offset: int, data: bytes, *, fua: bool = True
@@ -2616,13 +2625,7 @@ class WindowsPhysicalDevice(BlockDevice):
             self._scsi_fua_supported = True
         else:
             self._scsi_dirty = True
-        LOG.debug(
-            "SCSI WRITE(10)%s 성공 offset=%s lba=%s blocks=%s",
-            "+FUA" if fua else "",
-            absolute_offset,
-            lba,
-            blocks,
-        )
+        self._note_scsi_write(len(data))
 
     def _scsi_write10(self, absolute_offset: int, data: bytes) -> None:
         """Adaptive SCSI write for USB/SD bridges.
@@ -3341,12 +3344,9 @@ class WindowsPhysicalDevice(BlockDevice):
     def _write_volume_seek(self, item: _LockedVolume, offset: int, data: bytes) -> None:
         """Write relative to a locked/dismounted volume handle."""
         if item.offline:
-            from ext4lib.debuglog import LOG
-            LOG.info(
-                "오프라인 볼륨은 직접 쓰지 않고 PhysicalDrive 경로 사용 %s offset=%s",
-                item.name,
-                offset,
-            )
+            # The route choice was already logged when the volume was taken
+            # offline / the SCSI fallback became sticky. Do not emit one line
+            # for every 512-byte or 4-KiB filesystem write.
             self._fallback_after_volume_access_denied(offset, data)
             return
         kernel32.SetLastError(0)
