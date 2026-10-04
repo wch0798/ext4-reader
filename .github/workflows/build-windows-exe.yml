@@ -138,6 +138,9 @@ jobs:
           truncate -s 256M journal.img
           mkfs.ext4 -F -q -b 4096 -O 64bit,metadata_csum,^orphan_file,^fast_commit journal.img
 
+          truncate -s 256M repair.img
+          mkfs.ext4 -F -q -b 4096 -O 64bit,metadata_csum,^orphan_file,^fast_commit repair.img
+
           # Real disk layout: GPT + one Linux filesystem partition containing EXT4.
           truncate -s 320M gpt.img
           sgdisk -og gpt.img
@@ -151,12 +154,15 @@ jobs:
           python -m tests.integration_ext4_image clean.img --mode clean
           python -m tests.integration_ext4_image dirty.img --mode dirty-marker
           python -m tests.integration_ext4_image journal.img --mode journal-replay
+          python -m tests.integration_ext4_image repair.img --mode error-repair
           python -m tests.integration_ext4_image gpt.img --mode gpt-portable
 
       - name: Validate clean images with e2fsck
         run: |
           sudo e2fsck -fn clean.img
           sudo e2fsck -fn journal.img
+          sudo e2fsck -fn repair.img
+          debugfs -R "stat /windows-repaired.bin" repair.img
 
           # Validate that the GPT itself is still valid and that the EXT4
           # partition is independently readable after being moved/extracted.
