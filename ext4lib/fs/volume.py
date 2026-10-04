@@ -87,6 +87,9 @@ class Ext4Volume:
         self._dir_list: dict = {}
         self._dir_index: dict = {}
         self._write_session_active = False
+        self._metadata_overlay: dict[int, bytearray] = {}
+        self._pending_block_frees: list[tuple[int, int]] = []
+        self._journal_writer = None
         self._load_groups()
 
     def reload_metadata(self) -> None:
@@ -101,6 +104,8 @@ class Ext4Volume:
         self._alloc_hint.clear()
         self._dir_list.clear()
         self._dir_index.clear()
+        self._metadata_overlay.clear()
+        self._pending_block_frees.clear()
         raw = self.dev.read(self.part_offset + 1024, 1024)
         self.sb = parse_superblock(raw)
         self._load_groups()
@@ -116,7 +121,27 @@ class Ext4Volume:
         self.groups = groups
 
     def read_bytes(self, fs_offset: int, length: int) -> bytes:
-        return self.dev.read(self.part_offset + fs_offset, length)
+        data = bytearray(self.dev.read(self.part_offset + fs_offset, length))
+        overlay = getattr(self, "_metadata_overlay", None)
+        if not data or not overlay:
+            return bytes(data)
+        bs = self.sb.block_size
+        first = fs_offset // bs
+        last = (fs_offset + len(data) - 1) // bs
+        req_end = fs_offset + len(data)
+        for phys in range(first, last + 1):
+            pending = overlay.get(phys)
+            if pending is None:
+                continue
+            block_start = phys * bs
+            lo = max(fs_offset, block_start)
+            hi = min(req_end, block_start + bs)
+            if lo >= hi:
+                continue
+            src = lo - block_start
+            dst = lo - fs_offset
+            data[dst : dst + (hi - lo)] = pending[src : src + (hi - lo)]
+        return bytes(data)
 
     def write_bytes(self, fs_offset: int, data: bytes) -> None:
         if not data:
@@ -127,6 +152,109 @@ class Ext4Volume:
         self._invalidate_block_cache(first, last)
         self._data_dirty = True
         self.dev.write(self.part_offset + fs_offset, data)
+
+    def _read_home_block(self, phys: int) -> bytes:
+        if phys < 0 or phys >= self.sb.blocks_count:
+            raise Ext4Error(f"블록 번호가 범위를 벗어났습니다: {phys}")
+        return self.dev.read(
+            self.part_offset + phys * self.sb.block_size,
+            self.sb.block_size,
+        )
+
+    def write_metadata_bytes(self, fs_offset: int, data: bytes) -> None:
+        """Queue metadata in memory while JBD2 journaling is active."""
+        if not data:
+            return
+        if self._journal_writer is None:
+            self.write_bytes(fs_offset, data)
+            return
+        bs = self.sb.block_size
+        pos = 0
+        while pos < len(data):
+            absolute = fs_offset + pos
+            phys = absolute // bs
+            boff = absolute % bs
+            take = min(bs - boff, len(data) - pos)
+            block = self._metadata_overlay.get(phys)
+            if block is None:
+                block = bytearray(self._read_home_block(phys))
+                if len(block) < bs:
+                    block.extend(b"\x00" * (bs - len(block)))
+                elif len(block) > bs:
+                    del block[bs:]
+            block[boff : boff + take] = data[pos : pos + take]
+            self._metadata_overlay[phys] = block
+            pos += take
+        first = fs_offset // bs
+        last = (fs_offset + len(data) - 1) // bs
+        self._invalidate_block_cache(first, last)
+
+    def write_metadata_block(self, phys: int, data: bytes) -> None:
+        bs = self.sb.block_size
+        blob = bytes(data[:bs]).ljust(bs, b"\x00")
+        if self._journal_writer is None:
+            self.write_block(phys, blob)
+            return
+        if phys < 0 or phys >= self.sb.blocks_count:
+            raise Ext4Error(f"블록 번호가 범위를 벗어났습니다: {phys}")
+        self._metadata_overlay[phys] = bytearray(blob)
+        self._invalidate_block_cache(phys, phys)
+
+    def _checkpoint_metadata_blocks(self, metadata: dict[int, bytes]) -> None:
+        """Write committed metadata to its final EXT4 home blocks."""
+        bs = self.sb.block_size
+        for phys, data in sorted(metadata.items()):
+            if len(data) != bs:
+                raise Ext4Error("checkpoint metadata 블록 크기가 올바르지 않습니다.")
+            self.dev.write(self.part_offset + phys * bs, data)
+            self._invalidate_block_cache(phys, phys)
+        if metadata:
+            self._data_dirty = True
+
+    def _set_home_super_flags(
+        self,
+        *,
+        recover: bool | None = None,
+        valid: bool | None = None,
+        flush: bool = True,
+    ) -> None:
+        """Update only crash-state flags in the on-disk superblock."""
+        raw = self.dev.read(self.part_offset + 1024, 1024)
+        disk_sb = parse_superblock(raw)
+        if recover is not None:
+            if recover:
+                disk_sb.feature_incompat |= C.EXT4_FEATURE_INCOMPAT_RECOVER
+                self.sb.feature_incompat |= C.EXT4_FEATURE_INCOMPAT_RECOVER
+            else:
+                disk_sb.feature_incompat &= ~C.EXT4_FEATURE_INCOMPAT_RECOVER
+                self.sb.feature_incompat &= ~C.EXT4_FEATURE_INCOMPAT_RECOVER
+            struct.pack_into("<I", disk_sb.raw, 0x60, disk_sb.feature_incompat)
+            struct.pack_into("<I", self.sb.raw, 0x60, self.sb.feature_incompat)
+        if valid is not None:
+            if valid:
+                disk_sb.state |= C.EXT4_VALID_FS
+                self.sb.state |= C.EXT4_VALID_FS
+            else:
+                disk_sb.state &= ~C.EXT4_VALID_FS
+                self.sb.state &= ~C.EXT4_VALID_FS
+            struct.pack_into("<H", disk_sb.raw, 0x3A, disk_sb.state)
+            struct.pack_into("<H", self.sb.raw, 0x3A, self.sb.state)
+        disk_sb.write_checksum()
+        self.sb.write_checksum()
+        self.dev.write(self.part_offset + 1024, bytes(disk_sb.raw[:1024]))
+        bs = self.sb.block_size
+        self._invalidate_block_cache(1024 // bs, (1024 + 1023) // bs)
+        if flush:
+            self.dev.flush()
+            self._data_dirty = False
+        else:
+            self._data_dirty = True
+
+    def _refresh_pending_superblock(self) -> None:
+        if self._journal_writer is None:
+            return
+        self.sb.write_checksum()
+        self.write_metadata_bytes(1024, bytes(self.sb.raw[:1024]))
 
     def _cache_block(self, phys: int, data: bytes) -> None:
         cache = self._block_cache
@@ -208,7 +336,7 @@ class Ext4Volume:
         self._extent_cache.pop(inode.ino, None)
         self.drop_dir_cache(inode.ino)
         _g, off = self._inode_loc(inode.ino)
-        self.write_bytes(off, raw)
+        self.write_metadata_bytes(off, raw)
 
     def _store_dirty_bitmaps(self) -> None:
         bs = self.sb.block_size
@@ -216,13 +344,13 @@ class Ext4Volume:
             bm = self._block_bm_cache.get(g)
             if bm is not None:
                 blob = bytes(bm.data[:bs]).ljust(bs, b"\x00")
-                self.write_block(self.groups[g].block_bitmap, blob)
+                self.write_metadata_block(self.groups[g].block_bitmap, blob)
             self._dirty_block_bm.discard(g)
         for g in sorted(self._dirty_inode_bm):
             bm = self._inode_bm_cache.get(g)
             if bm is not None:
                 blob = bytes(bm.data[:bs]).ljust(bs, b"\x00")
-                self.write_block(self.groups[g].inode_bitmap, blob)
+                self.write_metadata_block(self.groups[g].inode_bitmap, blob)
             self._dirty_inode_bm.discard(g)
 
     def commit_metadata(self, sync: bool = True) -> None:
@@ -231,6 +359,12 @@ class Ext4Volume:
         ``sync`` waits until the device cache is on media. Copying a large file
         calls this very often; waiting every time is what makes USB/SD feel stuck.
         """
+        if sync and self._journal_writer is not None and self._pending_block_frees:
+            # Do not expose freed blocks to the allocator until the transaction
+            # that removes their old references is about to become durable.
+            from ext4lib.fs.bitmap import apply_pending_block_frees
+
+            apply_pending_block_frees(self)
         self._store_dirty_bitmaps()
         if self.dirty_groups:
             gdt_block = self.sb.first_data_block + 1
@@ -238,16 +372,19 @@ class Ext4Volume:
                 gd = self.groups[g]
                 update_group_desc_fields(self.sb, gd)
                 off = gdt_block * self.sb.block_size + g * self.sb.desc_size
-                self.write_bytes(off, bytes(gd.raw[: self.sb.desc_size]))
+                self.write_metadata_bytes(off, bytes(gd.raw[: self.sb.desc_size]))
             self.dirty_groups.clear()
         if self.dirty_super:
             self.sb.update_counts()
             self.sb.write_checksum()
-            self.write_bytes(1024, bytes(self.sb.raw[:1024]))
+            self.write_metadata_bytes(1024, bytes(self.sb.raw[:1024]))
             self.dirty_super = False
-        if sync and self._data_dirty:
-            self.dev.flush()
-            self._data_dirty = False
+        if sync:
+            if self._journal_writer is not None and self._metadata_overlay:
+                self._journal_writer.commit()
+            elif self._data_dirty:
+                self.dev.flush()
+                self._data_dirty = False
 
     def flush_metadata(self) -> None:
         self.commit_metadata(sync=True)
@@ -260,30 +397,50 @@ class Ext4Volume:
         self._data_dirty = False
 
     def begin_write_session(self) -> None:
-        """Mark the filesystem unclean before exposing a writable mount.
-
-        We do not yet journal new Windows metadata transactions, so a crash or
-        surprise removal must never leave the superblock claiming a clean
-        unmount. A clean flag is restored only after the final durable flush.
-        """
+        """Start a writable session and validate JBD2 before exposing writes."""
         if self._write_session_active:
             return
         if not self.dev.writable:
             raise Ext4Error("쓰기 세션을 시작하려면 장치를 쓰기 가능으로 열어야 합니다.")
-        self.sb.state &= ~C.EXT4_VALID_FS
-        self._write_super_state()
+
+        writer = None
+        if getattr(self.sb, "has_journal", False):
+            try:
+                from ext4lib.fs.journal import JournalWriteError, JournalWriter
+
+                writer = JournalWriter(self)
+            except JournalWriteError as exc:
+                raise Ext4Error(f"JBD2 쓰기 저널을 시작할 수 없습니다: {exc}") from exc
+
+        self._journal_writer = writer
+        if writer is None:
+            self.sb.state &= ~C.EXT4_VALID_FS
+            self._write_super_state()
+        else:
+            self._set_home_super_flags(valid=False, flush=True)
         self._write_session_active = True
-        LOG.warning("RW 세션 시작: EXT4 clean 플래그를 해제했습니다.")
+        LOG.warning(
+            "RW 세션 시작: EXT4 clean 플래그 해제, JBD2 write=%s",
+            "on" if writer is not None else "off",
+        )
 
     def finish_write_session(self) -> None:
-        """Durably flush and mark the filesystem clean after a safe unmount."""
+        """Durably commit/checkpoint metadata and mark the session clean."""
         if not self._write_session_active:
             return
         self.commit_metadata(sync=True)
-        self.sb.state |= C.EXT4_VALID_FS
-        self._write_super_state()
+        if self._journal_writer is not None:
+            self._journal_writer.mark_clean()
+            self._set_home_super_flags(recover=False, valid=True, flush=True)
+        else:
+            self.sb.state |= C.EXT4_VALID_FS
+            self._write_super_state()
         self._write_session_active = False
-        LOG.info("RW 세션 정상 종료: EXT4 clean 플래그를 복원했습니다.")
+        self._journal_writer = None
+        overlay = getattr(self, "_metadata_overlay", None)
+        if overlay is not None:
+            overlay.clear()
+        LOG.info("RW 세션 정상 종료: JBD2/EXT4 clean 상태를 복원했습니다.")
 
     def journal_start(self) -> int | None:
         if not self.sb.has_journal or not self.sb.journal_inum:
@@ -339,7 +496,11 @@ class Ext4Volume:
 
     def hard_write_blockers(self) -> list[str]:
         reasons = []
-        if self.journal_needs_recovery():
+        owns_live_journal = bool(
+            getattr(self, "_write_session_active", False)
+            and getattr(self, "_journal_writer", None) is not None
+        )
+        if not owns_live_journal and self.journal_needs_recovery():
             reasons.append(
                 "저널에 재생하지 않은 기록이 있습니다. 쓰기 연결 시 Windows에서 자동 복구를 시도합니다."
             )
@@ -393,12 +554,13 @@ class Ext4Volume:
 
     def close(self) -> None:
         try:
-            self.flush_metadata()
-        finally:
             if self._write_session_active:
                 LOG.warning(
-                    "RW 세션이 clean 완료 없이 닫힙니다. EXT4 clean 플래그를 복원하지 않습니다."
+                    "RW 세션이 clean 완료 없이 닫힙니다. pending metadata를 추가 commit하지 않습니다."
                 )
+            else:
+                self.flush_metadata()
+        finally:
             if self.owns_device:
                 self.dev.close()
 
