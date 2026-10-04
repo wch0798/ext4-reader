@@ -1559,13 +1559,12 @@ def _open_hidden_volume_alias(
                 or (partition_size and int(extent[1]) != int(partition_size))
             ):
                 LOG.warning(
-                    "파티션 DASD 범위 불일치 %s expected_offset=%s expected_size=%s actual=%s",
+                    "볼륨 별칭 범위 불일치 %s expected_offset=%s expected_size=%s actual=%s",
                     path,
                     partition_offset,
                     partition_size,
                     extent,
                 )
-                kernel32.CloseHandle(handle)
                 continue
             writable_ok, writable_err = _is_writable_ioctl(handle)
             LOG.info(
@@ -1653,6 +1652,22 @@ def _open_partition_device(
             continue
 
         try:
+            extent = _query_partition_extent(handle)
+            if (
+                extent is None
+                or (partition_offset and int(extent[0]) != int(partition_offset))
+                or (partition_size and int(extent[1]) != int(partition_size))
+            ):
+                LOG.warning(
+                    "파티션 DASD 범위 불일치 %s expected_offset=%s expected_size=%s actual=%s",
+                    path,
+                    partition_offset,
+                    partition_size,
+                    extent,
+                )
+                kernel32.CloseHandle(handle)
+                continue
+
             writable_ok, writable_err = _is_writable_ioctl(handle)
             if writable_ok:
                 LOG.info("파티션 DASD 쓰기 가능 확인 %s", path)
