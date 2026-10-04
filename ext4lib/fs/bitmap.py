@@ -132,16 +132,22 @@ def inode_table_blocks(vol) -> int:
 def apply_bitmap_csum(vol, gd: GroupDesc, which: str, bitmap: Bitmap) -> None:
     if not vol.sb.has_metadata_csum:
         return
-    crc = crc32c(vol.sb.csum_seed(), bitmap.data[: vol.sb.block_size])
     if which == "block":
-        # 0x18 lo, 0x34 hi
+        # EXT4_CLUSTERS_PER_GROUP / 8. bigalloc is rejected by the writer,
+        # therefore clusters == blocks here.
+        csum_len = vol.sb.blocks_per_group // 8
+    else:
+        csum_len = vol.sb.inodes_per_group // 8
+    crc = crc32c(vol.sb.csum_seed(), bitmap.data[:csum_len])
+    if which == "block":
+        # 0x18 low, 0x38 high. 0x34 is bg_exclude_bitmap_hi.
         gd.raw[0x18:0x1A] = (crc & 0xFFFF).to_bytes(2, "little")
         if vol.sb.desc_size >= 64:
-            gd.raw[0x34:0x36] = ((crc >> 16) & 0xFFFF).to_bytes(2, "little")
+            gd.raw[0x38:0x3A] = ((crc >> 16) & 0xFFFF).to_bytes(2, "little")
     else:
         gd.raw[0x1A:0x1C] = (crc & 0xFFFF).to_bytes(2, "little")
         if vol.sb.desc_size >= 64:
-            gd.raw[0x36:0x38] = ((crc >> 16) & 0xFFFF).to_bytes(2, "little")
+            gd.raw[0x3A:0x3C] = ((crc >> 16) & 0xFFFF).to_bytes(2, "little")
     update_group_desc_fields(vol.sb, gd)
 
 
@@ -218,7 +224,7 @@ def write_block_bitmap(vol, gd: GroupDesc, bm: Bitmap) -> None:
         cache[gd.group] = bm
         dirty.add(gd.group)
         return
-    vol.write_block(gd.block_bitmap, bytes(bm.data[: vol.sb.block_size]).ljust(vol.sb.block_size, b"\x00"))
+    (getattr(vol, "write_metadata_block", None) or vol.write_block)(gd.block_bitmap, bytes(bm.data[: vol.sb.block_size]).ljust(vol.sb.block_size, b"\x00"))
 
 
 def write_inode_bitmap(vol, gd: GroupDesc, bm: Bitmap) -> None:
@@ -229,7 +235,7 @@ def write_inode_bitmap(vol, gd: GroupDesc, bm: Bitmap) -> None:
         cache[gd.group] = bm
         dirty.add(gd.group)
         return
-    vol.write_block(gd.inode_bitmap, bytes(bm.data[: vol.sb.block_size]).ljust(vol.sb.block_size, b"\x00"))
+    (getattr(vol, "write_metadata_block", None) or vol.write_block)(gd.inode_bitmap, bytes(bm.data[: vol.sb.block_size]).ljust(vol.sb.block_size, b"\x00"))
 
 
 class AllocError(RuntimeError):
@@ -341,31 +347,24 @@ def alloc_inode(vol, prefer_group: int | None = None) -> int:
     raise AllocError("자유 inode가 없습니다.")
 
 
-def free_blocks(vol, blocks: list[int]) -> None:
-    by_group: dict[int, list[int]] = {}
-    for b in blocks:
-        if b < vol.sb.first_data_block:
-            continue
-        g = (b - vol.sb.first_data_block) // vol.sb.blocks_per_group
-        by_group.setdefault(g, []).append(b)
-    for g, blist in by_group.items():
-        gd = vol.groups[g]
-        bm = read_block_bitmap(vol, gd)
-        start, _ = group_block_range(vol, g)
-        for b in blist:
-            bit = b - start
-            if 0 <= bit < bm.nbits and bm.test(bit):
-                bm.clear(bit)
-                gd.free_blocks += 1
-                vol.sb.free_blocks_count += 1
-        write_block_bitmap(vol, gd, bm)
-        update_group_desc_fields(vol.sb, gd)
-        vol.dirty_groups.add(g)
-        vol.dirty_super = True
+def _queue_block_frees(vol, runs: list[tuple[int, int]]) -> None:
+    """Keep freed blocks unavailable until the current JBD2 transaction commits.
+
+    File data is written to home blocks before metadata commit (ordered mode).
+    Reusing a just-freed block before the transaction is durable could overwrite
+    data or extent-tree metadata still referenced by the old on-disk inode.
+    """
+    pending = getattr(vol, "_pending_block_frees", None)
+    if pending is None:
+        pending = []
+        vol._pending_block_frees = pending
+    for phys, length in runs:
+        if length > 0:
+            pending.append((phys, length))
 
 
-def free_phys_runs(vol, runs: list[tuple[int, int]]) -> None:
-    """Free physical block runs without building a list of every block."""
+def _free_phys_runs_now(vol, runs: list[tuple[int, int]]) -> None:
+    """Apply block frees to the in-memory bitmap/counts immediately."""
     by_group: dict[int, list[tuple[int, int]]] = {}
     for phys, length in runs:
         if length <= 0:
@@ -377,6 +376,9 @@ def free_phys_runs(vol, runs: list[tuple[int, int]]) -> None:
                 cursor += 1
                 continue
             g = (cursor - vol.sb.first_data_block) // vol.sb.blocks_per_group
+            if g < 0 or g >= vol.sb.groups_count:
+                cursor += 1
+                continue
             _start, gend = group_block_range(vol, g)
             run_end = min(end, gend)
             by_group.setdefault(g, []).append((cursor, run_end - cursor))
@@ -386,6 +388,7 @@ def free_phys_runs(vol, runs: list[tuple[int, int]]) -> None:
         bm = read_block_bitmap(vol, gd)
         start, _ = group_block_range(vol, g)
         freed = 0
+        first_freed_bit: int | None = None
         for b, length in pieces:
             bit = b - start
             for i in range(length):
@@ -393,21 +396,46 @@ def free_phys_runs(vol, runs: list[tuple[int, int]]) -> None:
                 if 0 <= idx < bm.nbits and bm.test(idx):
                     bm.clear(idx)
                     freed += 1
+                    if first_freed_bit is None or idx < first_freed_bit:
+                        first_freed_bit = idx
         if not freed:
             continue
         gd.free_blocks += freed
         vol.sb.free_blocks_count += freed
         hints = getattr(vol, "_alloc_hint", None)
-        if hints is not None:
-            first_bit = min(b - start for b, _n in pieces)
+        if hints is not None and first_freed_bit is not None:
             prev = hints.get(g)
-            if prev is None or first_bit < prev:
-                hints[g] = max(0, first_bit)
+            if prev is None or first_freed_bit < prev:
+                hints[g] = max(0, first_freed_bit)
         write_block_bitmap(vol, gd, bm)
         update_group_desc_fields(vol.sb, gd)
         vol.dirty_groups.add(g)
         vol.dirty_super = True
 
+
+def apply_pending_block_frees(vol) -> int:
+    """Apply JBD2-deferred frees immediately before a synchronous commit."""
+    pending = getattr(vol, "_pending_block_frees", None)
+    if not pending:
+        return 0
+    runs = list(pending)
+    _free_phys_runs_now(vol, runs)
+    # Clear only after the whole pass succeeds. Reapplying after a partial
+    # failure is safe because _free_phys_runs_now checks the bitmap bit first.
+    pending.clear()
+    return sum(length for _phys, length in runs if length > 0)
+
+
+def free_blocks(vol, blocks: list[int]) -> None:
+    free_phys_runs(vol, [(b, 1) for b in blocks])
+
+
+def free_phys_runs(vol, runs: list[tuple[int, int]]) -> None:
+    """Free physical runs, deferring reuse while a JBD2 transaction is open."""
+    if getattr(vol, "_journal_writer", None) is not None:
+        _queue_block_frees(vol, runs)
+        return
+    _free_phys_runs_now(vol, runs)
 
 def free_inode(vol, ino: int) -> None:
     if ino < vol.sb.first_ino:
