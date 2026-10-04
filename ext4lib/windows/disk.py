@@ -1636,6 +1636,76 @@ def _open_partition_device(disk_index: int, partition_number: int) -> _LockedVol
     )
     return None
 
+def _verify_expected_medium(
+    path: str,
+    partition_offset: int,
+    expected_size: int = 0,
+    expected_serial: str = "",
+    expected_ext_uuid: bytes | None = None,
+) -> None:
+    """Verify a PhysicalDrive before any writable volume lock/dismount."""
+    handle = _open_handle(path, False)
+    try:
+        size, sector = _query_geometry(handle)
+        if expected_size and size and int(expected_size) != int(size):
+            raise IoError(
+                f"검색 후 디스크 크기가 변경되었습니다: {expected_size} -> {size}",
+                winerr=1167,
+            )
+        current_serial = _query_storage_serial(handle).strip().lower()
+        scanned_serial = (expected_serial or "").strip().lower()
+        if scanned_serial and current_serial and scanned_serial != current_serial:
+            raise IoError("검색 후 저장장치 serial이 변경되었습니다.", winerr=1167)
+
+        if expected_ext_uuid is not None:
+            target = int(partition_offset) + 1024
+            ss = int(sector or 512)
+            start = (target // ss) * ss
+            end = ((target + 1024 + ss - 1) // ss) * ss
+            new_pos = ctypes.c_longlong(0)
+            if not kernel32.SetFilePointerEx(
+                handle, start, ctypes.byref(new_pos), FILE_BEGIN
+            ):
+                err = ctypes.get_last_error()
+                raise IoError(
+                    f"EXT4 대상 검증 seek 실패 (Win32 {err})",
+                    winerr=err,
+                )
+            length = end - start
+            buf = bytearray(length)
+            done = wintypes.DWORD(0)
+            ok = kernel32.ReadFile(
+                handle,
+                (ctypes.c_char * length).from_buffer(buf),
+                length,
+                ctypes.byref(done),
+                None,
+            )
+            if not ok or int(done.value) != length:
+                err = ctypes.get_last_error()
+                raise IoError(
+                    f"EXT4 대상 검증 read 실패 (Win32 {err})",
+                    winerr=err or 23,
+                )
+            rel = target - start
+            from ext4lib.fs.superblock import parse_superblock
+
+            try:
+                sb = parse_superblock(bytes(buf[rel : rel + 1024]))
+            except Exception as exc:
+                raise IoError(
+                    "선택했던 위치에서 EXT4 슈퍼블록을 다시 찾지 못했습니다.",
+                    winerr=1167,
+                ) from exc
+            if bytes(sb.uuid) != bytes(expected_ext_uuid):
+                raise IoError(
+                    "검색 후 선택한 EXT4 UUID가 변경되었습니다. 다른 디스크 보호를 위해 중단합니다.",
+                    winerr=1167,
+                )
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def list_physical_disks() -> list[DiskInfo]:
     disks: list[DiskInfo] = []
     for idx in range(32):
@@ -1696,6 +1766,9 @@ class WindowsPhysicalDevice(BlockDevice):
         partition_number: int | None = None,
         partition_offset: int = 0,
         partition_size: int = 0,
+        expected_size: int = 0,
+        expected_serial: str = "",
+        expected_ext_uuid: bytes | None = None,
     ):
         from ext4lib.debuglog import LOG
 
@@ -1723,6 +1796,21 @@ class WindowsPhysicalDevice(BlockDevice):
             self._partition_offset,
             self._partition_size,
         )
+        if expected_size or expected_serial or expected_ext_uuid is not None:
+            _verify_expected_medium(
+                path,
+                self._partition_offset,
+                expected_size=int(expected_size or 0),
+                expected_serial=expected_serial,
+                expected_ext_uuid=expected_ext_uuid,
+            )
+            LOG.info(
+                "PhysicalDrive 대상 고정 검증 성공 path=%s size=%s serial=%s uuid=%s",
+                path,
+                expected_size or "-",
+                expected_serial or "-",
+                expected_ext_uuid.hex() if expected_ext_uuid is not None else "-",
+            )
         if writable:
             _enable_storage_privileges()
             idx = _physical_index(path)
