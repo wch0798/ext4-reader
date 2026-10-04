@@ -88,6 +88,7 @@ class Ext4Volume:
         self._dir_index: dict = {}
         self._write_session_active = False
         self._metadata_overlay: dict[int, bytearray] = {}
+        self._pending_block_frees: list[tuple[int, int]] = []
         self._journal_writer = None
         self._load_groups()
 
@@ -104,6 +105,7 @@ class Ext4Volume:
         self._dir_list.clear()
         self._dir_index.clear()
         self._metadata_overlay.clear()
+        self._pending_block_frees.clear()
         raw = self.dev.read(self.part_offset + 1024, 1024)
         self.sb = parse_superblock(raw)
         self._load_groups()
@@ -357,6 +359,12 @@ class Ext4Volume:
         ``sync`` waits until the device cache is on media. Copying a large file
         calls this very often; waiting every time is what makes USB/SD feel stuck.
         """
+        if sync and self._journal_writer is not None and self._pending_block_frees:
+            # Do not expose freed blocks to the allocator until the transaction
+            # that removes their old references is about to become durable.
+            from ext4lib.fs.bitmap import apply_pending_block_frees
+
+            apply_pending_block_frees(self)
         self._store_dirty_bitmaps()
         if self.dirty_groups:
             gdt_block = self.sb.first_data_block + 1
