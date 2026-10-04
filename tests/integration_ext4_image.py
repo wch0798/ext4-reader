@@ -11,6 +11,7 @@ import argparse
 import os
 
 from ext4lib.fs import constants as C
+from ext4lib.fs.journal import _JournalLog
 from ext4lib.fs.volume import Ext4Volume
 from ext4lib.fs.writer import (
     create_empty_file,
@@ -87,6 +88,7 @@ def journal_replay_roundtrip(path: str) -> None:
     if blockers:
         raise AssertionError("journal image is not writable by ext4-reader: " + " | ".join(blockers))
 
+    initial_sequence = _JournalLog(vol).info.sequence
     vol.begin_write_session()
     assert vol._journal_writer is not None
 
@@ -119,6 +121,15 @@ def journal_replay_roundtrip(path: str) -> None:
         stats = recovery.recover_pending_journal()
         assert stats.transactions >= 1
         assert stats.replayed_blocks >= 1
+
+        # create_empty_file committed sequence S+1. The injected crash happens
+        # after the next commit (S+2), and Linux recovery restarts at
+        # ++end_transaction, so the clean journal sequence must be S+4.
+        expected_recovery_sequence = (initial_sequence + 4) & 0xFFFFFFFF
+        clean_log = _JournalLog(recovery)
+        assert clean_log.info.start == 0
+        assert clean_log.info.sequence == expected_recovery_sequence
+        assert stats.next_sequence == expected_recovery_sequence
     finally:
         recovery.close()
 
@@ -132,6 +143,26 @@ def journal_replay_roundtrip(path: str) -> None:
         assert not check.journal_needs_recovery()
     finally:
         check.close()
+
+    # Exercise a normal clean session after recovery too. This catches an
+    # off-by-one in JournalWriter.mark_clean() that a one-shot crash replay
+    # alone cannot detect.
+    again = open_volume(path, True)
+    try:
+        before = _JournalLog(again).info.sequence
+        assert before == expected_recovery_sequence
+        again.begin_write_session()
+        root = lookup_path(again, "/")
+        create_empty_file(again, root, "after-replay.bin")
+        again.finish_write_session()
+
+        clean_log = _JournalLog(again)
+        assert clean_log.info.start == 0
+        assert clean_log.info.sequence == ((before + 2) & 0xFFFFFFFF)
+        assert again.sb.state & C.EXT4_VALID_FS
+        assert not again.sb.needs_recovery
+    finally:
+        again.close()
 
 
 def dirty_marker_roundtrip(path: str) -> None:
