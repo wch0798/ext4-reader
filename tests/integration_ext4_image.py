@@ -11,8 +11,7 @@ import argparse
 import os
 
 from ext4lib.fs import constants as C
-from ext4lib.fs.extents import file_extents
-from ext4lib.fs.journal import commit_journal_transaction
+from ext4lib.fs.journal import _JournalLog
 from ext4lib.fs.volume import Ext4Volume
 from ext4lib.fs.writer import (
     create_empty_file,
@@ -82,44 +81,89 @@ def clean_roundtrip(path: str) -> None:
         check.close()
 
 
-
-def journal_write_roundtrip(path: str) -> None:
+def journal_replay_roundtrip(path: str) -> None:
+    """Crash after a durable JBD2 commit and verify recovery replays metadata."""
     vol = open_volume(path, True)
     blockers = vol.hard_write_blockers()
     if blockers:
-        raise AssertionError("mkfs image is not writable by ext4-reader: " + " | ".join(blockers))
+        raise AssertionError("journal image is not writable by ext4-reader: " + " | ".join(blockers))
 
+    initial_sequence = _JournalLog(vol).info.sequence
     vol.begin_write_session()
+    assert vol._journal_writer is not None
+
     root = lookup_path(vol, "/")
-    node = create_empty_file(vol, root, "journal.bin")
-    initial = b"A" * vol.sb.block_size
-    write_range(vol, node, 0, initial, flush=True)
+    node = create_empty_file(vol, root, "replay.bin")
+    payload = (b"jbd2-ordered-data-" * 4096) + b"END"
 
-    node = lookup_path(vol, "/journal.bin")
-    exts = file_extents(vol, node)
-    assert exts and exts[0].logical == 0 and exts[0].length >= 1
-    phys = exts[0].physical
-    payload = (b"JBD2-WRITE-TRANSACTION-" * ((vol.sb.block_size // 23) + 1))[: vol.sb.block_size]
+    original_checkpoint = vol._checkpoint_metadata_blocks
 
-    stats = commit_journal_transaction(vol, [(phys, payload)])
-    assert stats.checkpointed_blocks == 1
-    assert stats.next_sequence == ((stats.sequence + 1) & 0xFFFFFFFF)
-    assert read_range(vol, node, 0, len(payload)) == payload
-    assert vol.journal_start() == 0
-    assert not vol.sb.needs_recovery
+    def crash_after_commit(_metadata):
+        raise RuntimeError("simulated power loss after JBD2 commit")
 
-    vol.finish_write_session()
+    vol._checkpoint_metadata_blocks = crash_after_commit
+    try:
+        try:
+            write_range(vol, node, 0, payload, flush=True)
+        except RuntimeError as exc:
+            assert "simulated power loss" in str(exc)
+        else:
+            raise AssertionError("crash injection did not fire")
+    finally:
+        vol._checkpoint_metadata_blocks = original_checkpoint
+
+    # close() must not manufacture another transaction on an unclean path.
     vol.close()
+
+    recovery = open_volume(path, True)
+    try:
+        assert recovery.journal_needs_recovery()
+        stats = recovery.recover_pending_journal()
+        assert stats.transactions >= 1
+        assert stats.replayed_blocks >= 1
+
+        # create_empty_file committed sequence S+1. The injected crash happens
+        # after the next commit (S+2), and Linux recovery restarts at
+        # ++end_transaction, so the clean journal sequence must be S+4.
+        expected_recovery_sequence = (initial_sequence + 4) & 0xFFFFFFFF
+        clean_log = _JournalLog(recovery)
+        assert clean_log.info.start == 0
+        assert clean_log.info.sequence == expected_recovery_sequence
+        assert stats.next_sequence == expected_recovery_sequence
+    finally:
+        recovery.close()
 
     check = open_volume(path, False)
     try:
-        node = lookup_path(check, "/journal.bin")
+        node = lookup_path(check, "/replay.bin")
+        assert node.size == len(payload)
         assert read_range(check, node, 0, len(payload)) == payload
-        assert check.journal_start() == 0
-        assert not check.sb.needs_recovery
         assert check.sb.state & C.EXT4_VALID_FS
+        assert not check.sb.needs_recovery
+        assert not check.journal_needs_recovery()
     finally:
         check.close()
+
+    # Exercise a normal clean session after recovery too. This catches an
+    # off-by-one in JournalWriter.mark_clean() that a one-shot crash replay
+    # alone cannot detect.
+    again = open_volume(path, True)
+    try:
+        before = _JournalLog(again).info.sequence
+        assert before == expected_recovery_sequence
+        again.begin_write_session()
+        root = lookup_path(again, "/")
+        create_empty_file(again, root, "after-replay.bin")
+        again.finish_write_session()
+
+        clean_log = _JournalLog(again)
+        assert clean_log.info.start == 0
+        assert clean_log.info.sequence == ((before + 2) & 0xFFFFFFFF)
+        assert again.sb.state & C.EXT4_VALID_FS
+        assert not again.sb.needs_recovery
+    finally:
+        again.close()
+
 
 def dirty_marker_roundtrip(path: str) -> None:
     vol = open_volume(path, True)
@@ -144,15 +188,19 @@ def dirty_marker_roundtrip(path: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("image")
-    parser.add_argument("--mode", choices=("clean", "dirty-marker", "journal-write"), default="clean")
+    parser.add_argument(
+        "--mode",
+        choices=("clean", "dirty-marker", "journal-replay"),
+        default="clean",
+    )
     args = parser.parse_args()
 
     if args.mode == "clean":
         clean_roundtrip(args.image)
-    elif args.mode == "journal-write":
-        journal_write_roundtrip(args.image)
-    else:
+    elif args.mode == "dirty-marker":
         dirty_marker_roundtrip(args.image)
+    else:
+        journal_replay_roundtrip(args.image)
 
 
 if __name__ == "__main__":
