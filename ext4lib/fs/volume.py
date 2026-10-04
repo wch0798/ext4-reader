@@ -563,9 +563,13 @@ class Ext4Volume:
         if not self._write_session_active:
             self.begin_write_session()
 
-    def close(self) -> None:
+    def close(self, abort: bool = False) -> None:
         try:
-            if self._write_session_active:
+            if abort:
+                LOG.info(
+                    "이전 쓰기 오류가 있어 close 단계의 추가 flush/commit을 생략합니다."
+                )
+            elif self._write_session_active:
                 LOG.warning(
                     "RW 세션이 clean 완료 없이 닫힙니다. pending metadata를 추가 commit하지 않습니다."
                 )
