@@ -140,14 +140,14 @@ def apply_bitmap_csum(vol, gd: GroupDesc, which: str, bitmap: Bitmap) -> None:
         csum_len = vol.sb.inodes_per_group // 8
     crc = crc32c(vol.sb.csum_seed(), bitmap.data[:csum_len])
     if which == "block":
-        # 0x18 lo, 0x34 hi
+        # 0x18 low, 0x38 high. 0x34 is bg_exclude_bitmap_hi.
         gd.raw[0x18:0x1A] = (crc & 0xFFFF).to_bytes(2, "little")
         if vol.sb.desc_size >= 64:
-            gd.raw[0x34:0x36] = ((crc >> 16) & 0xFFFF).to_bytes(2, "little")
+            gd.raw[0x38:0x3A] = ((crc >> 16) & 0xFFFF).to_bytes(2, "little")
     else:
         gd.raw[0x1A:0x1C] = (crc & 0xFFFF).to_bytes(2, "little")
         if vol.sb.desc_size >= 64:
-            gd.raw[0x36:0x38] = ((crc >> 16) & 0xFFFF).to_bytes(2, "little")
+            gd.raw[0x3A:0x3C] = ((crc >> 16) & 0xFFFF).to_bytes(2, "little")
     update_group_desc_fields(vol.sb, gd)
 
 
