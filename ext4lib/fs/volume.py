@@ -34,6 +34,7 @@ class ErrorRepairStats:
     bitmaps_checked: int
     root_entries_checked: int
     error_count: int
+    bitmap_checksums_repaired: int = 0
 
 
 @dataclass
@@ -520,6 +521,162 @@ class Ext4Volume:
         except OrphanRecoveryError as exc:
             raise Ext4Error(f"Windows orphan 복구 실패: {exc}") from exc
 
+    def _repair_known_legacy_bitmap_checksums(self, progress=None) -> int:
+        """Repair only bitmap checksums matching the old Ext4Reader layout bug."""
+        if not self.sb.has_metadata_csum:
+            return 0
+
+        from ext4lib.fs.bitmap import (
+            Bitmap,
+            apply_legacy_bitmap_checksum_repair,
+            bitmap_checksum_valid,
+            bitmap_free_count,
+            bitmap_padding_is_set,
+            group_block_range,
+            inode_table_blocks,
+            legacy_bitmap_checksum_signature,
+        )
+
+        repairs: list[tuple[int, str, bytes]] = []
+        ng = len(self.groups)
+        flex_bg = bool(self.sb.feature_incompat & C.EXT4_FEATURE_INCOMPAT_FLEX_BG)
+
+        for g, gd in enumerate(self.groups):
+            if progress is not None and (g % 128 == 0 or g + 1 == ng):
+                progress(f"EXT4 legacy bitmap checksum 검사 {g + 1}/{ng}")
+            if not group_desc_checksum_valid(self.sb, gd):
+                raise Ext4Error(
+                    f"block group {g} descriptor checksum 불일치 — bitmap checksum 자동 복구를 중단합니다."
+                )
+
+            start, end = group_block_range(self, g)
+            group_blocks = max(0, end - start)
+            inode_start = g * self.sb.inodes_per_group
+            group_inodes = max(
+                0,
+                min(self.sb.inodes_per_group, self.sb.inodes_count - inode_start),
+            )
+
+            if not (gd.flags & C.BG_BLOCK_UNINIT):
+                raw = self.read_block(gd.block_bitmap)
+                if not bitmap_checksum_valid(self, gd, "block", raw):
+                    actual = bitmap_free_count(raw, group_blocks)
+                    if actual != gd.free_blocks:
+                        raise Ext4Error(
+                            f"block group {g} block bitmap checksum과 free count가 함께 불일치합니다. "
+                            f"descriptor={gd.free_blocks} bitmap={actual}; checksum-only 복구 대상이 아닙니다."
+                        )
+                    if not bitmap_padding_is_set(
+                        raw, group_blocks, self.sb.blocks_per_group
+                    ):
+                        raise Ext4Error(
+                            f"block group {g} block bitmap padding이 손상되어 checksum-only 복구를 중단합니다."
+                        )
+                    if not flex_bg:
+                        bm = Bitmap(bytearray(raw), self.sb.blocks_per_group)
+                        required = [gd.block_bitmap, gd.inode_bitmap]
+                        required.extend(
+                            range(gd.inode_table, gd.inode_table + inode_table_blocks(self))
+                        )
+                        for block in required:
+                            if start <= block < end and not bm.test(block - start):
+                                raise Ext4Error(
+                                    f"block group {g} metadata block {block}가 block bitmap에서 비어 있습니다."
+                                )
+                    if not legacy_bitmap_checksum_signature(
+                        self, gd, "block", raw
+                    ):
+                        raise Ext4Error(
+                            f"block group {g} block bitmap checksum 불일치가 "
+                            "알려진 구버전 Ext4Reader 패턴과 일치하지 않습니다."
+                        )
+                    repairs.append((g, "block", raw))
+
+            if not (gd.flags & C.BG_INODE_UNINIT):
+                raw = self.read_block(gd.inode_bitmap)
+                if not bitmap_checksum_valid(self, gd, "inode", raw):
+                    actual = bitmap_free_count(raw, group_inodes)
+                    if actual != gd.free_inodes:
+                        raise Ext4Error(
+                            f"block group {g} inode bitmap checksum과 free count가 함께 불일치합니다. "
+                            f"descriptor={gd.free_inodes} bitmap={actual}; checksum-only 복구 대상이 아닙니다."
+                        )
+                    if not bitmap_padding_is_set(
+                        raw, group_inodes, self.sb.inodes_per_group
+                    ):
+                        raise Ext4Error(
+                            f"block group {g} inode bitmap padding이 손상되어 checksum-only 복구를 중단합니다."
+                        )
+                    if not legacy_bitmap_checksum_signature(
+                        self, gd, "inode", raw
+                    ):
+                        raise Ext4Error(
+                            f"block group {g} inode bitmap checksum 불일치가 "
+                            "알려진 구버전 Ext4Reader 패턴과 일치하지 않습니다."
+                        )
+                    repairs.append((g, "inode", raw))
+
+        if not repairs:
+            return 0
+
+        LOG.warning(
+            "구버전 Ext4Reader bitmap checksum 배치 오류 감지: repairs=%s groups=%s",
+            len(repairs),
+            sorted({g for g, _which, _raw in repairs}),
+        )
+        if progress is not None:
+            progress(f"구버전 bitmap checksum {len(repairs)}개 JBD2 복구")
+
+        started = False
+        try:
+            self.begin_write_session()
+            started = True
+            for g, which, raw in repairs:
+                gd = self.groups[g]
+                apply_legacy_bitmap_checksum_repair(self, gd, which, raw)
+                self.dirty_groups.add(g)
+            self.finish_write_session()
+            started = False
+        except Exception:
+            if started:
+                # Never let a later read-only unmount turn a failed repair into
+                # a fabricated clean finish. Preserve whatever journal/recovery
+                # markers reached the medium and drop only in-memory pending state.
+                self._write_session_active = False
+                self._journal_writer = None
+                self._metadata_overlay.clear()
+                self.dirty_groups.clear()
+                self.dirty_super = False
+                self._dirty_block_bm.clear()
+                self._dirty_inode_bm.clear()
+                self._pending_block_frees.clear()
+                try:
+                    self.reload_metadata()
+                except Exception:
+                    pass
+            raise
+
+        self.reload_metadata()
+        for g, which, _raw in repairs:
+            gd = self.groups[g]
+            if not group_desc_checksum_valid(self.sb, gd):
+                raise Ext4Error(
+                    f"block group {g} descriptor checksum 복구 검증 실패"
+                )
+            current = self.read_block(
+                gd.block_bitmap if which == "block" else gd.inode_bitmap
+            )
+            if not bitmap_checksum_valid(self, gd, which, current):
+                raise Ext4Error(
+                    f"block group {g} {which} bitmap checksum 복구 검증 실패"
+                )
+
+        LOG.warning(
+            "구버전 Ext4Reader bitmap checksum 자동 복구 완료 repairs=%s",
+            len(repairs),
+        )
+        return len(repairs)
+
     def repair_error_state_if_safe(self, progress=None) -> ErrorRepairStats:
         """Clear a stale EXT4_ERROR_FS only after a conservative metadata scrub.
 
@@ -557,6 +714,9 @@ class Ext4Volume:
             info["last_block"],
         )
 
+        bitmap_checksums_repaired = self._repair_known_legacy_bitmap_checksums(
+            progress
+        )
         from ext4lib.fs.bitmap import (
             bitmap_checksum_valid,
             bitmap_free_count,
@@ -692,7 +852,14 @@ class Ext4Volume:
             raise Ext4Error("최종 확인에서 JBD2가 clean 상태가 아닙니다.")
         if not (disk_sb.state & C.EXT4_ERROR_FS):
             self.reload_metadata()
-            return ErrorRepairStats(False, groups_checked, bitmaps_checked, len(root_entries), int(info["count"]))
+            return ErrorRepairStats(
+                False,
+                groups_checked,
+                bitmaps_checked,
+                len(root_entries),
+                int(info["count"]),
+                bitmap_checksums_repaired,
+            )
 
         disk_sb.state &= ~C.EXT4_ERROR_FS
         struct.pack_into("<H", disk_sb.raw, 0x3A, disk_sb.state & 0xFFFF)
@@ -704,11 +871,13 @@ class Ext4Volume:
         if self.sb.state & C.EXT4_ERROR_FS:
             raise Ext4Error("ERROR_FS 상태를 디스크에 반영하지 못했습니다.")
         LOG.warning(
-            "EXT4 ERROR_FS 자동 복구 완료 groups=%s bitmaps=%s root_entries=%s historical_errors=%s",
+            "EXT4 ERROR_FS 자동 복구 완료 groups=%s bitmaps=%s root_entries=%s "
+            "historical_errors=%s bitmap_checksum_repairs=%s",
             groups_checked,
             bitmaps_checked,
             len(root_entries),
             info["count"],
+            bitmap_checksums_repaired,
         )
         return ErrorRepairStats(
             True,
@@ -716,6 +885,7 @@ class Ext4Volume:
             bitmaps_checked,
             len(root_entries),
             int(info["count"]),
+            bitmap_checksums_repaired,
         )
 
     def fs_write_blockers(self) -> list[str]:
