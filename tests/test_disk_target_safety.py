@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from ext4lib.io.backend import IoError
 from ext4lib.windows import disk as diskmod
@@ -110,8 +110,8 @@ class ScsiDurabilityTests(unittest.TestCase):
         self.assertEqual(
             dev._scsi_write10_direct.call_args_list,
             [
-                unittest.mock.call(0, b"x" * 512, fua=True),
-                unittest.mock.call(0, b"x" * 512, fua=False),
+                call(0, b"x" * 512, fua=True),
+                call(0, b"x" * 512, fua=False),
             ],
         )
 
