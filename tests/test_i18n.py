@@ -5,11 +5,14 @@ from unittest.mock import patch
 
 from ext4lib.i18n import (
     LANGUAGES,
+    OWNER_MODES,
     detect_language,
     language_from_label,
     language_label,
     load_language,
+    load_owner_mode,
     save_language,
+    save_owner_mode,
     tr,
 )
 
@@ -40,6 +43,24 @@ class I18nTests(unittest.TestCase):
                 self.assertEqual(load_language(), "ja")
                 save_language("en")
                 self.assertEqual(load_language(), "en")
+
+    def test_owner_modes(self):
+        self.assertEqual(OWNER_MODES["deck"], (1000, 1000))
+        self.assertEqual(OWNER_MODES["root"], (0, 0))
+
+    def test_owner_mode_defaults_to_deck_and_persists(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.dict(os.environ, {"LOCALAPPDATA": temp}, clear=False):
+                self.assertEqual(load_owner_mode(), "deck")
+                save_owner_mode("root")
+                self.assertEqual(load_owner_mode(), "root")
+                # Saving language must preserve the owner choice.
+                save_language("ko")
+                self.assertEqual(load_owner_mode(), "root")
+                # Saving owner must preserve the language choice.
+                save_owner_mode("deck")
+                self.assertEqual(load_language(), "ko")
+                self.assertEqual(load_owner_mode(), "deck")
 
     def test_os_locale_detection(self):
         with patch("ext4lib.i18n.locale.getlocale", return_value=("ja_JP", "UTF-8")):
