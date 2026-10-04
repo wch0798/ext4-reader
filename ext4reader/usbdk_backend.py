@@ -597,6 +597,7 @@ class UsbDkBotBackend:
         self._redirect = None
         self._tag = 0x45585434
         self._closed = False
+        self._sync_cache_supported: bool | None = None
 
         identity = resolve_usb_identity_for_physicaldrive(physical_path)
         info = self._select_device(identity)
@@ -776,19 +777,33 @@ class UsbDkBotBackend:
             )
         if status != 0:
             detail = f"status={status} residue={residue}"
+            sense_key = None
+            asc = None
+            ascq = None
             if sense_on_error and cdb[0] != SCSI_REQUEST_SENSE:
                 try:
                     sense = self.request_sense()
                     if len(sense) >= 14:
+                        sense_key = sense[2] & 0x0F
+                        asc = sense[12]
+                        ascq = sense[13]
                         detail += (
-                            f" sense_key=0x{sense[2] & 0x0F:02X}"
-                            f" asc=0x{sense[12]:02X} ascq=0x{sense[13]:02X}"
+                            f" sense_key=0x{sense_key:02X}"
+                            f" asc=0x{asc:02X} ascq=0x{ascq:02X}"
                         )
                 except Exception:
                     pass
             if status == 2:
                 self._recover_pipes()
-            raise UsbDkError(f"USB BOT SCSI 명령 실패 opcode=0x{cdb[0]:02X} {detail}", winerr=31)
+            err = UsbDkError(
+                f"USB BOT SCSI 명령 실패 opcode=0x{cdb[0]:02X} {detail}",
+                winerr=31,
+            )
+            err.scsi_status = int(status)
+            err.sense_key = sense_key
+            err.asc = asc
+            err.ascq = ascq
+            raise err
         if residue:
             raise UsbDkError(
                 f"USB BOT 데이터 residue={residue} opcode=0x{cdb[0]:02X}",
@@ -935,8 +950,43 @@ class UsbDkBotBackend:
             done += n
 
     def flush(self) -> None:
+        """Flush device write cache when the reader implements SYNCHRONIZE CACHE.
+
+        A number of USB card readers (including some Realtek 0BDA:0177
+        revisions) accept and verify WRITE(10) but reject SYNCHRONIZE CACHE(10)
+        with ILLEGAL REQUEST / INVALID COMMAND OR FIELD. Treat that specific
+        capability absence like the Windows/Linux removable-media stacks do:
+        keep read-back verification as the durability guard, confirm the device
+        is still responsive, and remember not to resend the unsupported command.
+        Other SCSI errors remain fatal.
+        """
+        from ext4reader.debuglog import LOG
+
+        if getattr(self, "_sync_cache_supported", None) is False:
+            self.test_unit_ready()
+            return
+
         cdb = bytes([SCSI_SYNCHRONIZE_CACHE10]) + b"\x00" * 9
-        self._bot(cdb)
+        try:
+            self._bot(cdb)
+            self._sync_cache_supported = True
+        except UsbDkError as exc:
+            sense_key = getattr(exc, "sense_key", None)
+            asc = getattr(exc, "asc", None)
+            if sense_key == 0x05 and asc in (0x20, 0x24):
+                self._sync_cache_supported = False
+                LOG.warning(
+                    "UsbDk 카드리더가 SYNCHRONIZE CACHE(10)을 지원하지 않음 "
+                    "sense=0x%02X/0x%02X/0x%02X; read-back 검증 쓰기를 계속 사용",
+                    sense_key,
+                    asc,
+                    int(getattr(exc, "ascq", 0) or 0),
+                )
+                # REQUEST SENSE consumed the check condition. Make sure the
+                # redirected device remains usable before reporting flush done.
+                self.test_unit_ready()
+                return
+            raise
 
     def close(self) -> None:
         if self._closed:
