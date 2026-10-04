@@ -188,6 +188,70 @@ def journal_replay_roundtrip(path: str) -> None:
 
 
 
+def raw_scan_roundtrip(path: str) -> None:
+    """Discover and write an EXT4 filesystem at 1 MiB with no partition table."""
+    dev = ImageDevice(path, writable=True)
+    vols = discover_volumes(dev)
+    if len(vols) != 1:
+        dev.close()
+        raise AssertionError(
+            f"expected one raw-scanned EXT volume, found {len(vols)}"
+        )
+    info = vols[0]
+    assert info.scheme == "RAW-SCAN"
+    assert info.partition_index == 0
+    assert info.offset == 1024 * 1024
+    assert info.size == info.sb.blocks_count * info.sb.block_size
+
+    vol = Ext4Volume(dev, info.offset, info.size, owns_device=True)
+    blockers = vol.hard_write_blockers()
+    if blockers:
+        vol.close()
+        raise AssertionError(
+            "raw-scanned EXT4 is not writable: " + " | ".join(blockers)
+        )
+    root = lookup_path(vol, "/")
+    node = create_empty_file(vol, root, "raw-discovered.bin")
+    payload = b"raw-ext4-discovery" * 4096
+    write_range(vol, node, 0, payload, flush=True)
+    vol.close()
+
+    check_dev = ImageDevice(path, writable=False)
+    try:
+        current = discover_volumes(check_dev)
+        assert len(current) == 1
+        assert current[0].scheme == "RAW-SCAN"
+        assert current[0].offset == 1024 * 1024
+        check = Ext4Volume(
+            check_dev,
+            current[0].offset,
+            current[0].size,
+            owns_device=False,
+        )
+        node = lookup_path(check, "/raw-discovered.bin")
+        assert read_range(check, node, 0, len(payload)) == payload
+    finally:
+        check_dev.close()
+
+
+def backup_gpt_discovery_roundtrip(path: str) -> None:
+    """Use the backup GPT when the primary GPT header is unreadable."""
+    dev = ImageDevice(path, writable=False)
+    try:
+        vols = discover_volumes(dev)
+        if len(vols) != 1:
+            raise AssertionError(
+                f"expected one EXT volume via backup GPT, found {len(vols)}"
+            )
+        info = vols[0]
+        assert info.scheme == "GPT"
+        assert info.partition_index == 1
+        assert info.offset == 1024 * 1024
+        assert info.sb.fs_type == "EXT4"
+    finally:
+        dev.close()
+
+
 def gpt_portable_roundtrip(path: str) -> None:
     """Write inside a GPT partition and prove both GPT copies stay untouched."""
     size = os.path.getsize(path)
@@ -654,6 +718,8 @@ def main() -> None:
             "dirty-marker",
             "journal-replay",
             "gpt-portable",
+            "raw-scan",
+            "backup-gpt",
             "error-repair",
             "orphan-repair",
             "legacy-bitmap-repair",
@@ -673,6 +739,10 @@ def main() -> None:
         journal_replay_roundtrip(args.image)
     elif args.mode == "gpt-portable":
         gpt_portable_roundtrip(args.image)
+    elif args.mode == "raw-scan":
+        raw_scan_roundtrip(args.image)
+    elif args.mode == "backup-gpt":
+        backup_gpt_discovery_roundtrip(args.image)
     elif args.mode == "error-repair":
         error_repair_roundtrip(args.image)
     elif args.mode == "orphan-repair":
