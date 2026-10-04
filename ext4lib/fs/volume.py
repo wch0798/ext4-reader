@@ -14,14 +14,26 @@ from ext4lib.io.backend import BlockDevice
 from ext4lib.fs.partitions import list_partitions
 from ext4lib.fs.superblock import (
     Superblock,
+    group_desc_checksum_valid,
     parse_group_desc,
     parse_superblock,
+    superblock_checksum_valid,
+    superblock_error_info,
     update_group_desc_fields,
 )
 
 
 class Ext4Error(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class ErrorRepairStats:
+    repaired: bool
+    groups_checked: int
+    bitmaps_checked: int
+    root_entries_checked: int
+    error_count: int
 
 
 @dataclass
@@ -498,6 +510,202 @@ class Ext4Volume:
             return recover_journal(self)
         except JournalRecoveryError as exc:
             raise Ext4Error(f"Windows 저널 복구 실패: {exc}") from exc
+
+    def repair_error_state_if_safe(self, progress=None) -> ErrorRepairStats:
+        """Clear a stale EXT4_ERROR_FS only after a conservative metadata scrub.
+
+        This is intentionally not a general-purpose fsck. It repairs the common
+        stale-error state left by interrupted/older writer versions only when
+        the journal is already clean and the metadata structures required for
+        safe allocation/navigation all validate.
+        """
+        if not (self.sb.state & C.EXT4_ERROR_FS):
+            return ErrorRepairStats(False, 0, 0, 0, 0)
+        if not self.dev.writable:
+            raise Ext4Error("EXT4 오류 상태를 복구하려면 장치를 쓰기 가능으로 열어야 합니다.")
+        if self.journal_needs_recovery() or self.sb.needs_recovery:
+            raise Ext4Error("JBD2 저널이 아직 clean 상태가 아니어서 ERROR_FS를 복구할 수 없습니다.")
+        if self.sb.state & C.EXT4_ORPHAN_FS:
+            raise Ext4Error("orphan inode 처리가 필요한 EXT4 상태라 자동 복구를 중단합니다.")
+        if self.sb.feature_ro_compat & C.EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT:
+            raise Ext4Error("orphan file 처리가 필요한 EXT4 상태라 자동 복구를 중단합니다.")
+        if not superblock_checksum_valid(self.sb):
+            raise Ext4Error("EXT4 superblock checksum이 일치하지 않습니다.")
+
+        info = superblock_error_info(self.sb)
+        LOG.warning(
+            "EXT4 ERROR_FS 자동 점검 시작 count=%s first=%s:%s ino=%s block=%s last=%s:%s ino=%s block=%s",
+            info["count"],
+            info["first_func"],
+            info["first_line"],
+            info["first_ino"],
+            info["first_block"],
+            info["last_func"],
+            info["last_line"],
+            info["last_ino"],
+            info["last_block"],
+        )
+
+        from ext4lib.fs.bitmap import (
+            bitmap_checksum_valid,
+            bitmap_free_count,
+            group_block_range,
+            inode_table_blocks,
+        )
+        from ext4lib.fs.directory import (
+            _htree_leaves,
+            dir_block_checksum_valid,
+            dir_block_count,
+            list_dir,
+            read_dir_lblock,
+        )
+        from ext4lib.fs.extents import file_extents
+        from ext4lib.fs.inode import inode_checksum_valid
+
+        groups_checked = 0
+        bitmaps_checked = 0
+        free_blocks_total = 0
+        free_inodes_total = 0
+        ng = len(self.groups)
+
+        for g, gd in enumerate(self.groups):
+            if progress is not None and (g % 64 == 0 or g + 1 == ng):
+                progress(f"EXT4 메타데이터 검사 {g + 1}/{ng}")
+
+            if not group_desc_checksum_valid(self.sb, gd):
+                raise Ext4Error(f"block group {g} descriptor checksum 불일치")
+
+            it_blocks = inode_table_blocks(self)
+            for label, block in (
+                ("block bitmap", gd.block_bitmap),
+                ("inode bitmap", gd.inode_bitmap),
+                ("inode table", gd.inode_table),
+            ):
+                if block < self.sb.first_data_block or block >= self.sb.blocks_count:
+                    raise Ext4Error(f"block group {g} {label} 위치가 범위를 벗어났습니다: {block}")
+            if gd.inode_table + it_blocks > self.sb.blocks_count:
+                raise Ext4Error(f"block group {g} inode table 끝이 파일시스템 범위를 벗어났습니다.")
+
+            start, end = group_block_range(self, g)
+            group_blocks = max(0, end - start)
+            inode_start = g * self.sb.inodes_per_group
+            group_inodes = max(
+                0,
+                min(self.sb.inodes_per_group, self.sb.inodes_count - inode_start),
+            )
+            if gd.free_blocks < 0 or gd.free_blocks > group_blocks:
+                raise Ext4Error(f"block group {g} free block count가 비정상입니다.")
+            if gd.free_inodes < 0 or gd.free_inodes > group_inodes:
+                raise Ext4Error(f"block group {g} free inode count가 비정상입니다.")
+
+            if not (gd.flags & C.BG_BLOCK_UNINIT):
+                raw = self.read_block(gd.block_bitmap)
+                if not bitmap_checksum_valid(self, gd, "block", raw):
+                    raise Ext4Error(f"block group {g} block bitmap checksum 불일치")
+                actual = bitmap_free_count(raw, group_blocks)
+                if actual != gd.free_blocks:
+                    raise Ext4Error(
+                        f"block group {g} free block count 불일치: descriptor={gd.free_blocks} bitmap={actual}"
+                    )
+                bitmaps_checked += 1
+
+            if not (gd.flags & C.BG_INODE_UNINIT):
+                raw = self.read_block(gd.inode_bitmap)
+                if not bitmap_checksum_valid(self, gd, "inode", raw):
+                    raise Ext4Error(f"block group {g} inode bitmap checksum 불일치")
+                actual = bitmap_free_count(raw, group_inodes)
+                if actual != gd.free_inodes:
+                    raise Ext4Error(
+                        f"block group {g} free inode count 불일치: descriptor={gd.free_inodes} bitmap={actual}"
+                    )
+                bitmaps_checked += 1
+
+            free_blocks_total += gd.free_blocks
+            free_inodes_total += gd.free_inodes
+            groups_checked += 1
+
+        if free_blocks_total != self.sb.free_blocks_count:
+            raise Ext4Error(
+                "superblock/group descriptor free block 합계가 일치하지 않습니다: "
+                f"super={self.sb.free_blocks_count} groups={free_blocks_total}"
+            )
+        if free_inodes_total != self.sb.free_inodes_count:
+            raise Ext4Error(
+                "superblock/group descriptor free inode 합계가 일치하지 않습니다: "
+                f"super={self.sb.free_inodes_count} groups={free_inodes_total}"
+            )
+
+        root = self.read_inode(C.EXT4_ROOT_INO)
+        if not root.is_dir or root.links < 2:
+            raise Ext4Error("root inode 구조가 올바르지 않습니다.")
+        if not inode_checksum_valid(self.sb, root):
+            raise Ext4Error("root inode checksum이 일치하지 않습니다.")
+
+        for ex in file_extents(self, root):
+            if ex.physical < self.sb.first_data_block or ex.physical + ex.length > self.sb.blocks_count:
+                raise Ext4Error("root directory extent가 파일시스템 범위를 벗어났습니다.")
+
+        if self.sb.has_journal and self.sb.journal_inum:
+            journal_inode = self.read_inode(self.sb.journal_inum)
+            if not inode_checksum_valid(self.sb, journal_inode):
+                raise Ext4Error("journal inode checksum이 일치하지 않습니다.")
+            for ex in file_extents(self, journal_inode):
+                if ex.physical < self.sb.first_data_block or ex.physical + ex.length > self.sb.blocks_count:
+                    raise Ext4Error("journal extent가 파일시스템 범위를 벗어났습니다.")
+
+        if root.is_indexed:
+            lblocks = _htree_leaves(self, root)
+        else:
+            lblocks = list(range(max(1, dir_block_count(root, self.sb.block_size))))
+        for lblk in lblocks:
+            block = read_dir_lblock(self, root, lblk)
+            if not dir_block_checksum_valid(self, root, block):
+                raise Ext4Error(f"root directory block {lblk} checksum이 일치하지 않습니다.")
+
+        root_entries = list_dir(self, root)
+        for entry in root_entries:
+            if entry.inode < 1 or entry.inode > self.sb.inodes_count:
+                raise Ext4Error(
+                    f"root directory entry '{entry.name}' inode가 범위를 벗어났습니다: {entry.inode}"
+                )
+
+        # Re-read the on-disk superblock immediately before changing state so a
+        # stale GUI selection cannot clear an error bit on a different medium.
+        raw = self.dev.read(self.part_offset + 1024, 1024)
+        disk_sb = parse_superblock(raw)
+        if disk_sb.uuid != self.sb.uuid:
+            raise Ext4Error("검사 중 저장장치가 바뀌어 ERROR_FS 복구를 중단했습니다.")
+        if not superblock_checksum_valid(disk_sb):
+            raise Ext4Error("최종 확인에서 superblock checksum이 일치하지 않습니다.")
+        if disk_sb.needs_recovery or self.journal_start() != 0:
+            raise Ext4Error("최종 확인에서 JBD2가 clean 상태가 아닙니다.")
+        if not (disk_sb.state & C.EXT4_ERROR_FS):
+            self.reload_metadata()
+            return ErrorRepairStats(False, groups_checked, bitmaps_checked, len(root_entries), int(info["count"]))
+
+        disk_sb.state &= ~C.EXT4_ERROR_FS
+        struct.pack_into("<H", disk_sb.raw, 0x3A, disk_sb.state & 0xFFFF)
+        disk_sb.write_checksum()
+        self.dev.write(self.part_offset + 1024, bytes(disk_sb.raw[:1024]))
+        self.dev.flush()
+        self.reload_metadata()
+
+        if self.sb.state & C.EXT4_ERROR_FS:
+            raise Ext4Error("ERROR_FS 상태를 디스크에 반영하지 못했습니다.")
+        LOG.warning(
+            "EXT4 ERROR_FS 자동 복구 완료 groups=%s bitmaps=%s root_entries=%s historical_errors=%s",
+            groups_checked,
+            bitmaps_checked,
+            len(root_entries),
+            info["count"],
+        )
+        return ErrorRepairStats(
+            True,
+            groups_checked,
+            bitmaps_checked,
+            len(root_entries),
+            int(info["count"]),
+        )
 
     def fs_write_blockers(self) -> list[str]:
         return self.hard_write_blockers() + self.soft_write_warnings()
