@@ -29,7 +29,7 @@ from ext4lib.mount.fuse import (
     winfsp_available,
 )
 from ext4lib.io.backend import ImageDevice
-from ext4lib.fs.volume import Ext4Volume, VolumeInfo, discover_volumes, format_bytes
+from ext4lib.fs.volume import Ext4Volume, VolumeInfo, discover_volumes, format_bytes, probe_superblock
 from ext4lib.windows.disk import (
     DiskInfo,
     WindowsPhysicalDevice,
@@ -508,7 +508,7 @@ class App(tk.Tk):
                     "end",
                     text=f"{v.sb.fs_type}  {v.label}",
                     values=(
-                        v.scheme or self._t("partition"),
+                        self._partition_scheme_label(v),
                         format_bytes(v.sb.blocks_count * v.sb.block_size),
                         state,
                         letter,
@@ -553,7 +553,7 @@ class App(tk.Tk):
                     "end",
                     text=f"{x.sb.fs_type}  {x.label}",
                     values=(
-                        x.scheme or self._t("partition"),
+                        self._partition_scheme_label(x),
                         format_bytes(x.sb.blocks_count * x.sb.block_size),
                         self._t("readonly") if x.write_blockers else self._t("writable"),
                         "",
@@ -573,6 +573,94 @@ class App(tk.Tk):
 
     def _vol_key(self, kind: str, path: str, vinfo: VolumeInfo) -> str:
         return f"{kind}:{path}:{vinfo.offset}"
+
+    def _partition_scheme_label(self, vinfo: VolumeInfo) -> str:
+        if vinfo.scheme == "GPT":
+            return self._t("scheme_gpt")
+        if vinfo.scheme == "MBR":
+            return self._t("scheme_mbr")
+        if vinfo.scheme in ("전체", "슈퍼블록") or not vinfo.scheme:
+            return self._t("scheme_whole")
+        return vinfo.scheme
+
+    def _verify_physical_selection(self, disk: DiskInfo, vinfo: VolumeInfo) -> None:
+        """Revalidate the selected medium before any lock/dismount/write action."""
+        check = WindowsPhysicalDevice(disk.path, disk.sector_size, writable=False)
+        try:
+            current_size = int(check.size() or 0)
+            if disk.size and current_size and int(disk.size) != current_size:
+                raise RuntimeError(
+                    self._t(
+                        "device_identity_changed",
+                        detail=f"disk size {disk.size} -> {current_size}",
+                    )
+                )
+
+            scanned_serial = (disk.serial or "").strip().lower()
+            current_serial = (check.serial or "").strip().lower()
+            if scanned_serial and current_serial and scanned_serial != current_serial:
+                raise RuntimeError(
+                    self._t(
+                        "device_identity_changed",
+                        detail="storage serial changed",
+                    )
+                )
+
+            current_sb = probe_superblock(check, vinfo.offset)
+            if current_sb is None:
+                raise RuntimeError(
+                    self._t(
+                        "device_identity_changed",
+                        detail=f"EXT superblock missing at offset {vinfo.offset}",
+                    )
+                )
+            if current_sb.uuid != vinfo.sb.uuid:
+                raise RuntimeError(
+                    self._t(
+                        "device_identity_changed",
+                        detail=(
+                            f"EXT UUID {vinfo.sb.uuid.hex()} -> "
+                            f"{current_sb.uuid.hex()}"
+                        ),
+                    )
+                )
+            if (
+                current_sb.block_size != vinfo.sb.block_size
+                or current_sb.blocks_count != vinfo.sb.blocks_count
+            ):
+                raise RuntimeError(
+                    self._t(
+                        "device_identity_changed",
+                        detail="EXT geometry changed after scan",
+                    )
+                )
+
+            current_vols = discover_volumes(check)
+            match = next(
+                (
+                    item
+                    for item in current_vols
+                    if item.offset == vinfo.offset and item.sb.uuid == vinfo.sb.uuid
+                ),
+                None,
+            )
+            if match is None:
+                raise RuntimeError(
+                    self._t(
+                        "device_identity_changed",
+                        detail="selected partition no longer exists at the scanned offset",
+                    )
+                )
+            if vinfo.size and match.size and int(vinfo.size) != int(match.size):
+                raise RuntimeError(
+                    self._t(
+                        "device_identity_changed",
+                        detail=f"partition size {vinfo.size} -> {match.size}",
+                    )
+                )
+        finally:
+            check.close()
+
 
     def _run_with_progress(
         self,
@@ -734,6 +822,9 @@ class App(tk.Tk):
                 partition_number=vinfo.partition_index,
                 partition_offset=vinfo.offset,
                 partition_size=vinfo.size,
+                expected_size=disk.size,
+                expected_serial=disk.serial,
+                expected_ext_uuid=vinfo.sb.uuid,
             )
             src = disk.path
         elif kind == "imgvol":
@@ -784,6 +875,17 @@ class App(tk.Tk):
             writable = False
 
         try:
+            if kind == "vol":
+                self.set_status(self._t("verifying_device"))
+                self.update_idletasks()
+                self._verify_physical_selection(disk, vinfo)
+                LOG.info(
+                    "선택 장치 재검증 성공 path=%s offset=%s uuid=%s serial=%s",
+                    disk.path,
+                    vinfo.offset,
+                    vinfo.sb.uuid.hex(),
+                    disk.serial or "-",
+                )
             letter = self._chosen_letter()
             self.set_status(self._t("mounting", letter=letter))
             self.update_idletasks()
