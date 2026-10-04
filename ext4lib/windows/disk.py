@@ -3484,9 +3484,9 @@ class WindowsPhysicalDevice(BlockDevice):
                         _nt_status_hex(status),
                     )
 
-            # WRITE(10) bypasses those file-object caches. Do not claim an
-            # EXT4/JBD2 commit is durable until the bridge confirms its own
-            # volatile write cache has been synchronized to the card.
+            # Plain WRITE(10) bypasses Windows file-object caches. FUA writes
+            # need no extra barrier; plain writes use cache-sync when the bridge
+            # supports it and a learned compatibility path when it does not.
             self._scsi_synchronize_cache()
 
     def close(self) -> None:
