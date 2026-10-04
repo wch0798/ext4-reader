@@ -1,1 +1,1 @@
-"""EXT4 Reader regression tests."""\n
+"""EXT4 Reader regression tests."""
