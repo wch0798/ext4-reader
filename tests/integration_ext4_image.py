@@ -15,7 +15,9 @@ from ext4lib.fs import constants as C
 from ext4lib.fs.journal import _JournalLog
 from ext4lib.fs.extents import extent_at, file_extents
 from ext4lib.fs.orphan import _orphan_block_checksum
-from ext4lib.fs.superblock import parse_superblock
+from ext4lib.fs.bitmap import bitmap_checksum_valid
+from ext4lib.fs.crc32c import crc32c
+from ext4lib.fs.superblock import parse_superblock, update_group_desc_fields
 from ext4lib.fs.volume import Ext4Volume, discover_volumes
 from ext4lib.fs.writer import (
     create_empty_file,
@@ -293,6 +295,89 @@ def error_repair_roundtrip(path: str) -> None:
         final.close()
 
 
+def legacy_bitmap_checksum_repair_roundtrip(path: str) -> None:
+    """Reproduce the old Ext4Reader 64-byte bitmap checksum layout bug."""
+    inject = open_volume(path, True)
+    try:
+        gd = inject.groups[0]
+        if inject.sb.desc_size < 64 or not inject.sb.has_metadata_csum:
+            raise AssertionError("fixture must use 64-byte metadata_csum descriptors")
+        if gd.flags & (C.BG_BLOCK_UNINIT | C.BG_INODE_UNINIT):
+            raise AssertionError("group 0 bitmaps must be initialized")
+
+        block_raw = inject.read_block(gd.block_bitmap)
+        inode_raw = inject.read_block(gd.inode_bitmap)
+        block_crc = crc32c(
+            inject.sb.csum_seed(),
+            block_raw[: inject.sb.blocks_per_group // 8],
+        )
+        inode_crc = crc32c(
+            inject.sb.csum_seed(),
+            inode_raw[: inject.sb.inodes_per_group // 8],
+        )
+        legacy_block_crc = crc32c(inject.sb.csum_seed(), block_raw[: inject.sb.block_size])
+        legacy_inode_crc = crc32c(inject.sb.csum_seed(), inode_raw[: inject.sb.block_size])
+
+        # Exact pre-fix Ext4Reader layout: low halves in the right fields,
+        # high halves incorrectly overwrite bg_exclude_bitmap_hi.
+        gd.raw[0x18:0x1A] = (legacy_block_crc & 0xFFFF).to_bytes(2, "little")
+        gd.raw[0x1A:0x1C] = (legacy_inode_crc & 0xFFFF).to_bytes(2, "little")
+        gd.raw[0x34:0x36] = ((legacy_block_crc >> 16) & 0xFFFF).to_bytes(2, "little")
+        gd.raw[0x36:0x38] = ((legacy_inode_crc >> 16) & 0xFFFF).to_bytes(2, "little")
+
+        # The old writer left the real high-half fields stale. Force them stale
+        # while keeping the descriptor checksum internally valid.
+        gd.raw[0x38:0x3A] = (((block_crc >> 16) ^ 1) & 0xFFFF).to_bytes(2, "little")
+        gd.raw[0x3A:0x3C] = (((inode_crc >> 16) ^ 1) & 0xFFFF).to_bytes(2, "little")
+        update_group_desc_fields(inject.sb, gd)
+        gdt_block = inject.sb.first_data_block + 1
+        off = gdt_block * inject.sb.block_size
+        inject.dev.write(off, bytes(gd.raw[: inject.sb.desc_size]))
+
+        raw = bytearray(inject.dev.read(1024, 1024))
+        sb = parse_superblock(raw)
+        sb.state |= C.EXT4_ERROR_FS | C.EXT4_VALID_FS
+        struct.pack_into("<H", sb.raw, 0x3A, sb.state & 0xFFFF)
+        struct.pack_into("<I", sb.raw, 0x194, 1)
+        func = b"ext4_validate_block_bitmap"
+        sb.raw[0x1A8:0x1C8] = b"\x00" * 32
+        sb.raw[0x1A8:0x1A8 + len(func)] = func
+        struct.pack_into("<I", sb.raw, 0x1C8, 423)
+        sb.write_checksum()
+        inject.dev.write(1024, bytes(sb.raw[:1024]))
+        inject.dev.flush()
+        inject.close(abort=True)
+    except Exception:
+        inject.close(abort=True)
+        raise
+
+    repair = open_volume(path, True)
+    try:
+        gd = repair.groups[0]
+        assert not bitmap_checksum_valid(
+            repair, gd, "block", repair.read_block(gd.block_bitmap)
+        )
+        assert not bitmap_checksum_valid(
+            repair, gd, "inode", repair.read_block(gd.inode_bitmap)
+        )
+        stats = repair.repair_error_state_if_safe()
+        assert stats.repaired
+        assert stats.bitmap_checksums_repaired == 2
+        assert not (repair.sb.state & C.EXT4_ERROR_FS)
+        gd = repair.groups[0]
+        assert bitmap_checksum_valid(
+            repair, gd, "block", repair.read_block(gd.block_bitmap)
+        )
+        assert bitmap_checksum_valid(
+            repair, gd, "inode", repair.read_block(gd.inode_bitmap)
+        )
+        assert repair.groups[0].raw[0x34:0x38] == b"\x00\x00\x00\x00"
+        repair.close()
+    except Exception:
+        repair.close(abort=True)
+        raise
+
+
 def orphan_repair_roundtrip(path: str) -> None:
     """Inject a real orphan-file entry + ERROR_FS and recover it on Windows."""
     seed = open_volume(path, True)
@@ -440,6 +525,7 @@ def main() -> None:
             "gpt-portable",
             "error-repair",
             "orphan-repair",
+            "legacy-bitmap-repair",
             "htree",
         ),
         default="clean",
@@ -458,6 +544,8 @@ def main() -> None:
         error_repair_roundtrip(args.image)
     elif args.mode == "orphan-repair":
         orphan_repair_roundtrip(args.image)
+    elif args.mode == "legacy-bitmap-repair":
+        legacy_bitmap_checksum_repair_roundtrip(args.image)
     else:
         htree_roundtrip(args.image)
 
