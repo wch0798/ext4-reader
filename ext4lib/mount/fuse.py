@@ -286,6 +286,7 @@ class Ext4FuseOps:
         self._win_flags: dict[str, int] = {}
         self._st_flags = 0
         self._write_failure: BaseException | None = None
+        self._write_failure_repeat_count = 0
 
     def _node(self, path: str):
         ino = self._path_ino.get(path)
@@ -427,11 +428,17 @@ class Ext4FuseOps:
             was_failed = self._write_failure is not None
             self._latch_write_failure(exc, getattr(fn, "__name__", str(fn)))
             if was_failed:
-                LOG.debug(
-                    "이전 쓰기 오류로 EIO 반환 %s %s",
-                    getattr(fn, "__name__", fn),
-                    _brief_args(args),
-                )
+                self._write_failure_repeat_count += 1
+                if (
+                    self._write_failure_repeat_count == 1
+                    or self._write_failure_repeat_count % 128 == 0
+                ):
+                    LOG.debug(
+                        "이전 쓰기 오류로 EIO 반환 %s %s (반복=%s)",
+                        getattr(fn, "__name__", fn),
+                        _brief_args(args),
+                        self._write_failure_repeat_count,
+                    )
             else:
                 key = (getattr(fn, "__name__", str(fn)), type(exc).__name__, str(exc)[:200])
                 if key not in self._logged:
