@@ -295,6 +295,71 @@ def error_repair_roundtrip(path: str) -> None:
         final.close()
 
 
+def bitmap_high_half_repair_roundtrip(path: str) -> None:
+    """Repair a Linux-style block bitmap checksum with only stale high bits."""
+    inject = open_volume(path, True)
+    try:
+        gd = inject.groups[0]
+        if inject.sb.desc_size < 64 or not inject.sb.has_metadata_csum:
+            raise AssertionError("fixture must use 64-byte metadata_csum descriptors")
+        if gd.flags & C.BG_BLOCK_UNINIT:
+            raise AssertionError("group 0 block bitmap must be initialized")
+
+        block_raw = inject.read_block(gd.block_bitmap)
+        block_crc = crc32c(
+            inject.sb.csum_seed(),
+            block_raw[: inject.sb.blocks_per_group // 8],
+        )
+        # Keep the low half correct and corrupt only the high half. This
+        # reproduces the class of media in which Linux reported
+        # ext4_validate_block_bitmap but all local bitmap invariants remain
+        # consistent.
+        gd.raw[0x18:0x1A] = (block_crc & 0xFFFF).to_bytes(2, "little")
+        gd.raw[0x38:0x3A] = (((block_crc >> 16) ^ 1) & 0xFFFF).to_bytes(2, "little")
+        update_group_desc_fields(inject.sb, gd)
+        gdt_block = inject.sb.first_data_block + 1
+        inject.dev.write(
+            gdt_block * inject.sb.block_size,
+            bytes(gd.raw[: inject.sb.desc_size]),
+        )
+
+        raw = bytearray(inject.dev.read(1024, 1024))
+        sb = parse_superblock(raw)
+        sb.state |= C.EXT4_ERROR_FS | C.EXT4_VALID_FS
+        struct.pack_into("<H", sb.raw, 0x3A, sb.state & 0xFFFF)
+        struct.pack_into("<I", sb.raw, 0x194, 1)
+        func = b"ext4_validate_block_bitmap"
+        sb.raw[0x1A8:0x1C8] = b"\x00" * 32
+        sb.raw[0x1A8:0x1A8 + len(func)] = func
+        struct.pack_into("<I", sb.raw, 0x1C8, 423)
+        sb.write_checksum()
+        inject.dev.write(1024, bytes(sb.raw[:1024]))
+        inject.dev.flush()
+        inject.close(abort=True)
+    except Exception:
+        inject.close(abort=True)
+        raise
+
+    repair = open_volume(path, True)
+    try:
+        gd = repair.groups[0]
+        assert not bitmap_checksum_valid(
+            repair, gd, "block", repair.read_block(gd.block_bitmap)
+        )
+        stats = repair.repair_error_state_if_safe()
+        assert stats.repaired
+        assert stats.bitmap_checksums_repaired == 1
+        assert not (repair.sb.state & C.EXT4_ERROR_FS)
+        gd = repair.groups[0]
+        assert bitmap_checksum_valid(
+            repair, gd, "block", repair.read_block(gd.block_bitmap)
+        )
+        repair.close()
+    except Exception:
+        repair.close(abort=True)
+        raise
+
+
 def legacy_bitmap_checksum_repair_roundtrip(path: str) -> None:
     """Reproduce the old Ext4Reader 64-byte bitmap checksum layout bug."""
     inject = open_volume(path, True)
@@ -526,6 +591,7 @@ def main() -> None:
             "error-repair",
             "orphan-repair",
             "legacy-bitmap-repair",
+            "bitmap-high-repair",
             "htree",
         ),
         default="clean",
@@ -546,6 +612,8 @@ def main() -> None:
         orphan_repair_roundtrip(args.image)
     elif args.mode == "legacy-bitmap-repair":
         legacy_bitmap_checksum_repair_roundtrip(args.image)
+    elif args.mode == "bitmap-high-repair":
+        bitmap_high_half_repair_roundtrip(args.image)
     else:
         htree_roundtrip(args.image)
 
