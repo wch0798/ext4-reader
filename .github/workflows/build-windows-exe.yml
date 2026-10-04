@@ -127,7 +127,7 @@ jobs:
       - name: Install e2fsprogs
         run: |
           sudo apt-get update
-          sudo apt-get install -y e2fsprogs
+          sudo apt-get install -y e2fsprogs gdisk
 
       - name: Create EXT4 test images
         run: |
@@ -138,16 +138,33 @@ jobs:
           truncate -s 256M journal.img
           mkfs.ext4 -F -q -b 4096 -O 64bit,metadata_csum,^orphan_file,^fast_commit journal.img
 
+          # Real disk layout: GPT + one Linux filesystem partition containing EXT4.
+          truncate -s 320M gpt.img
+          sgdisk -og gpt.img
+          sgdisk -n 1:2048:526335 -t 1:8300 -c 1:EXT4TEST gpt.img
+          truncate -s 256M gpt-part-seed.img
+          mkfs.ext4 -F -q -b 4096 -O 64bit,metadata_csum,^orphan_file,^fast_commit gpt-part-seed.img
+          dd if=gpt-part-seed.img of=gpt.img bs=512 seek=2048 conv=notrunc status=none
+
       - name: Exercise EXT4 writer
         run: |
           python -m tests.integration_ext4_image clean.img --mode clean
           python -m tests.integration_ext4_image dirty.img --mode dirty-marker
           python -m tests.integration_ext4_image journal.img --mode journal-replay
+          python -m tests.integration_ext4_image gpt.img --mode gpt-portable
 
       - name: Validate clean images with e2fsck
         run: |
           sudo e2fsck -fn clean.img
           sudo e2fsck -fn journal.img
+
+          # Validate that the GPT itself is still valid and that the EXT4
+          # partition is independently readable after being moved/extracted.
+          sgdisk -v gpt.img
+          dd if=gpt.img of=gpt-part-after.img bs=512 skip=2048 count=524288 status=none
+          sudo e2fsck -fn gpt-part-after.img
+          dumpe2fs -h gpt-part-after.img >/dev/null
+          debugfs -R "stat /portable.bin" gpt-part-after.img
 
       - name: Validate crash-marked image with e2fsck
         run: |
