@@ -5,8 +5,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from io_backend import IoError
-import system_raw_helper as helper
+from ext4lib.io.backend import IoError
+from ext4lib.windows import system_raw as helper
 
 
 class SystemRawHelperTests(unittest.TestCase):
@@ -56,7 +56,7 @@ class SystemRawHelperTests(unittest.TestCase):
                 self.assertEqual(fp.read(), b"fake-pyinstaller-image")
 
     def test_execute_uses_system_unbuffered_before_normal_fresh_write(self):
-        import windows_disk as wd
+        from ext4lib.windows import disk as wd
 
         req = self.make_request()
         devno = wd.STORAGE_DEVICE_NUMBER()
@@ -98,7 +98,7 @@ class SystemRawHelperTests(unittest.TestCase):
         self.assertEqual(calls[0][4]["expected_device_type"], 7)
 
     def test_execute_uses_fresh_system_physicaldrive_after_duplicated_handles_fail(self):
-        import windows_disk as wd
+        from ext4lib.windows import disk as wd
 
         req = self.make_request()
         data = base64.b64decode(req["data_b64"])
@@ -139,7 +139,7 @@ class SystemRawHelperTests(unittest.TestCase):
         self.assertEqual(result["method"], "SYSTEM fresh-PhysicalDrive WriteFile")
 
     def test_execute_can_set_whole_disk_offline_before_fresh_system_write(self):
-        import windows_disk as wd
+        from ext4lib.windows import disk as wd
 
         req = self.make_request()
         req["try_disk_offline"] = True
