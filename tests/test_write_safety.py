@@ -12,6 +12,7 @@ class DummyVolume:
         self.fail_sync = fail_sync
         self.sync_calls = []
         self.closed = False
+        self.finished = False
 
     def commit_metadata(self, sync=True):
         self.sync_calls.append(bool(sync))
@@ -20,6 +21,9 @@ class DummyVolume:
 
     def read_inode(self, ino):
         return SimpleNamespace(ino=ino)
+
+    def finish_write_session(self):
+        self.finished = True
 
     def close(self):
         self.closed = True
@@ -87,8 +91,59 @@ class WriteSafetyTests(unittest.TestCase):
                 fm.unmount("E:")
 
         self.assertIn("마지막 디스크 반영이 실패", str(cm.exception))
+        self.assertFalse(vol.finished)
         self.assertTrue(vol.closed)
         self.assertNotIn("E:", fm._SESSIONS)
+
+
+class WriteSessionStateTests(unittest.TestCase):
+    def _make_volume(self):
+        class Device:
+            writable = True
+
+            def __init__(self):
+                self.writes = []
+                self.flushes = 0
+
+            def write(self, offset, data):
+                self.writes.append((offset, bytes(data)))
+
+            def flush(self):
+                self.flushes += 1
+
+        raw = bytearray(1024)
+        state = fm.C.EXT4_VALID_FS if hasattr(fm, "C") else 1
+        # Import here to keep this test focused on volume state transitions.
+        from ext4lib.fs import constants as C
+        from ext4lib.fs.volume import Ext4Volume
+
+        sb = SimpleNamespace(
+            raw=raw,
+            state=C.EXT4_VALID_FS,
+            write_checksum=lambda: None,
+        )
+        vol = Ext4Volume.__new__(Ext4Volume)
+        vol.dev = Device()
+        vol.owns_device = False
+        vol.part_offset = 1048576
+        vol.sb = sb
+        vol._data_dirty = False
+        vol._write_session_active = False
+        vol.commit_metadata = lambda sync=True: vol.dev.flush() if sync else None
+        return vol, C
+
+    def test_write_session_marks_unclean_then_restores_clean(self):
+        vol, C = self._make_volume()
+
+        vol.begin_write_session()
+        self.assertTrue(vol._write_session_active)
+        self.assertFalse(vol.sb.state & C.EXT4_VALID_FS)
+        self.assertGreaterEqual(vol.dev.flushes, 1)
+
+        vol.finish_write_session()
+        self.assertFalse(vol._write_session_active)
+        self.assertTrue(vol.sb.state & C.EXT4_VALID_FS)
+        self.assertGreaterEqual(vol.dev.flushes, 3)
 
 
 if __name__ == "__main__":
