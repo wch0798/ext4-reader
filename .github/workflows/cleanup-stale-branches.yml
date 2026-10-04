@@ -1,3 +1,4 @@
+# one-time cleanup trigger
 name: Cleanup stale branches
 
 on:
