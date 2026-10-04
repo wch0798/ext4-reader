@@ -323,68 +323,30 @@ class App(tk.Tk):
     def ensure_winfsp(self, force: bool = False, show_success: bool = False) -> bool:
         if not force and winfsp_ready():
             return True
-        dlg = tk.Toplevel(self)
-        dlg.title("WinFsp 설치")
-        dlg.configure(bg=BG)
-        dlg.resizable(False, False)
-        dlg.transient(self)
-        dlg.protocol("WM_DELETE_WINDOW", lambda: None)
-        ttk.Label(
-            dlg,
-            text="탐색기 드라이브에 필요한 WinFsp를 내려받아 설치합니다.",
-            wraplength=420,
-        ).pack(padx=20, pady=(16, 6))
-        status = ttk.Label(dlg, text="준비 중…", wraplength=420)
-        status.pack(padx=20, pady=(0, 16))
-        dlg.update_idletasks()
-        dlg.geometry(f"+{self.winfo_rootx() + 80}+{self.winfo_rooty() + 80}")
-        dlg.grab_set()
-        q: queue.Queue = queue.Queue()
-
-        def work():
-            try:
-                path = ensure_winfsp_installed(progress=lambda m: q.put(("p", m)), force=force)
-                q.put(("ok", path))
-            except Exception as exc:
-                q.put(("err", exc))
-
-        threading.Thread(target=work, daemon=True).start()
-        result: dict = {"ok": False, "err": None, "path": None}
-
-        def poll():
-            try:
-                kind, payload = q.get_nowait()
-            except queue.Empty:
-                dlg.after(80, poll)
-                return
-            if kind == "p":
-                status.config(text=str(payload))
-                dlg.after(80, poll)
-                return
-            if kind == "ok":
-                result["ok"] = True
-                result["path"] = payload
-            else:
-                result["err"] = payload
-            dlg.grab_release()
-            dlg.destroy()
-
-        poll()
-        self.wait_window(dlg)
-        if result["ok"]:
-            if show_success:
-                messagebox.showinfo("WinFsp", f"설치되어 있습니다.\n\n{result['path']}")
-            else:
-                self.set_status("WinFsp 설치가 완료되었습니다.")
-            return True
-        err = result["err"]
-        if isinstance(err, WinFspSetupError) and err.reboot_required:
-            if messagebox.askyesno("재시작 필요", f"{err}\n\n지금 PC를 재시작할까요?"):
-                os.system("shutdown /r /t 5")
-            return False
-        if err is not None:
+        try:
+            path = self._run_with_progress(
+                "WinFsp 설치 중",
+                "탐색기 드라이브에 필요한 WinFsp를 내려받아 설치합니다.\n"
+                "진행 상태는 이 메인 창 안에서 표시됩니다.",
+                lambda report: ensure_winfsp_installed(progress=report, force=force),
+                progress_aware=True,
+            )
+        except WinFspSetupError as err:
+            if err.reboot_required:
+                if messagebox.askyesno("재시작 필요", f"{err}\n\n지금 PC를 재시작할까요?"):
+                    os.system("shutdown /r /t 5")
+                return False
             messagebox.showerror("WinFsp 설치 실패", str(err))
-        return winfsp_ready()
+            return winfsp_ready()
+        except Exception as err:
+            messagebox.showerror("WinFsp 설치 실패", str(err))
+            return winfsp_ready()
+
+        if show_success:
+            messagebox.showinfo("WinFsp", f"설치되어 있습니다.\n\n{path}")
+        else:
+            self.set_status("WinFsp 설치가 완료되었습니다.")
+        return True
 
     def check_winfsp(self) -> None:
         dll = find_winfsp_dll()
@@ -409,78 +371,15 @@ class App(tk.Tk):
                 )
             return True
 
-        dlg = tk.Toplevel(self)
-        dlg.title("UsbDk 선택 설치")
-        dlg.configure(bg=BG)
-        dlg.resizable(False, False)
-        dlg.transient(self)
-        dlg.protocol("WM_DELETE_WINDOW", lambda: None)
-        ttk.Label(
-            dlg,
-            text=(
-                "공식 UsbDk 1.0.22 x64 MSI를 GitHub에서 내려받아 SHA-256을 확인한 뒤 설치합니다.\n"
-                "UsbDk는 시스템 USB 필터 드라이버이므로 선택 설치이며, 일반 리더기에는 사용하지 않습니다."
-            ),
-            wraplength=500,
-        ).pack(padx=20, pady=(16, 6))
-        status = ttk.Label(dlg, text="준비 중…", wraplength=500)
-        status.pack(padx=20, pady=(0, 16))
-        dlg.update_idletasks()
-        dlg.geometry(f"+{self.winfo_rootx() + 80}+{self.winfo_rooty() + 80}")
-        dlg.grab_set()
-        q: queue.Queue = queue.Queue()
-
-        def work():
-            try:
-                result = install_usbdk(progress=lambda m: q.put(("p", m)))
-                q.put(("ok", result))
-            except Exception as exc:
-                q.put(("err", exc))
-
-        threading.Thread(target=work, daemon=True).start()
-        result_box: dict = {"result": None, "err": None}
-
-        def poll():
-            try:
-                kind, payload = q.get_nowait()
-            except queue.Empty:
-                dlg.after(80, poll)
-                return
-            if kind == "p":
-                status.config(text=str(payload))
-                dlg.after(80, poll)
-                return
-            if kind == "ok":
-                result_box["result"] = payload
-            else:
-                result_box["err"] = payload
-            dlg.grab_release()
-            dlg.destroy()
-
-        poll()
-        self.wait_window(dlg)
-
-        result = result_box["result"]
-        if result is not None:
-            if result.reboot_required:
-                if messagebox.askyesno(
-                    "UsbDk 설치 완료 — 재시작 필요",
-                    "UsbDk 설치가 완료됐지만 적용을 위해 Windows 재시작이 필요합니다.\n\n"
-                    "지금 PC를 재시작할까요?",
-                ):
-                    os.system("shutdown /r /t 5")
-                return False
-            if show_success:
-                messagebox.showinfo(
-                    "UsbDk 설치 완료",
-                    "UsbDk가 준비되었습니다.\n\n"
-                    "카드리더를 다시 꽂거나 디스크 다시 검색 후 쓰기 연결을 다시 시도하세요. "
-                    "UsbDk는 Windows raw-write가 모두 실패하는 USB 리더기에만 자동 사용됩니다.",
-                )
-            return True
-
-        err = result_box["err"]
-        if err is not None:
+        try:
+            result = self._run_with_progress(
+                "UsbDk 설치 중",
+                "공식 UsbDk 1.0.22 x64 MSI를 다운로드하고 SHA-256을 확인한 뒤 설치합니다.\n"
+                "시스템 USB 필터 드라이버 설치 진행 상태를 이 메인 창 안에 표시합니다.",
+                lambda report: install_usbdk(progress=report),
+                progress_aware=True,
+            )
+        except Exception as err:
             LOG.error("UsbDk 설치 실패: %s", err)
             message = str(err)
             if isinstance(err, UsbDkSetupError) and err.manual_install:
@@ -492,7 +391,24 @@ class App(tk.Tk):
                     webbrowser.open(USBDK_RELEASE_URL)
             else:
                 messagebox.showerror("UsbDk 설치 실패", message)
-        return usbdk_ready()
+            return usbdk_ready()
+
+        if result.reboot_required:
+            if messagebox.askyesno(
+                "UsbDk 설치 완료 — 재시작 필요",
+                "UsbDk 설치가 완료됐지만 적용을 위해 Windows 재시작이 필요합니다.\n\n"
+                "지금 PC를 재시작할까요?",
+            ):
+                os.system("shutdown /r /t 5")
+            return False
+        if show_success:
+            messagebox.showinfo(
+                "UsbDk 설치 완료",
+                "UsbDk가 준비되었습니다.\n\n"
+                "카드리더를 다시 꽂거나 디스크 다시 검색 후 쓰기 연결을 다시 시도하세요. "
+                "UsbDk는 Windows raw-write가 모두 실패하는 USB 리더기에만 자동 사용됩니다.",
+            )
+        return True
 
     def check_usbdk(self) -> None:
         if usbdk_ready():
@@ -642,7 +558,14 @@ class App(tk.Tk):
     def _vol_key(self, kind: str, path: str, vinfo: VolumeInfo) -> str:
         return f"{kind}:{path}:{vinfo.offset}"
 
-    def _run_with_progress(self, title: str, message: str, func):
+    def _run_with_progress(
+        self,
+        title: str,
+        message: str,
+        func,
+        *,
+        progress_aware: bool = False,
+    ):
         """Run blocking storage work off the Tk thread with an in-window overlay."""
         if self._operation_active:
             raise RuntimeError("이미 저장장치 작업을 처리하고 있습니다.")
@@ -714,26 +637,40 @@ class App(tk.Tk):
         ).pack(fill="x", pady=(10, 0))
 
         state: dict[str, object] = {}
+        status_updates: queue.Queue = queue.Queue()
         finished = threading.Event()
         done_var = tk.BooleanVar(self, value=False)
         started = time.monotonic()
+        last_detail = "장치 응답을 기다리는 중…"
+
+        def report(message: str) -> None:
+            status_updates.put(str(message))
 
         def worker() -> None:
             try:
-                state["result"] = func()
+                state["result"] = func(report) if progress_aware else func()
             except BaseException as exc:
                 state["error"] = exc
             finally:
                 finished.set()
 
         def poll() -> None:
+            nonlocal last_detail
+            while True:
+                try:
+                    last_detail = status_updates.get_nowait()
+                except queue.Empty:
+                    break
             if finished.is_set():
                 done_var.set(True)
                 return
             elapsed = max(0, int(time.monotonic() - started))
-            detail.set(
-                f"작업 중… {elapsed}초  ·  Windows raw I/O / UsbDk 응답 확인 중"
-            )
+            if progress_aware:
+                detail.set(f"{last_detail}  ·  {elapsed}초")
+            else:
+                detail.set(
+                    f"작업 중… {elapsed}초  ·  Windows raw I/O / UsbDk 응답 확인 중"
+                )
             self.after(100, poll)
 
         thread = threading.Thread(
