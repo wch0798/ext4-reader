@@ -641,6 +641,77 @@ class App(tk.Tk):
     def _vol_key(self, kind: str, path: str, vinfo: VolumeInfo) -> str:
         return f"{kind}:{path}:{vinfo.offset}"
 
+    def _run_with_progress(self, title: str, message: str, func):
+        """Run blocking storage work off the Tk thread while keeping the UI responsive."""
+        dialog = tk.Toplevel(self)
+        dialog.title(title)
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        dialog.configure(bg=BG)
+        dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text=message, wraplength=420, justify="left").pack(
+            fill="x", pady=(0, 10)
+        )
+        detail = tk.StringVar(value="장치 응답을 기다리는 중…")
+        ttk.Label(frame, textvariable=detail, style="Dim.TLabel").pack(
+            fill="x", pady=(0, 8)
+        )
+        progress = ttk.Progressbar(frame, mode="indeterminate", length=420)
+        progress.pack(fill="x")
+        progress.start(12)
+
+        state: dict[str, object] = {}
+        finished = threading.Event()
+        done_var = tk.BooleanVar(self, value=False)
+        started = time.monotonic()
+
+        def worker() -> None:
+            try:
+                state["result"] = func()
+            except BaseException as exc:
+                state["error"] = exc
+            finally:
+                finished.set()
+
+        def poll() -> None:
+            if finished.is_set():
+                done_var.set(True)
+                return
+            elapsed = max(0, int(time.monotonic() - started))
+            detail.set(
+                f"작업 중… {elapsed}초  ·  Windows raw I/O / UsbDk 응답 확인 중"
+            )
+            self.after(100, poll)
+
+        thread = threading.Thread(
+            target=worker,
+            daemon=True,
+            name="ext4-storage-operation",
+        )
+        thread.start()
+        self.after(100, poll)
+
+        try:
+            dialog.grab_set()
+            self.wait_variable(done_var)
+        finally:
+            try:
+                progress.stop()
+                dialog.grab_release()
+            except tk.TclError:
+                pass
+            try:
+                dialog.destroy()
+            except tk.TclError:
+                pass
+
+        if "error" in state:
+            raise state["error"]
+        return state.get("result")
+
     def mount_selected(self) -> None:
         node = self._selected_volume()
         if not node:
@@ -739,7 +810,13 @@ class App(tk.Tk):
                     try:
                         self.set_status("EXT4 저널을 Windows에서 복구하는 중…")
                         self.update_idletasks()
-                        recovery_stats = vol.recover_pending_journal()
+                        recovery_stats = self._run_with_progress(
+                            "EXT4 저널 복구 중",
+                            "저널을 안전하게 재생하고 있습니다.\n"
+                            "Windows raw-write가 차단되면 LocalSystem/UsbDk 경로를 순서대로 확인합니다.\n"
+                            "이 작업 동안 창은 계속 응답합니다.",
+                            vol.recover_pending_journal,
+                        )
                         LOG.info(
                             "Windows JBD2 복구 성공 transactions=%s replayed=%s revoked=%s",
                             recovery_stats.transactions,
