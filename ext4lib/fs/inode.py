@@ -115,6 +115,17 @@ class Inode:
         self.mode = mode
         struct.pack_into("<H", self.raw, 0x00, mode)
 
+    def set_owner(self, uid: int, gid: int) -> None:
+        uid = int(uid) & 0xFFFFFFFF
+        gid = int(gid) & 0xFFFFFFFF
+        self.uid = uid
+        self.gid = gid
+        struct.pack_into("<H", self.raw, 0x02, uid & 0xFFFF)
+        struct.pack_into("<H", self.raw, 0x18, gid & 0xFFFF)
+        if len(self.raw) >= 0x7C:
+            struct.pack_into("<H", self.raw, 0x78, (uid >> 16) & 0xFFFF)
+            struct.pack_into("<H", self.raw, 0x7A, (gid >> 16) & 0xFFFF)
+
     def apply_checksum(self, sb: Superblock) -> None:
         apply_inode_checksum(sb, self)
 
