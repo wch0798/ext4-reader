@@ -47,12 +47,16 @@ python -m pip install -r requirements.txt
 
 ## 소스 구조
 
-소스는 별도 `ext4reader/` 패키지 복사본 없이 **저장소 루트 한 곳**만 사용합니다.
+루트에는 실행 진입점만 두고 실제 기능은 **`ext4lib/` 라이브러리 한 벌**로 관리합니다.
 
-- `main.py`: 실행 진입점
-- `gui.py`, `windows_disk.py`, `volume.py`, `journal.py` 등: 핵심 모듈
+- `main.py`: 유일한 Python 실행 진입점
+- `ext4lib/fs/`: EXT4 슈퍼블록, inode, extent, 디렉터리, 저널, 쓰기 처리
+- `ext4lib/io/`: 블록 장치 I/O 추상화
+- `ext4lib/windows/`: Windows raw I/O, LocalSystem, UsbDk, WinFsp
+- `ext4lib/mount/`: FUSE/탐색기 마운트
+- `ext4lib/ui/`: GUI와 드래그 앤 드롭
 - `tests/`: 회귀 테스트
 - `Ext4Reader.spec`: PyInstaller 빌드 정의
 - `Ext4Reader.exe`: GitHub Actions가 최신 소스로 자동 생성한 실행 파일
 
-소스 실행은 `python main.py` 또는 `run_as_admin.bat`을 사용합니다.
+같은 기능의 소스를 루트와 패키지에 중복 보관하지 않습니다. 소스 실행은 `python main.py` 또는 `run_as_admin.bat`을 사용합니다.
