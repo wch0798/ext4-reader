@@ -197,17 +197,19 @@ def gpt_portable_roundtrip(path: str) -> None:
 
     root = lookup_path(vol, "/")
     node = create_empty_file(vol, root, "portable.bin")
-    assert not vol._write_session_active
-    assert vol.journal_start() == 0
-    assert not vol.sb.needs_recovery
-    assert vol.sb.state & C.EXT4_VALID_FS
+    assert vol._write_session_active
+    assert vol.journal_start() != 0
+    assert vol.sb.needs_recovery
+    assert not (vol.sb.state & C.EXT4_VALID_FS)
 
     payload = (b"portable-ext4-" * 8192) + b"END"
     write_range(vol, node, 0, payload, flush=True)
-    assert not vol._write_session_active
-    assert vol.journal_start() == 0
-    assert not vol.sb.needs_recovery
-    assert vol.sb.state & C.EXT4_VALID_FS
+    assert vol._write_session_active
+    assert vol.journal_start() != 0
+    assert vol.sb.needs_recovery
+    assert not (vol.sb.state & C.EXT4_VALID_FS)
+
+    # A normal close is the single clean handoff point for the mount.
     vol.close()
 
     with open(path, "rb") as fp:
