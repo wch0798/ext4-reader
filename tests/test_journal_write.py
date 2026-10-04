@@ -124,6 +124,71 @@ class MemoryDevice:
         self.flushes += 1
 
 
+class DeferredBlockFreeTests(unittest.TestCase):
+    def test_journaled_free_is_not_reusable_before_sync_commit(self):
+        from ext4lib.fs.bitmap import (
+            AllocError,
+            Bitmap,
+            alloc_blocks,
+            apply_pending_block_frees,
+            free_phys_runs,
+        )
+        from ext4lib.fs.superblock import GroupDesc
+
+        # One tiny group with every block allocated. Block 5 is freed while a
+        # JBD2 transaction is open; it must remain unavailable to allocation
+        # until the pending free is folded into the transaction at sync time.
+        gd = GroupDesc(
+            group=0,
+            block_bitmap=1,
+            inode_bitmap=2,
+            inode_table=3,
+            free_blocks=0,
+            free_inodes=0,
+            used_dirs=0,
+            flags=0,
+            itable_unused=0,
+            raw=bytearray(32),
+        )
+        sb = SimpleNamespace(
+            groups_count=1,
+            first_data_block=0,
+            blocks_per_group=8,
+            blocks_count=8,
+            free_blocks_count=0,
+            block_size=1024,
+            has_metadata_csum=False,
+            has_64bit=False,
+            desc_size=32,
+            has_gdt_csum=False,
+        )
+        bm = Bitmap(bytearray([0xFF]), 8)
+        vol = SimpleNamespace(
+            sb=sb,
+            groups=[gd],
+            _block_bm_cache={0: bm},
+            _dirty_block_bm=set(),
+            _alloc_hint={},
+            dirty_groups=set(),
+            dirty_super=False,
+            _journal_writer=object(),
+            _pending_block_frees=[],
+        )
+
+        free_phys_runs(vol, [(5, 1)])
+        self.assertTrue(bm.test(5))
+        self.assertEqual(gd.free_blocks, 0)
+        self.assertEqual(vol._pending_block_frees, [(5, 1)])
+        with self.assertRaises(AllocError):
+            alloc_blocks(vol, 1)
+
+        apply_pending_block_frees(vol)
+        self.assertFalse(bm.test(5))
+        self.assertEqual(gd.free_blocks, 1)
+        self.assertEqual(vol._pending_block_frees, [])
+        self.assertEqual(alloc_blocks(vol, 1), [5])
+
+
 class MetadataOverlayTests(unittest.TestCase):
     def _volume(self):
         vol = Ext4Volume.__new__(Ext4Volume)
