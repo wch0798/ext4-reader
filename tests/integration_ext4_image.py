@@ -13,6 +13,8 @@ import struct
 
 from ext4lib.fs import constants as C
 from ext4lib.fs.journal import _JournalLog
+from ext4lib.fs.extents import extent_at, file_extents
+from ext4lib.fs.orphan import _orphan_block_checksum
 from ext4lib.fs.superblock import parse_superblock
 from ext4lib.fs.volume import Ext4Volume, discover_volumes
 from ext4lib.fs.writer import (
@@ -290,6 +292,120 @@ def error_repair_roundtrip(path: str) -> None:
     finally:
         final.close()
 
+
+def orphan_repair_roundtrip(path: str) -> None:
+    """Inject a real orphan-file entry + ERROR_FS and recover it on Windows."""
+    seed = open_volume(path, True)
+    try:
+        if not (seed.sb.feature_compat & C.EXT4_FEATURE_COMPAT_ORPHAN_FILE):
+            raise AssertionError("test image has no orphan_file feature")
+        if not seed.sb.orphan_file_inum:
+            raise AssertionError("test image has no orphan file inode")
+
+        root = lookup_path(seed, "/")
+        node = create_empty_file(seed, root, "orphan-keep.bin")
+        payload = b"orphan-recovery-data" * 512
+        write_range(seed, node, 0, payload, flush=True)
+        seed.close()
+    except Exception:
+        seed.close(abort=True)
+        raise
+
+    inject = open_volume(path, True)
+    try:
+        node = lookup_path(inject, "/orphan-keep.bin")
+        orphan_inode = inject.read_inode(inject.sb.orphan_file_inum)
+        ex = extent_at(file_extents(inject, orphan_inode), 0)
+        if ex is None or ex.uninitialized:
+            raise AssertionError("orphan file block 0 is not mapped")
+        phys = ex.physical
+        raw = bytearray(inject.read_block(phys))
+        bs = inject.sb.block_size
+        struct.pack_into("<I", raw, 0, node.ino)
+        struct.pack_into("<I", raw, bs - 8, C.EXT4_ORPHAN_BLOCK_MAGIC)
+        if inject.sb.has_metadata_csum:
+            struct.pack_into("<I", raw, bs - 4, 0)
+            struct.pack_into(
+                "<I",
+                raw,
+                bs - 4,
+                _orphan_block_checksum(inject, orphan_inode, phys, raw),
+            )
+        inject.write_block(phys, bytes(raw))
+
+        inject.sb.feature_ro_compat |= C.EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT
+        inject.sb.state |= C.EXT4_ERROR_FS | C.EXT4_VALID_FS
+        struct.pack_into("<I", inject.sb.raw, 0x64, inject.sb.feature_ro_compat)
+        struct.pack_into("<H", inject.sb.raw, 0x3A, inject.sb.state & 0xFFFF)
+        inject.sb.write_checksum()
+        inject.dev.write(1024, bytes(inject.sb.raw[:1024]))
+        inject.dev.flush()
+        inject.close(abort=True)
+    except Exception:
+        inject.close(abort=True)
+        raise
+
+    repair = open_volume(path, True)
+    try:
+        assert repair.sb.feature_ro_compat & C.EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT
+        assert repair.sb.state & C.EXT4_ERROR_FS
+        assert not repair.journal_needs_recovery()
+
+        ostats = repair.recover_pending_orphans()
+        assert ostats.entries_found == 1
+        assert ostats.truncated == 1
+        assert ostats.deleted == 0
+        assert not (
+            repair.sb.feature_ro_compat
+            & C.EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT
+        )
+
+        estats = repair.repair_error_state_if_safe()
+        assert estats.repaired
+        assert not (repair.sb.state & C.EXT4_ERROR_FS)
+        repair.close()
+    except Exception:
+        repair.close(abort=True)
+        raise
+
+    final = open_volume(path, False)
+    try:
+        assert not (
+            final.sb.feature_ro_compat & C.EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT
+        )
+        assert not (final.sb.state & C.EXT4_ERROR_FS)
+        assert final.sb.state & C.EXT4_VALID_FS
+        node = lookup_path(final, "/orphan-keep.bin")
+        assert read_range(final, node, 0, len(payload)) == payload
+    finally:
+        final.close()
+
+
+def htree_roundtrip(path: str) -> None:
+    """Insert into a Linux-built indexed directory and verify the same path."""
+    vol = open_volume(path, True)
+    try:
+        indexed = lookup_path(vol, "/indexed")
+        assert indexed.is_dir
+        assert indexed.is_indexed, "fixture directory was not indexed by e2fsck -D"
+
+        node = create_empty_file(vol, indexed, "from-windows.bin")
+        payload = b"steam-deck-visible" * 1024
+        write_range(vol, node, 0, payload, flush=True)
+        vol.close()
+    except Exception:
+        vol.close(abort=True)
+        raise
+
+    check = open_volume(path, False)
+    try:
+        indexed = lookup_path(check, "/indexed")
+        assert indexed.is_indexed
+        node = lookup_path(check, "/indexed/from-windows.bin")
+        assert read_range(check, node, 0, len(payload)) == payload
+    finally:
+        check.close()
+
 def dirty_marker_roundtrip(path: str) -> None:
     vol = open_volume(path, True)
     blockers = vol.hard_write_blockers()
@@ -317,7 +433,15 @@ def main() -> None:
     parser.add_argument("image")
     parser.add_argument(
         "--mode",
-        choices=("clean", "dirty-marker", "journal-replay", "gpt-portable", "error-repair"),
+        choices=(
+            "clean",
+            "dirty-marker",
+            "journal-replay",
+            "gpt-portable",
+            "error-repair",
+            "orphan-repair",
+            "htree",
+        ),
         default="clean",
     )
     args = parser.parse_args()
@@ -330,8 +454,12 @@ def main() -> None:
         journal_replay_roundtrip(args.image)
     elif args.mode == "gpt-portable":
         gpt_portable_roundtrip(args.image)
-    else:
+    elif args.mode == "error-repair":
         error_repair_roundtrip(args.image)
+    elif args.mode == "orphan-repair":
+        orphan_repair_roundtrip(args.image)
+    else:
+        htree_roundtrip(args.image)
 
 
 if __name__ == "__main__":

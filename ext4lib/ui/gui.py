@@ -952,6 +952,30 @@ class App(tk.Tk):
                             self._t("journal_fail_message", error=exc),
                         )
 
+                if (
+                    vol.sb.feature_ro_compat & C.EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT
+                    or vol.sb.last_orphan
+                ):
+                    try:
+                        self.set_status(self._t("orphan_repair_status"))
+                        self.update_idletasks()
+                        orphan_stats = self._run_with_progress(
+                            self._t("orphan_repair_title"),
+                            self._t("orphan_repair_message"),
+                            vol.recover_pending_orphans,
+                            progress_aware=True,
+                        )
+                        LOG.warning(
+                            "Windows EXT4 orphan 자동 복구 성공 entries=%s deleted=%s truncated=%s",
+                            orphan_stats.entries_found,
+                            orphan_stats.deleted,
+                            orphan_stats.truncated,
+                        )
+                        self.set_status(self._t("orphan_repair_done"))
+                    except Exception as exc:
+                        LOG.error("Windows EXT4 orphan 자동 복구 중단: %s", exc)
+                        self.set_status(self._t("orphan_repair_failed", error=exc))
+
                 if vol.sb.state & C.EXT4_ERROR_FS:
                     try:
                         self.set_status(self._t("error_repair_status"))

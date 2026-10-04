@@ -115,22 +115,23 @@ def half_md4_transform(buf: list[int], inp: list[int]) -> None:
     d = r1(d, a, b, c, 5, 7)
     c = r1(c, d, a, b, 6, 11)
     b = r1(b, c, d, a, 7, 19)
+    # Match e2fsprogs halfMD4Transform exactly.
     a = r2(a, b, c, d, 1, 3)
-    d = r2(d, a, b, c, 6, 5)
+    d = r2(d, a, b, c, 3, 5)
     c = r2(c, d, a, b, 5, 9)
-    b = r2(b, c, d, a, 2, 13)
-    a = r2(a, b, c, d, 3, 3)
-    d = r2(d, a, b, c, 0, 5)
-    c = r2(c, d, a, b, 7, 9)
-    b = r2(b, c, d, a, 4, 13)
+    b = r2(b, c, d, a, 7, 13)
+    a = r2(a, b, c, d, 0, 3)
+    d = r2(d, a, b, c, 2, 5)
+    c = r2(c, d, a, b, 4, 9)
+    b = r2(b, c, d, a, 6, 13)
     a = r3(a, b, c, d, 3, 3)
-    d = r3(d, a, b, c, 4, 9)
-    c = r3(c, d, a, b, 7, 11)
-    b = r3(b, c, d, a, 1, 15)
-    a = r3(a, b, c, d, 6, 3)
-    d = r3(d, a, b, c, 2, 9)
-    c = r3(c, d, a, b, 5, 11)
-    b = r3(b, c, d, a, 0, 15)
+    d = r3(d, a, b, c, 7, 9)
+    c = r3(c, d, a, b, 2, 11)
+    b = r3(b, c, d, a, 6, 15)
+    a = r3(a, b, c, d, 1, 3)
+    d = r3(d, a, b, c, 5, 9)
+    c = r3(c, d, a, b, 0, 11)
+    b = r3(b, c, d, a, 4, 15)
     buf[0] = (buf[0] + a) & 0xFFFFFFFF
     buf[1] = (buf[1] + b) & 0xFFFFFFFF
     buf[2] = (buf[2] + c) & 0xFFFFFFFF
@@ -159,9 +160,9 @@ def dirhash(name: bytes, hash_version: int, seed: bytes) -> int:
 
     buf = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476]
     if seed and any(seed):
-        vals = struct.unpack("<4I", seed[:16].ljust(16, b"\x00"))
-        for i in range(4):
-            buf[i] ^= vals[i]
+        # e2fsprogs ext2fs_dirhash(): a non-zero s_hash_seed REPLACES the
+        # default IV. It is not XORed with it.
+        buf = list(struct.unpack("<4I", seed[:16].ljust(16, b"\x00")))
 
     if hash_version in (C.DX_HASH_TEA, C.DX_HASH_TEA_UNSIGNED):
         msg = name

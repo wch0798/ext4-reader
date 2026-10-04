@@ -2442,8 +2442,10 @@ class WindowsPhysicalDevice(BlockDevice):
         """Keep high-frequency SCSI traffic out of the normal GUI log."""
         from ext4lib.debuglog import LOG
 
-        self._scsi_write_count += 1
-        self._scsi_write_bytes += max(0, int(length))
+        self._scsi_write_count = int(getattr(self, "_scsi_write_count", 0)) + 1
+        self._scsi_write_bytes = int(getattr(self, "_scsi_write_bytes", 0)) + max(
+            0, int(length)
+        )
         if self._scsi_write_count % 256 == 0:
             LOG.debug(
                 "SCSI 쓰기 진행 count=%s bytes=%s",
@@ -3114,7 +3116,7 @@ class WindowsPhysicalDevice(BlockDevice):
         # Do not rediscover the same failing Windows routes on every 512-byte
         # metadata write. Once this bridge has proven that SCSI passthrough is
         # the working route, keep using it for the lifetime of this device.
-        if self._fallback_write_route == "scsi":
+        if getattr(self, "_fallback_write_route", None) == "scsi":
             self._scsi_write10(absolute, data)
             return
 
