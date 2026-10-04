@@ -24,5 +24,5 @@ if not defined PY (
   exit /b 1
 )
 
-"%PY%" -m ext4reader
+"%PY%" "%~dp0main.py"
 if %errorlevel% neq 0 pause
