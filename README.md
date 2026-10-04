@@ -60,3 +60,8 @@ python -m pip install -r requirements.txt
 - `Ext4Reader.exe`: GitHub Actions가 최신 소스로 자동 생성한 실행 파일
 
 같은 기능의 소스를 루트와 패키지에 중복 보관하지 않습니다. 소스 실행은 `python main.py` 또는 `run_as_admin.bat`을 사용합니다.
+
+
+## UI 언어
+
+상단 **언어** 드롭다운에서 `한국어`, `English`, `日本語`를 선택할 수 있습니다. 선택값은 `%LOCALAPPDATA%\Ext4Reader\settings.json`에 저장되며 다음 실행부터 전체 UI에 적용됩니다. 첫 실행에서는 Windows 언어가 한국어/영어/일본어인 경우 자동으로 맞추고, 그 외 언어는 한국어를 기본으로 사용합니다. 문제 분석용 저수준 로그는 현재 한국어로 유지합니다.

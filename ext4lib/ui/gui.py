@@ -13,6 +13,7 @@ import webbrowser
 from tkinter import filedialog, messagebox, ttk
 
 from ext4lib import __app_name__, __version__
+from ext4lib.i18n import LANGUAGES, language_from_label, language_label, load_language, save_language, tr
 from ext4lib.debuglog import LOG, setup_logging
 from ext4lib.ui.dnd import DropTarget
 from ext4lib.mount.fuse import (
@@ -76,6 +77,7 @@ class App(tk.Tk):
         self._log_q: queue.Queue = queue.Queue()
         self._busy = False
         self._operation_active = False
+        self.language = load_language()
         self._nodes: dict[str, tuple[str, object]] = {}
         self._mounts: dict[str, MountSession] = {}
         self._drop: DropTarget | None = None
@@ -90,6 +92,21 @@ class App(tk.Tk):
         self.after(200, self._startup)
         self.after(400, self._hook_dnd)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _t(self, key: str, **kwargs) -> str:
+        return tr(self.language, key, **kwargs)
+
+    def _on_language_change(self, _event=None) -> None:
+        language = language_from_label(self.language_var.get())
+        if language == self.language:
+            return
+        self.language = language
+        save_language(language)
+        messagebox.showinfo(
+            self._t("language_changed_title"),
+            self._t("language_changed_message"),
+            parent=self,
+        )
 
     def _style(self) -> None:
         st = ttk.Style()
@@ -122,15 +139,27 @@ class App(tk.Tk):
         top = ttk.Frame(self)
         top.pack(fill="x", padx=16, pady=(14, 4))
         ttk.Label(top, text=f"{__app_name__} {__version__}", style="Head.TLabel").pack(side="left")
-        ttk.Label(top, text="  탐색기 드라이브로 연결", style="Dim.TLabel").pack(side="left")
+        ttk.Label(top, text=self._t("subtitle"), style="Dim.TLabel").pack(side="left")
+        self.language_var = tk.StringVar(value=language_label(self.language))
+        self.language_combo = ttk.Combobox(
+            top,
+            textvariable=self.language_var,
+            values=list(LANGUAGES.values()),
+            width=9,
+            state="readonly",
+        )
+        self.language_combo.pack(side="right", padx=(4, 0))
+        self.language_combo.bind("<<ComboboxSelected>>", self._on_language_change)
+        ttk.Label(top, text=self._t("language")).pack(side="right", padx=(12, 2))
+
         self.write_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(top, text="쓰기 허용", variable=self.write_var, command=self._on_write_toggle).pack(
+        ttk.Checkbutton(top, text=self._t("write_enable"), variable=self.write_var, command=self._on_write_toggle).pack(
             side="right", padx=8
         )
-        self.admin_btn = ttk.Button(top, text="관리자 권한으로 다시 시작", command=self._elevate)
+        self.admin_btn = ttk.Button(top, text=self._t("admin_restart"), command=self._elevate)
         self.admin_badge = tk.Label(
             top,
-            text="관리자 실행 중",
+            text=self._t("admin_running"),
             bg="#40a02b",
             fg="white",
             font=("Segoe UI", 9, "bold"),
@@ -139,41 +168,40 @@ class App(tk.Tk):
         )
         if is_admin():
             self.admin_badge.pack(side="right", padx=6)
-            self.title(f"{__app_name__} {__version__} — 관리자 실행 중")
+            self.title(f"{__app_name__} {__version__} — {self._t('admin_running')}")
             LOG.info("GUI: 관리자 실행 중")
         else:
             self.admin_btn.pack(side="right", padx=4)
-            self.title(f"{__app_name__} {__version__} — 관리자 권한 필요")
+            self.title(f"{__app_name__} {__version__} — {self._t('admin_required')}")
             LOG.info("GUI: 일반 권한으로 실행 중")
 
         ttk.Label(
             self,
-            text="연결한 뒤 탐색기에서 파일을 끌어다 놓으면 복사됩니다. "
-            "이 창으로 끌어다 놓아도 선택한 드라이브로 들어갑니다. 창은 닫지 마세요.",
+            text=self._t("main_hint"),
             style="Dim.TLabel",
             wraplength=780,
         ).pack(fill="x", padx=16, pady=(0, 8))
 
         bar = ttk.Frame(self)
         bar.pack(fill="x", padx=16, pady=4)
-        ttk.Button(bar, text="디스크 다시 검색", command=self.scan_disks).pack(side="left", padx=2)
-        ttk.Button(bar, text="이미지 파일 열기…", command=self.open_image).pack(side="left", padx=2)
-        ttk.Label(bar, text="  드라이브").pack(side="left", padx=(12, 4))
+        ttk.Button(bar, text=self._t("scan"), command=self.scan_disks).pack(side="left", padx=2)
+        ttk.Button(bar, text=self._t("open_image"), command=self.open_image).pack(side="left", padx=2)
+        ttk.Label(bar, text="  " + self._t("drive")).pack(side="left", padx=(12, 4))
         self.drive_var = tk.StringVar()
         self.drive_combo = ttk.Combobox(bar, textvariable=self.drive_var, width=6, state="readonly")
         self.drive_combo.pack(side="left")
         self.drive_combo.bind("<Button-1>", lambda _e: self.refresh_drive_letters())
         self.drive_combo.bind("<FocusIn>", lambda _e: self.refresh_drive_letters())
-        ttk.Button(bar, text="탐색기에서 열기", style="Accent.TButton", command=self.mount_selected).pack(
+        ttk.Button(bar, text=self._t("open_explorer"), style="Accent.TButton", command=self.mount_selected).pack(
             side="left", padx=10
         )
-        ttk.Button(bar, text="연결 해제", command=self.unmount_selected).pack(side="left", padx=2)
-        ttk.Button(bar, text="로그 복사", command=self.copy_logs).pack(side="right", padx=2)
-        ttk.Button(bar, text="WinFsp 설치", command=self.check_winfsp).pack(side="right", padx=2)
-        ttk.Button(bar, text="UsbDk 설치(선택)", command=self.check_usbdk).pack(side="right", padx=2)
+        ttk.Button(bar, text=self._t("disconnect"), command=self.unmount_selected).pack(side="left", padx=2)
+        ttk.Button(bar, text=self._t("copy_log"), command=self.copy_logs).pack(side="right", padx=2)
+        ttk.Button(bar, text=self._t("install_winfsp"), command=self.check_winfsp).pack(side="right", padx=2)
+        ttk.Button(bar, text=self._t("install_usbdk"), command=self.check_usbdk).pack(side="right", padx=2)
 
         self.status = tk.StringVar(
-            value="관리자 실행 중 — 디스크를 검색합니다" if is_admin() else "관리자 권한이 필요합니다. 오른쪽 위 버튼으로 다시 시작하세요."
+            value=self._t("status_admin_scanning") if is_admin() else self._t("status_admin_required")
         )
         tk.Label(
             self,
@@ -188,7 +216,7 @@ class App(tk.Tk):
 
         log_wrap = ttk.Frame(self)
         log_wrap.pack(fill="x", side="bottom", padx=16, pady=(0, 4))
-        ttk.Label(log_wrap, text="로그 (복사해서 붙여넣을 수 있습니다)", style="Dim.TLabel").pack(anchor="w")
+        ttk.Label(log_wrap, text=self._t("log_caption"), style="Dim.TLabel").pack(anchor="w")
         log_box = ttk.Frame(log_wrap)
         log_box.pack(fill="x")
         self.log_text = tk.Text(
@@ -210,7 +238,7 @@ class App(tk.Tk):
 
         tk.Label(
             self,
-            text="파일을 이 창으로 끌어다 놓으면 연결된 EXT4 드라이브로 복사됩니다.",
+            text=self._t("drop_hint"),
             bg="#45475a",
             fg="white",
             font=("Segoe UI", 10),
@@ -221,11 +249,11 @@ class App(tk.Tk):
         mid = ttk.Frame(self)
         mid.pack(fill="both", expand=True, padx=16, pady=8)
         self.tree = ttk.Treeview(mid, columns=cols, show="tree headings", selectmode="browse")
-        self.tree.heading("#0", text="장치 / 볼륨")
-        self.tree.heading("kind", text="종류")
-        self.tree.heading("size", text="용량")
-        self.tree.heading("state", text="상태")
-        self.tree.heading("drive", text="드라이브")
+        self.tree.heading("#0", text=self._t("tree_device"))
+        self.tree.heading("kind", text=self._t("tree_kind"))
+        self.tree.heading("size", text=self._t("tree_size"))
+        self.tree.heading("state", text=self._t("tree_state"))
+        self.tree.heading("drive", text=self._t("tree_drive"))
         self.tree.column("#0", width=340)
         self.tree.column("kind", width=90)
         self.tree.column("size", width=90, anchor="e")
@@ -248,22 +276,21 @@ class App(tk.Tk):
             ok, err = restart_as_admin(hwnd)
         except Exception as exc:
             LOG.exception("관리자 재시작 실패")
-            messagebox.showerror("관리자 권한", str(exc))
+            messagebox.showerror(self._t("admin_required"), str(exc), parent=self)
             return
         LOG.info("관리자 재시작 결과 ok=%s err=%s", ok, err)
         if ok:
             self.on_close()
             return
         if err:
-            messagebox.showerror("관리자 권한", err)
+            messagebox.showerror(self._t("admin_required"), err, parent=self)
 
     def _on_write_toggle(self) -> None:
         if self.write_var.get():
             ok = messagebox.askokcancel(
-                "쓰기 허용",
-                "탐색기에서 파일을 넣거나 지우면 실제 EXT4 디스크에 기록됩니다.\n\n"
-                "리눅스에서 해당 파티션을 언마운트한 뒤에만 쓰세요.\n"
-                "이미 연결된 드라이브는 해제 후 다시 연결해야 쓰기가 적용됩니다.",
+                self._t("write_enable_title"),
+                self._t("write_enable_message"),
+                parent=self,
             )
             if not ok:
                 self.write_var.set(False)
@@ -287,11 +314,11 @@ class App(tk.Tk):
         self.refresh_drive_letters()
         letter = (self.drive_var.get() or "").strip()
         if not letter:
-            raise RuntimeError("남는 드라이브 문자가 없습니다. 쓰지 않는 문자를 선택하세요.")
+            raise RuntimeError(self._t("no_drive_letter"))
         return letter
 
     def set_status(self, text: str) -> None:
-        prefix = "[관리자 실행 중] " if is_admin() else ""
+        prefix = self._t("admin_prefix") if is_admin() else ""
         self.status.set(prefix + text)
 
     def _append_log(self, line: str) -> None:
@@ -309,11 +336,11 @@ class App(tk.Tk):
     def copy_logs(self) -> None:
         text = self.log_text.get("1.0", "end").strip()
         if not text:
-            messagebox.showinfo("로그", "아직 복사할 로그가 없습니다.")
+            messagebox.showinfo(self._t("log_title"), self._t("log_empty"), parent=self)
             return
         self.clipboard_clear()
         self.clipboard_append(text)
-        self.set_status("로그를 클립보드에 복사했습니다.")
+        self.set_status(self._t("log_copied"))
         LOG.info("로그 복사됨 (%s자)", len(text))
 
     def _startup(self) -> None:
@@ -325,27 +352,26 @@ class App(tk.Tk):
             return True
         try:
             path = self._run_with_progress(
-                "WinFsp 설치 중",
-                "탐색기 드라이브에 필요한 WinFsp를 내려받아 설치합니다.\n"
-                "진행 상태는 이 메인 창 안에서 표시됩니다.",
+                self._t("winfsp_installing"),
+                self._t("winfsp_install_desc"),
                 lambda report: ensure_winfsp_installed(progress=report, force=force),
                 progress_aware=True,
             )
         except WinFspSetupError as err:
             if err.reboot_required:
-                if messagebox.askyesno("재시작 필요", f"{err}\n\n지금 PC를 재시작할까요?"):
+                if messagebox.askyesno(self._t("reboot_required"), self._t("reboot_now", error=err), parent=self):
                     os.system("shutdown /r /t 5")
                 return False
-            messagebox.showerror("WinFsp 설치 실패", str(err))
+            messagebox.showerror(self._t("winfsp_install_failed"), str(err), parent=self)
             return winfsp_ready()
         except Exception as err:
-            messagebox.showerror("WinFsp 설치 실패", str(err))
+            messagebox.showerror(self._t("winfsp_install_failed"), str(err), parent=self)
             return winfsp_ready()
 
         if show_success:
-            messagebox.showinfo("WinFsp", f"설치되어 있습니다.\n\n{path}")
+            messagebox.showinfo("WinFsp", self._t("winfsp_installed", path=path), parent=self)
         else:
-            self.set_status("WinFsp 설치가 완료되었습니다.")
+            self.set_status(self._t("winfsp_done"))
         return True
 
     def check_winfsp(self) -> None:
@@ -353,7 +379,7 @@ class App(tk.Tk):
         if dll:
             if not messagebox.askyesno(
                 "WinFsp",
-                f"이미 설치되어 있습니다.\n\n{dll}\n\n다시 설치할까요?",
+                self._t("winfsp_reinstall", path=dll),
             ):
                 return
             self.ensure_winfsp(force=True, show_success=True)
@@ -365,17 +391,14 @@ class App(tk.Tk):
             if show_success:
                 messagebox.showinfo(
                     "UsbDk",
-                    "UsbDk가 이미 설치되어 실행 중입니다.\n\n"
-                    "일반 리더기는 기존 Windows 경로를 그대로 사용하고, "
-                    "모든 raw-write 경로가 거부되는 USB 리더기에서만 UsbDk를 사용합니다.",
+                    self._t("usbdk_already"),
                 )
             return True
 
         try:
             result = self._run_with_progress(
-                "UsbDk 설치 중",
-                "공식 UsbDk 1.0.22 x64 MSI를 다운로드하고 SHA-256을 확인한 뒤 설치합니다.\n"
-                "시스템 USB 필터 드라이버 설치 진행 상태를 이 메인 창 안에 표시합니다.",
+                self._t("usbdk_installing"),
+                self._t("usbdk_install_desc"),
                 lambda report: install_usbdk(progress=report),
                 progress_aware=True,
             )
@@ -383,30 +406,27 @@ class App(tk.Tk):
             LOG.error("UsbDk 설치 실패: %s", err)
             message = str(err)
             if isinstance(err, UsbDkSetupError) and err.manual_install:
-                message += "\n\n자동 설치가 안 되면 공식 릴리스에서 직접 설치할 수 있습니다."
+                message += self._t("usbdk_manual")
                 if messagebox.askyesno(
-                    "UsbDk 설치 실패",
-                    message + "\n\n공식 UsbDk 릴리스 페이지를 열까요?",
+                    self._t("usbdk_install_failed"),
+                    message + self._t("usbdk_open_release"),
                 ):
                     webbrowser.open(USBDK_RELEASE_URL)
             else:
-                messagebox.showerror("UsbDk 설치 실패", message)
+                messagebox.showerror(self._t("usbdk_install_failed"), message, parent=self)
             return usbdk_ready()
 
         if result.reboot_required:
             if messagebox.askyesno(
-                "UsbDk 설치 완료 — 재시작 필요",
-                "UsbDk 설치가 완료됐지만 적용을 위해 Windows 재시작이 필요합니다.\n\n"
-                "지금 PC를 재시작할까요?",
+                self._t("usbdk_reboot_title"),
+                self._t("usbdk_reboot_message"),
             ):
                 os.system("shutdown /r /t 5")
             return False
         if show_success:
             messagebox.showinfo(
-                "UsbDk 설치 완료",
-                "UsbDk가 준비되었습니다.\n\n"
-                "카드리더를 다시 꽂거나 디스크 다시 검색 후 쓰기 연결을 다시 시도하세요. "
-                "UsbDk는 Windows raw-write가 모두 실패하는 USB 리더기에만 자동 사용됩니다.",
+                self._t("usbdk_done_title"),
+                self._t("usbdk_done_message"),
             )
         return True
 
@@ -415,12 +435,8 @@ class App(tk.Tk):
             self.ensure_usbdk(show_success=True)
             return
         ok = messagebox.askyesno(
-            "UsbDk 선택 설치",
-            "UsbDk는 Windows의 일반 raw-write 경로가 전부 차단되는 일부 USB 카드리더를 위한 "
-            "마지막 fallback입니다.\n\n"
-            "설치하면 시스템 USB 필터 드라이버가 추가되므로 재부팅이 필요할 수 있고, "
-            "문제가 생기면 Windows의 '설치된 앱' 또는 UsbDkController -u로 제거할 수 있습니다.\n\n"
-            "공식 UsbDk 1.0.22를 다운로드하고 설치할까요?",
+            self._t("usbdk_select_title"),
+            self._t("usbdk_select_message"),
         )
         if ok:
             self.ensure_usbdk(show_success=True)
@@ -429,7 +445,7 @@ class App(tk.Tk):
         if self._busy:
             return
         self._busy = True
-        self.set_status("디스크를 검색하는 중… (HDD, SSD, USB, SD 카드)")
+        self.set_status(self._t("scanning"))
         for item in self.tree.get_children():
             self.tree.delete(item)
         self._nodes.clear()
@@ -467,7 +483,7 @@ class App(tk.Tk):
             return
         self._busy = False
         if kind == "err":
-            self.set_status(f"검색 실패: {payload}")
+            self.set_status(self._t("scan_failed", error=payload))
             return
         ext_count = 0
         for disk, vols, err in payload:
@@ -475,24 +491,24 @@ class App(tk.Tk):
                 "",
                 "end",
                 text=f"{_kind_icon(disk.kind)}  {disk.title}",
-                values=(disk.bus_name, format_bytes(disk.size), err or "연결됨", ""),
+                values=(disk.bus_name, format_bytes(disk.size), err or self._t("connected"), ""),
                 open=True,
             )
             self._nodes[did] = ("disk", disk)
             if not vols:
-                self.tree.insert(did, "end", text="EXT 파티션 없음", values=("", "", "", ""))
+                self.tree.insert(did, "end", text=self._t("no_ext"), values=("", "", "", ""))
                 continue
             for v in vols:
                 key = self._vol_key("disk", disk.path, v)
                 mounted = key in self._mounts
                 letter = self._mounts[key].letter if mounted else ""
-                state = f"연결됨 {letter}" if mounted else ("쓰기 가능" if not v.write_blockers else "읽기 전용")
+                state = f"{self._t('connected')} {letter}" if mounted else (self._t("writable") if not v.write_blockers else self._t("readonly"))
                 vid = self.tree.insert(
                     did,
                     "end",
                     text=f"{v.sb.fs_type}  {v.label}",
                     values=(
-                        v.scheme or "파티션",
+                        v.scheme or self._t("partition"),
                         format_bytes(v.sb.blocks_count * v.sb.block_size),
                         state,
                         letter,
@@ -500,18 +516,18 @@ class App(tk.Tk):
                 )
                 self._nodes[vid] = ("vol", (disk, v))
                 ext_count += 1
-        extra = "  · 관리자 실행 중" if is_admin() else "  · 물리 디스크는 관리자 권한으로 실행하세요"
-        winfsp = "  · WinFsp 준비됨" if winfsp_ready() else "  · WinFsp 설치가 필요합니다"
-        self.set_status(f"디스크 {len(payload)}개, EXT 볼륨 {ext_count}개{extra}{winfsp}")
+        extra = self._t("admin_extra") if is_admin() else self._t("admin_needed_extra")
+        winfsp = self._t("winfsp_ready") if winfsp_ready() else self._t("winfsp_needed")
+        self.set_status(self._t("scan_summary", disks=len(payload), volumes=ext_count, admin=extra, winfsp=winfsp))
         LOG.info("검색 완료 disks=%s ext=%s admin=%s", len(payload), ext_count, is_admin())
         self.refresh_drive_letters()
 
     def open_image(self) -> None:
         path = filedialog.askopenfilename(
-            title="디스크 이미지 열기",
+            title=self._t("image_open_title"),
             filetypes=[
-                ("디스크 이미지", "*.img *.raw *.iso *.bin *.dd"),
-                ("모든 파일", "*.*"),
+                (self._t("image_filter"), "*.img *.raw *.iso *.bin *.dd"),
+                (self._t("all_files"), "*.*"),
             ],
         )
         if not path:
@@ -521,13 +537,13 @@ class App(tk.Tk):
                 size = dev.size()
                 vols = discover_volumes(dev)
             if not vols:
-                messagebox.showerror("EXT4 없음", "이 파일에서 EXT 슈퍼블록을 찾지 못했습니다.")
+                messagebox.showerror(self._t("no_ext_title"), self._t("no_ext_message"), parent=self)
                 return
             nid = self.tree.insert(
                 "",
                 "end",
                 text=f"IMG  {os.path.basename(path)}",
-                values=("이미지", format_bytes(size), "파일", ""),
+                values=(self._t("image_kind"), format_bytes(size), self._t("file_state"), ""),
                 open=True,
             )
             self._nodes[nid] = ("image", path)
@@ -537,17 +553,17 @@ class App(tk.Tk):
                     "end",
                     text=f"{x.sb.fs_type}  {x.label}",
                     values=(
-                        x.scheme or "파티션",
+                        x.scheme or self._t("partition"),
                         format_bytes(x.sb.blocks_count * x.sb.block_size),
-                        "읽기 전용" if x.write_blockers else "쓰기 가능",
+                        self._t("readonly") if x.write_blockers else self._t("writable"),
                         "",
                     ),
                 )
                 self._nodes[vid] = ("imgvol", (path, x))
             self.tree.selection_set(vid)
-            self.set_status(f"이미지에서 EXT 볼륨 {len(vols)}개를 찾았습니다. 더블클릭하면 탐색기가 열립니다.")
+            self.set_status(self._t("image_summary", count=len(vols)))
         except Exception as exc:
-            messagebox.showerror("열기 실패", str(exc))
+            messagebox.showerror(self._t("open_failed"), str(exc), parent=self)
 
     def _selected_volume(self):
         sel = self.tree.selection()
@@ -568,7 +584,7 @@ class App(tk.Tk):
     ):
         """Run blocking storage work off the Tk thread with an in-window overlay."""
         if self._operation_active:
-            raise RuntimeError("이미 저장장치 작업을 처리하고 있습니다.")
+            raise RuntimeError(self._t("operation_busy"))
 
         self._operation_active = True
         overlay = tk.Frame(
@@ -613,7 +629,7 @@ class App(tk.Tk):
             wraplength=560,
         ).pack(fill="x", pady=(0, 12))
 
-        detail = tk.StringVar(value="장치 응답을 기다리는 중…")
+        detail = tk.StringVar(value=self._t("device_wait"))
         tk.Label(
             card,
             textvariable=detail,
@@ -629,7 +645,7 @@ class App(tk.Tk):
 
         tk.Label(
             card,
-            text="작업이 끝날 때까지 장치를 분리하거나 프로그램을 종료하지 마세요.",
+            text=self._t("do_not_disconnect"),
             bg=BG2,
             fg=FG_DIM,
             font=("Segoe UI", 9),
@@ -641,7 +657,7 @@ class App(tk.Tk):
         finished = threading.Event()
         done_var = tk.BooleanVar(self, value=False)
         started = time.monotonic()
-        last_detail = "장치 응답을 기다리는 중…"
+        last_detail = self._t("device_wait")
 
         def report(message: str) -> None:
             status_updates.put(str(message))
@@ -666,11 +682,9 @@ class App(tk.Tk):
                 return
             elapsed = max(0, int(time.monotonic() - started))
             if progress_aware:
-                detail.set(f"{last_detail}  ·  {elapsed}초")
+                detail.set(self._t("progress_seconds", message=last_detail, seconds=elapsed))
             else:
-                detail.set(
-                    f"작업 중… {elapsed}초  ·  Windows raw I/O / UsbDk 응답 확인 중"
-                )
+                detail.set(self._t("progress_storage", seconds=elapsed))
             self.after(100, poll)
 
         thread = threading.Thread(
@@ -707,7 +721,7 @@ class App(tk.Tk):
     def mount_selected(self) -> None:
         node = self._selected_volume()
         if not node:
-            messagebox.showinfo("선택", "왼쪽에서 EXT4 볼륨을 선택하세요.")
+            messagebox.showinfo(self._t("select_title"), self._t("select_volume"), parent=self)
             return
         kind, payload = node
         if kind == "vol":
@@ -728,7 +742,7 @@ class App(tk.Tk):
             opener = lambda writable: ImageDevice(path, writable=writable)
             src = path
         else:
-            messagebox.showinfo("선택", "EXT4 볼륨 줄을 선택한 뒤 다시 시도하세요.")
+            messagebox.showinfo(self._t("select_title"), self._t("select_volume_row"), parent=self)
             return
 
         if key in self._mounts:
@@ -737,9 +751,9 @@ class App(tk.Tk):
             if want_write and session.read_only:
                 letter_keep = session.letter
                 if not messagebox.askyesno(
-                    "쓰기로 다시 연결",
-                    f"{letter_keep} 는 지금 읽기 전용입니다.\n"
-                    "연결을 해제하고 같은 문자로 쓰기를 열어 다시 연결할까요?",
+                    self._t("reconnect_write_title"),
+                    self._t("reconnect_write_message", letter=letter_keep),
+                    parent=self,
                 ):
                     open_explorer(letter_keep)
                     return
@@ -756,7 +770,7 @@ class App(tk.Tk):
                     self.drive_var.set(letter_keep)
             else:
                 open_explorer(session.letter)
-                self.set_status(f"이미 {session.letter} 로 연결되어 있습니다.")
+                self.set_status(self._t("already_connected", letter=session.letter))
                 return
 
         if not winfsp_available():
@@ -765,12 +779,12 @@ class App(tk.Tk):
 
         writable = bool(self.write_var.get())
         if writable and kind == "vol" and not is_admin():
-            messagebox.showwarning("권한", "물리 디스크에 쓰려면 관리자 권한으로 다시 시작하세요. 읽기 전용으로 엽니다.")
+            messagebox.showwarning(self._t("permission_title"), self._t("permission_write"), parent=self)
             writable = False
 
         try:
             letter = self._chosen_letter()
-            self.set_status(f"{letter} 드라이브로 연결하는 중…")
+            self.set_status(self._t("mounting", letter=letter))
             self.update_idletasks()
             LOG.info(
                 "마운트 요청 src=%s offset=%s writable=%s admin=%s letter=%s",
@@ -800,13 +814,11 @@ class App(tk.Tk):
                 recovery_stats = None
                 if vol.journal_needs_recovery() or vol.sb.needs_recovery:
                     try:
-                        self.set_status("EXT4 저널을 Windows에서 복구하는 중…")
+                        self.set_status(self._t("journal_recover_status"))
                         self.update_idletasks()
                         recovery_stats = self._run_with_progress(
-                            "EXT4 저널 복구 중",
-                            "저널을 안전하게 재생하고 있습니다.\n"
-                            "Windows raw-write가 차단되면 LocalSystem/UsbDk 경로를 순서대로 확인합니다.\n"
-                            "이 작업 동안 창은 계속 응답합니다.",
+                            self._t("journal_recover_title"),
+                            self._t("journal_recover_message"),
                             vol.recover_pending_journal,
                         )
                         LOG.info(
@@ -822,43 +834,35 @@ class App(tk.Tk):
                         except Exception:
                             LOG.exception("UsbDk 설치 전 장치 닫기 실패")
                         install_now = messagebox.askyesno(
-                            "이 USB 카드리더에는 UsbDk가 필요합니다",
-                            str(exc)
-                            + "\n\n일반 Windows/관리자/LocalSystem raw-write 경로는 이미 모두 실패했습니다. "
-                            "다른 리더기에는 기존 경로를 계속 사용하고, 이 경우에만 UsbDk direct-USB fallback을 사용합니다.\n\n"
-                            "공식 UsbDk를 다운로드하고 설치할까요?",
+                            self._t("usbdk_required_title"),
+                            self._t("usbdk_required_message", error=exc),
                         )
                         if install_now:
                             ready = self.ensure_usbdk(show_success=True)
                             if ready:
-                                self.set_status("UsbDk 준비 완료 — 카드리더를 다시 검색한 뒤 연결을 다시 시도하세요.")
+                                self.set_status(self._t("usbdk_ready_status"))
                         else:
-                            self.set_status("UsbDk 설치를 취소했습니다.")
+                            self.set_status(self._t("usbdk_cancelled"))
                         return
                     except Exception as exc:
                         LOG.exception("Windows JBD2 복구 실패")
                         messagebox.showwarning(
-                            "저널 자동 복구 실패 — 읽기 전용으로 연결",
-                            "EXT4 저널을 Windows에서 안전하게 복구하지 못했습니다.\n"
-                            "원본 보호를 위해 읽기 전용으로 연결합니다.\n\n"
-                            + str(exc),
+                            self._t("journal_fail_title"),
+                            self._t("journal_fail_message", error=exc),
                         )
                 hard = vol.hard_write_blockers()
                 soft = vol.soft_write_warnings()
                 LOG.info("쓰기 검사 hard=%s soft=%s", hard, soft)
                 if hard:
                     messagebox.showwarning(
-                        "쓰기 불가 — 읽기 전용으로 연결",
-                        "쓸 수 없는 이유:\n- " + "\n- ".join(hard),
+                        self._t("write_block_title"),
+                        self._t("write_block_reasons", reasons="\n- ".join(hard)),
                     )
                     read_only = True
                 elif soft:
                     ok = messagebox.askyesno(
-                        "쓰기 주의",
-                        "이 디스크는 리눅스에서 완전히 끄지 않고 뺀 상태일 수 있습니다.\n- "
-                        + "\n- ".join(soft)
-                        + "\n\n그래도 Windows에서 파일을 복사·저장할까요?\n"
-                        "리눅스가 아직 이 USB를 쓰는 중이면 데이터가 깨질 수 있습니다.",
+                        self._t("write_warning_title"),
+                        self._t("write_warning_message", warnings="\n- ".join(soft)),
                     )
                     if ok:
                         LOG.warning("사용자가 쓰기 위험을 감수함: %s", soft)
@@ -869,22 +873,20 @@ class App(tk.Tk):
             label = vol.sb.volume_name or vinfo.label or "EXT4"
             session = mount_volume(vol, read_only=read_only, label=label, letter=letter)
             self._mounts[key] = session
-            mode = "읽기 전용" if read_only else "읽기/쓰기"
-            self.tree.set(self.tree.selection()[0], "state", f"연결됨 ({mode})")
+            mode = self._t("mode_ro") if read_only else self._t("mode_rw")
+            self.tree.set(self.tree.selection()[0], "state", self._t("connected_state", mode=mode))
             self.tree.set(self.tree.selection()[0], "drive", session.letter)
             self.refresh_drive_letters()
             open_explorer(session.letter)
-            self.set_status(
-                f"{session.letter} 드라이브로 연결했습니다 ({mode}). "
-                f"내 PC에서 {session.letter} 를 쓰세요."
-            )
+            self.set_status(self._t("mount_success", letter=session.letter, mode=mode))
         except Exception as exc:
             LOG.exception("연결 실패 src=%s", src)
             messagebox.showerror(
-                "연결 실패",
-                explain_fuse_error(exc) + "\n\n아래 로그를 복사해 주세요. 콘솔 창에도 같은 내용이 있습니다.",
+                self._t("mount_fail_title"),
+                self._t("mount_fail_message", error=explain_fuse_error(exc)),
+                parent=self,
             )
-            self.set_status(f"연결 실패: {exc}")
+            self.set_status(self._t("mount_fail_status", error=exc))
 
     def unmount_selected(self) -> None:
         node = self._selected_volume()
@@ -902,10 +904,10 @@ class App(tk.Tk):
         self._drop_mount(key)
         sel = self.tree.selection()
         if sel:
-            self.tree.set(sel[0], "state", "해제됨")
+            self.tree.set(sel[0], "state", self._t("disconnected"))
             self.tree.set(sel[0], "drive", "")
         self.refresh_drive_letters()
-        self.set_status("연결을 해제했습니다.")
+        self.set_status(self._t("disconnect_done"))
 
     def _drop_mount(self, key: str) -> None:
         session = self._mounts.pop(key, None)
@@ -921,7 +923,7 @@ class App(tk.Tk):
             self.update_idletasks()
             self._drop = DropTarget(self, self.on_drop)
         except Exception:
-            self.set_status("창으로 끌어다 놓기는 사용할 수 없습니다. 탐색기에서 드라이브로 드래그하세요.")
+            self.set_status(self._t("dnd_unavailable"))
 
     def _mount_key_for_node(self, node) -> str | None:
         if not node:
@@ -951,15 +953,15 @@ class App(tk.Tk):
         if not letter:
             if not self.write_var.get():
                 messagebox.showinfo(
-                    "끌어다 넣기",
-                    "탐색기에서 넣으려면 «쓰기 허용»을 켠 뒤 EXT4 볼륨을 연결하세요.\n"
-                    "그다음 내 PC의 드라이브로 파일을 끌어다 놓으면 됩니다.",
+                    self._t("drop_title"),
+                    self._t("drop_message"),
+                    parent=self,
                 )
                 return
             self.mount_selected()
             letter = self._target_letter()
         if not letter:
-            messagebox.showinfo("대상", "먼저 EXT4 볼륨을 선택하고 «탐색기에서 열기»로 연결하세요.")
+            messagebox.showinfo(self._t("target_title"), self._t("target_message"), parent=self)
             return
         dest_root = letter + "\\"
         ok = 0
@@ -976,8 +978,8 @@ class App(tk.Tk):
             except Exception as exc:
                 errors.append(f"{name}: {exc}")
         if errors:
-            messagebox.showerror("복사 실패", "\n".join(errors[:8]))
-        self.set_status(f"{ok}개 항목을 {letter} 로 복사했습니다. 탐색기에서 확인하세요.")
+            messagebox.showerror(self._t("copy_failed"), "\n".join(errors[:8]), parent=self)
+        self.set_status(self._t("copy_done", count=ok, letter=letter))
         try:
             open_explorer(letter)
         except Exception:
@@ -986,9 +988,9 @@ class App(tk.Tk):
     def on_close(self) -> None:
         if self._operation_active:
             self.bell()
-            self.set_status("저장장치 작업이 끝날 때까지 프로그램을 종료할 수 없습니다.")
+            self.set_status(self._t("busy_close"))
             return
-        self.set_status("드라이브를 해제하는 중…")
+        self.set_status(self._t("unmounting"))
         try:
             self.update_idletasks()
         except Exception:
@@ -1009,6 +1011,6 @@ class App(tk.Tk):
 
 def main() -> None:
     if sys.platform != "win32":
-        print("이 프로그램은 Windows용입니다.")
+        print(tr(load_language(), "windows_only"))
     app = App()
     app.mainloop()
