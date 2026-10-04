@@ -488,7 +488,10 @@ class Ext4Volume:
 
     def hard_write_blockers(self) -> list[str]:
         reasons = []
-        if self.journal_needs_recovery():
+        owns_live_journal = bool(
+            self._write_session_active and self._journal_writer is not None
+        )
+        if not owns_live_journal and self.journal_needs_recovery():
             reasons.append(
                 "저널에 재생하지 않은 기록이 있습니다. 쓰기 연결 시 Windows에서 자동 복구를 시도합니다."
             )
