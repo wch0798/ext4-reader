@@ -289,6 +289,118 @@ def _init_inode_bitmap(vol, gd: GroupDesc) -> Bitmap:
     return bm
 
 
+def _set_abs_block_if_in_group(
+    bm: Bitmap, start: int, end: int, block: int
+) -> None:
+    if start <= block < end:
+        bm.set(block - start)
+
+
+def rebuild_block_bitmap_from_metadata(
+    vol, group: int, progress=None
+) -> Bitmap:
+    """Reconstruct one corrupt block bitmap without trusting its old contents.
+
+    Sources of truth:
+      * every allocated inode from the inode bitmaps
+      * all block/inode bitmap and inode-table locations from group descriptors
+      * primary/backup superblock + GDT/reserved-GDT metadata
+
+    The caller MUST compare both free-count and stored checksum before writing
+    this candidate to disk.
+    """
+    if group < 0 or group >= len(vol.groups):
+        raise ValueError(f"invalid block group: {group}")
+    if vol.sb.feature_ro_compat & C.EXT4_FEATURE_RO_COMPAT_BIGALLOC:
+        raise ValueError("BIGALLOC bitmap reconstruction is not supported")
+
+    from ext4lib.fs.extents import inode_allocation_blocks
+    from ext4lib.fs.inode import inode_checksum_valid
+
+    gd = vol.groups[group]
+    start, end = group_block_range(vol, group)
+    group_blocks = max(0, end - start)
+    data = bytearray(vol.sb.block_size)
+    bm = Bitmap(data, vol.sb.blocks_per_group)
+
+    # Linux requires bits beyond the real last group boundary to be set.
+    for bit in range(group_blocks, vol.sb.blocks_per_group):
+        bm.set(bit)
+
+    # Group-descriptor declared metadata can live in another group with
+    # flex_bg, so inspect every descriptor rather than only the target group.
+    it_blocks = inode_table_blocks(vol)
+    for meta_gd in vol.groups:
+        _set_abs_block_if_in_group(bm, start, end, meta_gd.block_bitmap)
+        _set_abs_block_if_in_group(bm, start, end, meta_gd.inode_bitmap)
+        for block in range(meta_gd.inode_table, meta_gd.inode_table + it_blocks):
+            _set_abs_block_if_in_group(bm, start, end, block)
+
+    # Superblock/GDT/reserved-GDT blocks are fixed filesystem metadata.
+    gdt_blocks = (
+        vol.sb.groups_count * vol.sb.desc_size + vol.sb.block_size - 1
+    ) // vol.sb.block_size
+    for meta_group in range(vol.sb.groups_count):
+        if not bg_has_super(vol, meta_group):
+            continue
+        meta_start, meta_end = group_block_range(vol, meta_group)
+        _set_abs_block_if_in_group(bm, start, end, meta_start)
+        for block in range(
+            meta_start + 1,
+            min(
+                meta_end,
+                meta_start
+                + 1
+                + gdt_blocks
+                + int(getattr(vol.sb, "reserved_gdt_blocks", 0) or 0),
+            ),
+        ):
+            _set_abs_block_if_in_group(bm, start, end, block)
+
+    # Reconstruct all file-owned blocks from allocated inodes only. This does
+    # not consult the corrupt block bitmap.
+    total_groups = len(vol.groups)
+    for inode_group, inode_gd in enumerate(vol.groups):
+        if progress is not None and (
+            inode_group % 64 == 0 or inode_group + 1 == total_groups
+        ):
+            progress(
+                f"EXT4 block bitmap 재구성: inode group "
+                f"{inode_group + 1}/{total_groups}"
+            )
+        if inode_gd.flags & C.BG_INODE_UNINIT:
+            continue
+        raw_ibm = vol.read_block(inode_gd.inode_bitmap)
+        if not bitmap_checksum_valid(vol, inode_gd, "inode", raw_ibm):
+            raise ValueError(
+                f"inode bitmap checksum mismatch in group {inode_group}; "
+                "cannot safely reconstruct block bitmap"
+            )
+        ibm = Bitmap(bytearray(raw_ibm), vol.sb.inodes_per_group)
+        base_ino = inode_group * vol.sb.inodes_per_group + 1
+        max_count = min(
+            vol.sb.inodes_per_group,
+            max(0, vol.sb.inodes_count - (base_ino - 1)),
+        )
+        for bit in range(max_count):
+            if not ibm.test(bit):
+                continue
+            ino = base_ino + bit
+            inode = vol.read_inode(ino)
+            if not inode_checksum_valid(vol.sb, inode):
+                raise ValueError(
+                    f"allocated inode {ino} checksum mismatch during bitmap rebuild"
+                )
+            if inode.mode == 0 and ino >= vol.sb.first_ino:
+                raise ValueError(
+                    f"allocated inode {ino} has zero mode during bitmap rebuild"
+                )
+            for block in inode_allocation_blocks(vol, inode):
+                _set_abs_block_if_in_group(bm, start, end, block)
+
+    return bm
+
+
 def read_block_bitmap(vol, gd: GroupDesc) -> Bitmap:
     cache = getattr(vol, "_block_bm_cache", None)
     if cache is not None and gd.group in cache:
