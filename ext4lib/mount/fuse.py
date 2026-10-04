@@ -590,7 +590,7 @@ class Ext4FuseOps:
         except FileNotFoundError:
             if not creat:
                 raise
-            self._create(path, 0o644)
+            self._create(path, None)
             return 0
         if excl and creat:
             raise self._err(errno.EEXIST)
@@ -634,7 +634,10 @@ class Ext4FuseOps:
         except FileNotFoundError:
             self._drop_paths()
             parent, name = lookup_parent(self.vol, path)
-            create_empty_file(self.vol, parent, name, mode & 0o777)
+            # Windows has no POSIX execute-bit semantics. Use the volume's
+            # Linux/Steam Deck default mode rather than letting WinFsp's
+            # synthetic 0644/0666 mode make native binaries non-executable.
+            create_empty_file(self.vol, parent, name, None)
             return 0
         if node.is_dir:
             raise self._err(errno.EISDIR)
