@@ -521,8 +521,18 @@ class Ext4Volume:
         except OrphanRecoveryError as exc:
             raise Ext4Error(f"Windows orphan 복구 실패: {exc}") from exc
 
-    def _repair_known_legacy_bitmap_checksums(self, progress=None) -> int:
-        """Repair only bitmap checksums matching the old Ext4Reader layout bug."""
+    def _repair_known_legacy_bitmap_checksums(
+        self, progress=None, error_info=None
+    ) -> int:
+        """Repair checksum-only bitmap damage after strict structural validation.
+
+        Two cases are accepted:
+        1) the exact old Ext4Reader misplaced-high-half signature; or
+        2) for a Linux ext4_validate_block_bitmap error, the bitmap's low
+           16 checksum bits already match and only the high 16 bits are stale.
+
+        Everything else remains read-only.
+        """
         if not self.sb.has_metadata_csum:
             return 0
 
@@ -530,6 +540,7 @@ class Ext4Volume:
             Bitmap,
             apply_legacy_bitmap_checksum_repair,
             bitmap_checksum_valid,
+            bitmap_checksum_values,
             bitmap_free_count,
             bitmap_padding_is_set,
             group_block_range,
@@ -583,12 +594,37 @@ class Ext4Volume:
                                 raise Ext4Error(
                                     f"block group {g} metadata block {block}가 block bitmap에서 비어 있습니다."
                                 )
-                    if not legacy_bitmap_checksum_signature(
+                    stored, calculated = bitmap_checksum_values(
                         self, gd, "block", raw
-                    ):
+                    )
+                    legacy = legacy_bitmap_checksum_signature(
+                        self, gd, "block", raw
+                    )
+                    low_matches = (stored & 0xFFFF) == (calculated & 0xFFFF)
+                    first_func = str((error_info or {}).get("first_func", ""))
+                    last_func = str((error_info or {}).get("last_func", ""))
+                    linux_block_csum_error = (
+                        first_func == "ext4_validate_block_bitmap"
+                        or last_func == "ext4_validate_block_bitmap"
+                    )
+                    misplaced_hi = int.from_bytes(gd.raw[0x34:0x36], "little")
+                    LOG.warning(
+                        "bitmap checksum 진단 group=%s type=block stored=0x%08X "
+                        "calculated=0x%08X low_match=%s legacy=%s misplaced_hi=0x%04X "
+                        "linux_error=%s",
+                        g,
+                        stored,
+                        calculated,
+                        low_matches,
+                        legacy,
+                        misplaced_hi,
+                        linux_block_csum_error,
+                    )
+                    if not legacy and not (low_matches and linux_block_csum_error):
                         raise Ext4Error(
-                            f"block group {g} block bitmap checksum 불일치가 "
-                            "알려진 구버전 Ext4Reader 패턴과 일치하지 않습니다."
+                            f"block group {g} block bitmap checksum 불일치가 안전한 "
+                            f"checksum-only 복구 조건을 만족하지 않습니다 "
+                            f"(stored=0x{stored:08X}, calculated=0x{calculated:08X})."
                         )
                     repairs.append((g, "block", raw))
 
@@ -607,12 +643,25 @@ class Ext4Volume:
                         raise Ext4Error(
                             f"block group {g} inode bitmap padding이 손상되어 checksum-only 복구를 중단합니다."
                         )
-                    if not legacy_bitmap_checksum_signature(
+                    stored, calculated = bitmap_checksum_values(
                         self, gd, "inode", raw
-                    ):
+                    )
+                    legacy = legacy_bitmap_checksum_signature(
+                        self, gd, "inode", raw
+                    )
+                    LOG.warning(
+                        "bitmap checksum 진단 group=%s type=inode stored=0x%08X "
+                        "calculated=0x%08X legacy=%s",
+                        g,
+                        stored,
+                        calculated,
+                        legacy,
+                    )
+                    if not legacy:
                         raise Ext4Error(
                             f"block group {g} inode bitmap checksum 불일치가 "
-                            "알려진 구버전 Ext4Reader 패턴과 일치하지 않습니다."
+                            f"알려진 구버전 Ext4Reader 패턴과 일치하지 않습니다 "
+                            f"(stored=0x{stored:08X}, calculated=0x{calculated:08X})."
                         )
                     repairs.append((g, "inode", raw))
 
@@ -633,7 +682,28 @@ class Ext4Volume:
             started = True
             for g, which, raw in repairs:
                 gd = self.groups[g]
-                apply_legacy_bitmap_checksum_repair(self, gd, which, raw)
+                if legacy_bitmap_checksum_signature(self, gd, which, raw):
+                    apply_legacy_bitmap_checksum_repair(self, gd, which, raw)
+                else:
+                    # High-half-only corruption: preserve bitmap contents and
+                    # recompute only the Linux metadata_csum fields.
+                    from ext4lib.fs.bitmap import apply_bitmap_csum
+
+                    if which == "block":
+                        calculated_hi = (
+                            bitmap_checksum_values(self, gd, which, raw)[1] >> 16
+                        ) & 0xFFFF
+                        if int.from_bytes(gd.raw[0x34:0x36], "little") == calculated_hi:
+                            gd.raw[0x34:0x36] = b"\x00\x00"
+                        nbits = self.sb.blocks_per_group
+                    else:
+                        nbits = self.sb.inodes_per_group
+                    apply_bitmap_csum(
+                        self,
+                        gd,
+                        which,
+                        Bitmap(bytearray(raw), nbits),
+                    )
                 self.dirty_groups.add(g)
             self.finish_write_session()
             started = False
@@ -715,7 +785,7 @@ class Ext4Volume:
         )
 
         bitmap_checksums_repaired = self._repair_known_legacy_bitmap_checksums(
-            progress
+            progress, info
         )
         from ext4lib.fs.bitmap import (
             bitmap_checksum_valid,

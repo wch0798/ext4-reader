@@ -170,11 +170,11 @@ class App(tk.Tk):
         if is_admin():
             self.admin_badge.pack(side="right", padx=6)
             self.title(f"{__app_name__} {__version__} — {self._t('admin_running')}")
-            LOG.info("GUI: 관리자 실행 중")
+            LOG.info("GUI: EXT4 Reader v%s 관리자 실행 중", __version__)
         else:
             self.admin_btn.pack(side="right", padx=4)
             self.title(f"{__app_name__} {__version__} — {self._t('admin_required')}")
-            LOG.info("GUI: 일반 권한으로 실행 중")
+            LOG.info("GUI: EXT4 Reader v%s 일반 권한으로 실행 중", __version__)
 
         ttk.Label(
             self,
@@ -1020,6 +1020,37 @@ class App(tk.Tk):
                     else:
                         read_only = True
                         LOG.info("사용자가 쓰기를 취소하고 읽기 전용으로 연결")
+            if read_only and writable:
+                # A writable WindowsPhysicalDevice keeps the real volume
+                # locked/dismounted/offline for raw writes.  If filesystem
+                # safety checks downgrade this request to read-only, release
+                # that raw-write state before asking WinFsp to publish a
+                # virtual drive.  Keeping the writable handle here can prevent
+                # mount-manager registration on some USB/SD readers.
+                LOG.warning(
+                    "쓰기 연결이 읽기 전용으로 강등됨 — writable raw 장치를 닫고 "
+                    "read-only 장치로 다시 엽니다."
+                )
+                try:
+                    vol.close(abort=True)
+                except Exception:
+                    LOG.exception("RW→RO 강등 중 writable 장치 닫기 실패")
+                    raise
+                dev = opener(False)
+                vol = Ext4Volume(
+                    dev,
+                    vinfo.offset,
+                    vinfo.size,
+                    owns_device=True,
+                )
+                LOG.info(
+                    "RW→RO 재오픈 완료 path=%s state=0x%X incompat=0x%X ro_compat=0x%X",
+                    src,
+                    vol.sb.state,
+                    vol.sb.feature_incompat,
+                    vol.sb.feature_ro_compat,
+                )
+
             LOG.info("실제 마운트 모드 read_only=%s letter=%s", read_only, letter)
             label = vol.sb.volume_name or vinfo.label or "EXT4"
             session = mount_volume(vol, read_only=read_only, label=label, letter=letter)
