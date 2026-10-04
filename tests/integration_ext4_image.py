@@ -241,8 +241,10 @@ def dirty_marker_roundtrip(path: str) -> None:
 
     vol.begin_write_session()
     assert not (vol.sb.state & C.EXT4_VALID_FS)
-    # Simulate application/device loss: close without finish_write_session().
-    vol.close()
+    # Simulate application/device loss explicitly. A normal close is a clean
+    # boundary; abort=True preserves the dirty marker and must never fabricate
+    # EXT4_VALID_FS after an interrupted write session.
+    vol.close(abort=True)
 
     check = open_volume(path, False)
     try:
