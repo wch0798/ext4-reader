@@ -3,10 +3,10 @@
 import struct
 from types import SimpleNamespace
 
-from bitmap import Bitmap, alloc_blocks
-from extents import Extent, build_extent_tree, walk_extents
-from superblock import GroupDesc
-from writer import _add_runs, _initialize_range
+from ext4lib.fs.bitmap import Bitmap, alloc_blocks
+from ext4lib.fs.extents import Extent, build_extent_tree, walk_extents
+from ext4lib.fs.superblock import GroupDesc
+from ext4lib.fs.writer import _add_runs, _initialize_range
 
 
 class MemInode:
@@ -115,7 +115,7 @@ def test_metadata_spares_append_cursor():
 def test_block_count_is_not_capped_at_2tb():
     import struct
 
-    from inode import Inode
+    from ext4lib.fs.inode import Inode
 
     raw = bytearray(256)
     inode = Inode(
@@ -160,7 +160,7 @@ def test_prealloc_tail_initializes():
 
 
 def test_recycle_targets():
-    from fuse_mount import recycle_attr_path, recycle_repair_targets
+    from ext4lib.mount.fuse import recycle_attr_path, recycle_repair_targets
 
     assert recycle_repair_targets("/Game/desktop.ini") is None
     assert recycle_repair_targets("/$RECYCLE.BIN") == ("/$RECYCLE.BIN", "")
@@ -176,7 +176,7 @@ def test_recycle_targets():
 
 
 def test_htree_grows_levels():
-    from directory import _dx_entries, _dx_insert_pointer, _dx_pick, _write_dx_entries
+    from ext4lib.fs.directory import _dx_entries, _dx_insert_pointer, _dx_pick, _write_dx_entries
 
     bs = 64
     root = bytearray(bs)
@@ -218,7 +218,7 @@ def test_htree_grows_levels():
 
 
 def test_unlink_frees_extent_indexes():
-    from writer import release_inode_blocks
+    from ext4lib.fs.writer import release_inode_blocks
 
     vol = make_vol()
     inode = MemInode()
@@ -236,7 +236,7 @@ def test_unlink_frees_extent_indexes():
 def test_journal_recovery_blocks_writes():
     import types
 
-    from volume import Ext4Error, Ext4Volume
+    from ext4lib.fs.volume import Ext4Error, Ext4Volume
 
     sb = SimpleNamespace(feature_incompat=0, feature_ro_compat=0, has_extents=True, state=1, needs_recovery=True)
     vol = SimpleNamespace(
@@ -274,7 +274,7 @@ def test_stat_ex_slot():
         print("stat ex slot skipped (WinFsp/libfuse unavailable):", exc)
         return
 
-    from fuse_mount import _install_winfsp_stat_ex
+    from ext4lib.mount.fuse import _install_winfsp_stat_ex
 
     before = ctypes.sizeof(fuse.fuse_operations)
     _install_winfsp_stat_ex(fuse.FUSE)
