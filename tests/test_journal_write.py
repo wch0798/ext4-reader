@@ -128,5 +128,41 @@ class MetadataOverlayTests(unittest.TestCase):
         self.assertEqual(vol.dev.writes, [])
 
 
+
+    def test_64bit_bitmap_checksum_high_words_use_linux_offsets(self):
+        from ext4lib.fs.bitmap import Bitmap, apply_bitmap_csum
+        from ext4lib.fs.superblock import GroupDesc
+
+        raw = bytearray(64)
+        # Sentinel: exclude_bitmap_hi must not be clobbered by checksum writes.
+        raw[0x34:0x38] = b"EXCL"
+        gd = GroupDesc(
+            group=0,
+            block_bitmap=1,
+            inode_bitmap=2,
+            inode_table=3,
+            free_blocks=10,
+            free_inodes=10,
+            used_dirs=1,
+            flags=0,
+            itable_unused=0,
+            raw=raw,
+        )
+        sb = SimpleNamespace(
+            has_metadata_csum=True,
+            desc_size=64,
+            blocks_per_group=32768,
+            inodes_per_group=32768,
+            csum_seed=lambda: 0x12345678,
+            has_64bit=True,
+            has_gdt_csum=False,
+        )
+        vol = SimpleNamespace(sb=sb)
+        bm = Bitmap(bytearray(4096), 32768)
+
+        apply_bitmap_csum(vol, gd, "block", bm)
+        self.assertEqual(gd.raw[0x34:0x38], b"EXCL")
+        self.assertNotEqual(gd.raw[0x38:0x3A], b"\x00\x00")
+
 if __name__ == "__main__":
     unittest.main()
