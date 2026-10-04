@@ -149,7 +149,10 @@ class Superblock:
         if not self.has_metadata_csum:
             return
         struct.pack_into("<I", self.raw, 0x3FC, 0)
-        crc = crc32c(self.csum_seed(), self.raw[:0x3FC])
+        # Linux ext4_superblock_csum() starts from ~0. Unlike inode,
+        # bitmap and group-descriptor checksums, the superblock does not use
+        # s_csum_seed / UUID as the initial CRC.
+        crc = crc32c(0xFFFFFFFF, self.raw[:0x3FC])
         struct.pack_into("<I", self.raw, 0x3FC, crc)
 
 
