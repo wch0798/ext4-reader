@@ -1101,6 +1101,33 @@ def cleanup_stale_mounts() -> None:
             LOG.exception("남은 드라이브 해제 실패 %s", letter)
 
 
+def _drive_letter_registered(letter: str) -> tuple[bool, str]:
+    """Return whether Windows has registered the WinFsp drive letter.
+
+    os.path.exists('X:\\') can lag behind mount-manager registration while
+    WinFsp is still finishing startup. QueryDosDevice is the authoritative
+    signal that the drive letter exists and avoids tearing down a healthy mount
+    merely because Explorer/root probing took longer than eight seconds.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    root = normalize_drive_letter(letter)
+    buf = ctypes.create_unicode_buffer(512)
+    kernel32 = ctypes.windll.kernel32
+    kernel32.QueryDosDeviceW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+    ]
+    kernel32.QueryDosDeviceW.restype = wintypes.DWORD
+    n = kernel32.QueryDosDeviceW(root, buf, 512)
+    if not n:
+        return False, ""
+    target = buf.value or ""
+    return True, target
+
+
 def _looks_like_orphan_winfsp(letter: str) -> bool:
     """Dead WinFsp volume letter. Never touch unused letters or network maps."""
     buf = ctypes.create_unicode_buffer(512)
@@ -1387,22 +1414,57 @@ def mount_volume(vol: Ext4Volume, read_only: bool, letter: str | None = None, la
         _SESSIONS[cand] = session
         _remember(cand)
         session.thread.start()
-        deadline = time.time() + 8
+        deadline = time.time() + 20
         root = cand + "\\"
+        registered_at: float | None = None
+        registered_target = ""
         while time.time() < deadline:
             if session.error:
                 break
-            if os.path.exists(root):
-                LOG.info("마운트 성공 %s", cand)
-                _log_drive(cand)
-                return session
+            registered, target = _drive_letter_registered(cand)
+            if registered:
+                registered_target = target
+                if registered_at is None:
+                    registered_at = time.time()
+                    LOG.info(
+                        "WinFsp 드라이브 문자 등록 확인 %s target=%s",
+                        cand,
+                        target,
+                    )
+                # Prefer a fully probeable root, but do not tear down a valid
+                # WinFsp registration just because shell/path visibility lags.
+                if os.path.exists(root) or time.time() - registered_at >= 1.5:
+                    LOG.info(
+                        "마운트 성공 %s root_visible=%s target=%s",
+                        cand,
+                        os.path.exists(root),
+                        registered_target,
+                    )
+                    _log_drive(cand)
+                    return session
+            elif not session.thread.is_alive() and session.error is None:
+                last_error = RuntimeError("WinFsp mount thread가 드라이브 등록 전에 종료되었습니다.")
+                break
             time.sleep(0.12)
-        if os.path.exists(root):
-            LOG.info("마운트 성공 %s", cand)
+
+        registered, target = _drive_letter_registered(cand)
+        if registered and session.error is None:
+            LOG.info(
+                "마운트 성공 %s (지연 등록) root_visible=%s target=%s",
+                cand,
+                os.path.exists(root),
+                target,
+            )
             _log_drive(cand)
             return session
-        last_error = session.error
-        LOG.error("마운트 실패 %s error=%s", cand, last_error)
+        last_error = session.error or locals().get("last_error")
+        LOG.error(
+            "마운트 실패 %s error=%s registered=%s target=%s",
+            cand,
+            last_error,
+            registered,
+            target,
+        )
         try:
             unmount(cand)
         except Exception:
