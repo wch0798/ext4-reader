@@ -1,17 +1,39 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-from PyInstaller.utils.hooks import collect_submodules
-
-hiddenimports = collect_submodules("ext4reader") + [
+hiddenimports = [
+    "app_info",
+    "bitmap",
+    "constants",
+    "crc32c",
+    "debuglog",
+    "directory",
+    "dnd",
+    "extents",
+    "fuse_mount",
+    "gui",
+    "hashdir",
+    "host",
+    "inode",
+    "io_backend",
+    "journal",
+    "partitions",
+    "superblock",
+    "system_raw_helper",
+    "usbdk_backend",
+    "usbdk_setup",
+    "volume",
+    "windows_disk",
+    "winfsp_setup",
+    "writer",
     "fuse",
     "tkinter",
     "tkinter.ttk",
     "tkinter.filedialog",
-    "tkinter.messagebox",
+    "tkinter.messagebox"
 ]
 
 a = Analysis(
-    ["launch.py"],
+    ["main.py"],
     pathex=["."],
     binaries=[],
     datas=[],
