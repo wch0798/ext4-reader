@@ -134,20 +134,19 @@ jobs:
           truncate -s 256M clean.img
           mkfs.ext4 -F -q -b 4096 -O ^64bit,^metadata_csum,^orphan_file clean.img
           cp clean.img dirty.img
-          cp clean.img journal.img
+
+          truncate -s 256M journal.img
+          mkfs.ext4 -F -q -b 4096 -O 64bit,metadata_csum,^orphan_file,^fast_commit journal.img
 
       - name: Exercise EXT4 writer
         run: |
           python -m tests.integration_ext4_image clean.img --mode clean
           python -m tests.integration_ext4_image dirty.img --mode dirty-marker
-          python -m tests.integration_ext4_image journal.img --mode journal-write
+          python -m tests.integration_ext4_image journal.img --mode journal-replay
 
-      - name: Validate clean image with e2fsck
+      - name: Validate clean images with e2fsck
         run: |
           sudo e2fsck -fn clean.img
-
-      - name: Validate journal-write image with e2fsck
-        run: |
           sudo e2fsck -fn journal.img
 
       - name: Validate crash-marked image with e2fsck
