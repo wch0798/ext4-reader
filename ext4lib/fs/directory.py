@@ -39,9 +39,12 @@ def _dir_csum_set(vol, inode: Inode, block: bytearray) -> None:
     block[tail_off + 6] = 0
     block[tail_off + 7] = C.EXT4_FT_DIR_CSUM
     struct.pack_into("<I", block, tail_off + 8, 0)
+    # Linux precomputes i_csum_seed from fs seed + inode number +
+    # generation, then checksums a classic directory leaf only up to the
+    # ext4_dir_entry_tail. The 12-byte fake tail itself is excluded.
     crc = crc32c(vol.sb.csum_seed(), struct.pack("<I", inode.ino))
     crc = crc32c(crc, struct.pack("<I", inode.generation))
-    crc = crc32c(crc, block[: bs - 4])
+    crc = crc32c(crc, block[:tail_off])
     struct.pack_into("<I", block, tail_off + 8, crc)
 
 
