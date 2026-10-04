@@ -368,7 +368,15 @@ def rebuild_block_bitmap_from_metadata(
                 f"EXT4 block bitmap 재구성: inode group "
                 f"{inode_group + 1}/{total_groups}"
             )
-        ibm = read_inode_bitmap(vol, inode_gd)
+        if inode_gd.flags & C.BG_INODE_UNINIT:
+            continue
+        raw_ibm = vol.read_block(inode_gd.inode_bitmap)
+        if not bitmap_checksum_valid(vol, inode_gd, "inode", raw_ibm):
+            raise ValueError(
+                f"inode bitmap checksum mismatch in group {inode_group}; "
+                "cannot safely reconstruct block bitmap"
+            )
+        ibm = Bitmap(bytearray(raw_ibm), vol.sb.inodes_per_group)
         base_ino = inode_group * vol.sb.inodes_per_group + 1
         max_count = min(
             vol.sb.inodes_per_group,
