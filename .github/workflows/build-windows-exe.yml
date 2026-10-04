@@ -102,3 +102,49 @@ jobs:
               --title "EXT4 Reader $env:VERSION" `
               --notes "Windows EXE 자동 빌드. main.py 단일 진입점 + ext4lib 라이브러리 구조, EXT4 JBD2 복구 및 UsbDk fallback 포함."
           }
+
+  ext4-image-integration:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install e2fsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs
+
+      - name: Create EXT4 test images
+        run: |
+          truncate -s 256M clean.img
+          mkfs.ext4 -F -q -b 4096 -O ^64bit,^metadata_csum,^orphan_file clean.img
+          cp clean.img dirty.img
+
+      - name: Exercise EXT4 writer
+        run: |
+          python tests/integration_ext4_image.py clean.img --mode clean
+          python tests/integration_ext4_image.py dirty.img --mode dirty-marker
+
+      - name: Validate clean image with e2fsck
+        run: |
+          sudo e2fsck -fn clean.img
+
+      - name: Validate crash-marked image with e2fsck
+        run: |
+          set +e
+          sudo e2fsck -fn dirty.img
+          rc=$?
+          set -e
+          # e2fsck bit 4/8/16/32/128 indicates uncorrected/operational/usage/
+          # cancelled/shared-library failure. A merely unclean filesystem may
+          # still return 0 after a read-only full check.
+          if (( rc & (4|8|16|32|128) )); then
+            exit "$rc"
+          fi
+
