@@ -1346,10 +1346,27 @@ def _run_fuse(ops, letter: str, label: str, read_only: bool, session: MountSessi
     )
     try:
         FUSE(bound, mountpoint, **kwargs)
-        if session.error is None and not os.path.exists(letter + "\\"):
-            session.error = RuntimeError("1")
-            LOG.error("FUSE가 반환했지만 드라이브 %s 가 없습니다", letter)
+        if session.stop.is_set():
+            LOG.info("FUSE 정상 종료 mount=%s", letter)
+            return
+        registered, target = _drive_letter_registered(letter)
+        if session.error is None and not registered:
+            session.error = RuntimeError(
+                f"WinFsp가 종료되었고 {letter} 드라이브 등록도 없습니다."
+            )
+            LOG.error(
+                "FUSE가 예기치 않게 반환됨 mount=%s registered=%s target=%s",
+                letter,
+                registered,
+                target,
+            )
     except Exception as exc:
+        if session.stop.is_set():
+            # WinFsp/fusepy commonly reports RuntimeError(1) when the host is
+            # deliberately stopped. This is an expected teardown result, not a
+            # filesystem failure and should not flood the user log.
+            LOG.info("FUSE 종료 확인 mount=%s (%s)", letter, exc)
+            return
         LOG.exception("FUSE 실패 mount=%s", letter)
         session.error = RuntimeError(explain_fuse_error(exc))
 
