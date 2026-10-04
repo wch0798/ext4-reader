@@ -13,7 +13,17 @@ import webbrowser
 from tkinter import filedialog, messagebox, ttk
 
 from ext4lib import __app_name__, __version__
-from ext4lib.i18n import LANGUAGES, language_from_label, language_label, load_language, save_language, tr
+from ext4lib.i18n import (
+    LANGUAGES,
+    OWNER_MODES,
+    language_from_label,
+    language_label,
+    load_language,
+    load_owner_mode,
+    save_language,
+    save_owner_mode,
+    tr,
+)
 from ext4lib.debuglog import LOG, setup_logging
 from ext4lib.ui.dnd import DropTarget
 from ext4lib.mount.fuse import (
@@ -79,6 +89,7 @@ class App(tk.Tk):
         self._busy = False
         self._operation_active = False
         self.language = load_language()
+        self.owner_mode = load_owner_mode()
         self._nodes: dict[str, tuple[str, object]] = {}
         self._mounts: dict[str, MountSession] = {}
         self._drop: DropTarget | None = None
@@ -109,6 +120,45 @@ class App(tk.Tk):
             parent=self,
         )
 
+    def _owner_labels(self) -> dict[str, str]:
+        return {
+            "deck": self._t("owner_deck"),
+            "root": self._t("owner_root"),
+        }
+
+    def _on_owner_change(self, _event=None) -> None:
+        label = self.owner_var.get()
+        labels = self._owner_labels()
+        mode = next(
+            (key for key, value in labels.items() if value == label),
+            "deck",
+        )
+        self.owner_mode = mode
+        save_owner_mode(mode)
+        uid, gid = OWNER_MODES[mode]
+        LOG.info(
+            "Linux 신규 inode 소유자 선택 mode=%s uid=%s gid=%s",
+            mode,
+            uid,
+            gid,
+        )
+
+    def _apply_owner_mode(self, vol: Ext4Volume) -> None:
+        mode = self.owner_mode if self.owner_mode in OWNER_MODES else "deck"
+        uid, gid = OWNER_MODES[mode]
+        vol.default_uid = uid
+        vol.default_gid = gid
+        vol.default_file_mode = C.DEFAULT_LINUX_FILE_MODE
+        vol.default_dir_mode = C.DEFAULT_LINUX_DIR_MODE
+        LOG.info(
+            "Linux 신규 inode 적용 mode=%s uid=%s gid=%s file_mode=%04o dir_mode=%04o",
+            mode,
+            uid,
+            gid,
+            vol.default_file_mode,
+            vol.default_dir_mode,
+        )
+
     def _style(self) -> None:
         st = ttk.Style()
         try:
@@ -125,6 +175,22 @@ class App(tk.Tk):
         st.configure("Accent.TButton", background="#3d5a80", foreground="white", padding=8)
         st.configure("TCheckbutton", background=BG, foreground=FG)
         st.configure("TCombobox", fieldbackground=BG2, background=BG2, foreground=FG)
+        st.configure(
+            "Visible.TCombobox",
+            fieldbackground=BG2,
+            background=BG2,
+            foreground=FG,
+            arrowcolor=FG,
+        )
+        st.map(
+            "Visible.TCombobox",
+            fieldbackground=[("readonly", BG2), ("disabled", BG2)],
+            background=[("readonly", BG2), ("disabled", BG2)],
+            foreground=[("readonly", FG), ("disabled", FG_DIM)],
+            selectbackground=[("readonly", BG2)],
+            selectforeground=[("readonly", FG)],
+            arrowcolor=[("readonly", FG), ("disabled", FG_DIM)],
+        )
         st.configure(
             "Treeview",
             background=BG3,
@@ -148,8 +214,14 @@ class App(tk.Tk):
             values=list(LANGUAGES.values()),
             width=9,
             state="readonly",
+            style="Visible.TCombobox",
         )
         self.language_combo.pack(side="right", padx=(4, 0))
+        language_codes = list(LANGUAGES)
+        if self.language in language_codes:
+            self.language_combo.current(language_codes.index(self.language))
+        else:
+            self.language_combo.current(0)
         self.language_combo.bind("<<ComboboxSelected>>", self._on_language_change)
         ttk.Label(top, text=self._t("language")).pack(side="right", padx=(12, 2))
 
@@ -183,13 +255,44 @@ class App(tk.Tk):
             wraplength=780,
         ).pack(fill="x", padx=16, pady=(0, 8))
 
+        owner_bar = ttk.Frame(self)
+        owner_bar.pack(fill="x", padx=16, pady=(0, 2))
+        ttk.Label(owner_bar, text=self._t("linux_owner")).pack(
+            side="left", padx=(2, 6)
+        )
+        owner_labels = self._owner_labels()
+        owner_values = [owner_labels["deck"], owner_labels["root"]]
+        self.owner_var = tk.StringVar()
+        self.owner_combo = ttk.Combobox(
+            owner_bar,
+            textvariable=self.owner_var,
+            values=owner_values,
+            width=31,
+            state="readonly",
+            style="Visible.TCombobox",
+        )
+        self.owner_combo.pack(side="left")
+        owner_index = 1 if self.owner_mode == "root" else 0
+        self.owner_combo.current(owner_index)
+        self.owner_var.set(owner_values[owner_index])
+        self.owner_combo.bind(
+            "<<ComboboxSelected>>",
+            self._on_owner_change,
+        )
+
         bar = ttk.Frame(self)
         bar.pack(fill="x", padx=16, pady=4)
         ttk.Button(bar, text=self._t("scan"), command=self.scan_disks).pack(side="left", padx=2)
         ttk.Button(bar, text=self._t("open_image"), command=self.open_image).pack(side="left", padx=2)
         ttk.Label(bar, text="  " + self._t("drive")).pack(side="left", padx=(12, 4))
         self.drive_var = tk.StringVar()
-        self.drive_combo = ttk.Combobox(bar, textvariable=self.drive_var, width=6, state="readonly")
+        self.drive_combo = ttk.Combobox(
+            bar,
+            textvariable=self.drive_var,
+            width=6,
+            state="readonly",
+            style="Visible.TCombobox",
+        )
         self.drive_combo.pack(side="left")
         self.drive_combo.bind("<Button-1>", lambda _e: self.refresh_drive_letters())
         self.drive_combo.bind("<FocusIn>", lambda _e: self.refresh_drive_letters())
@@ -304,10 +407,14 @@ class App(tk.Tk):
         cur = (self.drive_var.get() or "").upper()
         self.drive_combo["values"] = letters
         if cur in letters:
+            index = letters.index(cur)
+            self.drive_combo.current(index)
             self.drive_var.set(cur)
         elif letters:
+            self.drive_combo.current(0)
             self.drive_var.set(letters[0])
         else:
+            self.drive_combo.set("")
             self.drive_var.set("")
         LOG.info("사용 가능한 드라이브 %s (선택 %s)", ",".join(letters) or "(없음)", self.drive_var.get() or "-")
 
@@ -487,6 +594,7 @@ class App(tk.Tk):
             self.set_status(self._t("scan_failed", error=payload))
             return
         ext_count = 0
+        first_volume_id = None
         for disk, vols, err in payload:
             did = self.tree.insert(
                 "",
@@ -516,12 +624,19 @@ class App(tk.Tk):
                     ),
                 )
                 self._nodes[vid] = ("vol", (disk, v))
+                if first_volume_id is None:
+                    first_volume_id = vid
                 ext_count += 1
         extra = self._t("admin_extra") if is_admin() else self._t("admin_needed_extra")
         winfsp = self._t("winfsp_ready") if winfsp_ready() else self._t("winfsp_needed")
         self.set_status(self._t("scan_summary", disks=len(payload), volumes=ext_count, admin=extra, winfsp=winfsp))
         LOG.info("검색 완료 disks=%s ext=%s admin=%s", len(payload), ext_count, is_admin())
+        if first_volume_id is not None and not self.tree.selection():
+            self.tree.selection_set(first_volume_id)
+            self.tree.focus(first_volume_id)
+            self.tree.see(first_volume_id)
         self.refresh_drive_letters()
+        self.after_idle(self.refresh_drive_letters)
 
     def open_image(self) -> None:
         path = filedialog.askopenfilename(
@@ -902,6 +1017,7 @@ class App(tk.Tk):
             LOG.info("FUSE 런타임 사전 로드 완료")
             dev = opener(writable)
             vol = Ext4Volume(dev, vinfo.offset, vinfo.size, owns_device=True)
+            self._apply_owner_mode(vol)
             LOG.info(
                 "볼륨 label=%s type=%s blocks=%s block_size=%s inode_size=%s",
                 vol.sb.volume_name,
@@ -1043,6 +1159,7 @@ class App(tk.Tk):
                     vinfo.size,
                     owns_device=True,
                 )
+                self._apply_owner_mode(vol)
                 LOG.info(
                     "RW→RO 재오픈 완료 path=%s state=0x%X incompat=0x%X ro_compat=0x%X",
                     src,
