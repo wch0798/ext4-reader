@@ -1,35 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-hiddenimports = [
-    "app_info",
-    "bitmap",
-    "constants",
-    "crc32c",
-    "debuglog",
-    "directory",
-    "dnd",
-    "extents",
-    "fuse_mount",
-    "gui",
-    "hashdir",
-    "host",
-    "inode",
-    "io_backend",
-    "journal",
-    "partitions",
-    "superblock",
-    "system_raw_helper",
-    "usbdk_backend",
-    "usbdk_setup",
-    "volume",
-    "windows_disk",
-    "winfsp_setup",
-    "writer",
+from PyInstaller.utils.hooks import collect_submodules
+
+hiddenimports = collect_submodules("ext4lib") + [
     "fuse",
     "tkinter",
     "tkinter.ttk",
     "tkinter.filedialog",
-    "tkinter.messagebox"
+    "tkinter.messagebox",
 ]
 
 a = Analysis(
