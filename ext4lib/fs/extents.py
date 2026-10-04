@@ -296,7 +296,7 @@ def _write_extent_node(vol, inode: Inode, records: list[bytes], depth: int, cap:
     for i, rec in enumerate(records):
         block[12 + i * 12 : 24 + i * 12] = rec
     _extent_block_csum(vol.sb, inode.ino, inode.generation, block)
-    vol.write_metadata_block(phys, bytes(block))
+    (getattr(vol, "write_metadata_block", None) or vol.write_block)(phys, bytes(block))
     return phys
 
 
