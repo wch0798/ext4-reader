@@ -1149,31 +1149,85 @@ def probe_superblock(dev: BlockDevice, offset: int) -> Superblock | None:
         return None
 
 
+def _raw_ext4_scan_offsets(dev: BlockDevice) -> list[int]:
+    """Conservative byte offsets to try when Windows exposes no partitions.
+
+    Modern GPT/MBR tools normally align the first partition at 1 MiB. Some
+    USB/card-reader stacks expose the physical disk but fail to surface the
+    partition table, so probing a small set of standard raw offsets lets us
+    recover the filesystem without depending on Windows' partition manager.
+    """
+    size = int(dev.size() or 0)
+    mib = 1024 * 1024
+    offsets: set[int] = {0}
+
+    # Cover the usual modern alignment area without turning startup into a
+    # whole-disk signature scan.
+    max_mib = min(64, max(0, (size - 2048) // mib))
+    for i in range(1, max_mib + 1):
+        offsets.add(i * mib)
+
+    # Old DOS/CHS and sector-based starts occasionally used by removable media.
+    reported = int(getattr(dev, "sector_size", 512) or 512)
+    for sector in {512, 4096, reported}:
+        for lba in (63, 128, 256, 2048, 4096):
+            off = int(lba) * int(sector)
+            if 0 <= off + 2048 <= size:
+                offsets.add(off)
+
+    return sorted(off for off in offsets if 0 <= off + 2048 <= size)
+
+
 def discover_volumes(dev: BlockDevice) -> list[VolumeInfo]:
     found: list[VolumeInfo] = []
     seen_off: set[int] = set()
     parts = []
     try:
         parts = list_partitions(dev)
-    except Exception:
+    except Exception as exc:
+        LOG.warning("파티션 테이블 검사 실패 — raw EXT4 탐색으로 계속합니다: %s", exc)
         parts = []
 
     candidates: list[tuple[int, int, int, str, str]] = []
     for p in parts:
         candidates.append((p.start, p.size, p.index, p.name, p.scheme))
-    if not candidates:
-        candidates.append((0, dev.size(), 0, "", "전체"))
 
-    for start, size, idx, name, scheme in candidates:
+    def add_candidate(
+        start: int,
+        size: int,
+        idx: int,
+        name: str,
+        scheme: str,
+        *,
+        raw_scan: bool = False,
+    ) -> bool:
         if start in seen_off:
-            continue
+            return False
         sb = probe_superblock(dev, start)
         if not sb:
-            continue
-        seen_off.add(start)
+            return False
+
+        # Backup EXT superblocks contain their block-group number. A raw
+        # signature scan must only accept the primary superblock.
+        if raw_scan and int(getattr(sb, "block_group_nr", 0) or 0) != 0:
+            return False
+
+        fs_size = int(sb.blocks_count) * int(sb.block_size)
+        disk_size = int(dev.size() or 0)
+        if fs_size <= 0:
+            return False
+        if disk_size and start + fs_size > disk_size:
+            return False
+
+        effective_size = int(size or fs_size)
+        if raw_scan:
+            # Without a trustworthy partition table, bind writes to the exact
+            # filesystem extent advertised by its primary superblock.
+            effective_size = fs_size
+
         info = VolumeInfo(
             offset=start,
-            size=size or (sb.blocks_count * sb.block_size),
+            size=effective_size,
             partition_index=idx,
             partition_name=name,
             scheme=scheme,
@@ -1182,25 +1236,48 @@ def discover_volumes(dev: BlockDevice) -> list[VolumeInfo]:
         try:
             tmp = Ext4Volume(dev, start, info.size, owns_device=False)
             info.write_blockers = tmp.hard_write_blockers()
-        except Exception:
-            pass
+        except Exception as exc:
+            if raw_scan:
+                LOG.debug(
+                    "raw EXT4 후보 검증 실패 offset=%s: %s",
+                    start,
+                    exc,
+                )
+                return False
+
+        seen_off.add(start)
         found.append(info)
+        if raw_scan:
+            LOG.warning(
+                "파티션 테이블 없이 EXT4 직접 발견 offset=%s size=%s "
+                "uuid=%s label=%s",
+                start,
+                effective_size,
+                sb.uuid.hex(),
+                sb.volume_name or "-",
+            )
+        return True
+
+    for start, size, idx, name, scheme in candidates:
+        add_candidate(start, size, idx, name, scheme)
 
     if not found:
-        sb = probe_superblock(dev, 0)
-        if sb:
-            found.append(
-                VolumeInfo(
-                    offset=0,
-                    size=dev.size(),
-                    partition_index=0,
-                    partition_name="",
-                    scheme="슈퍼블록",
-                    sb=sb,
-                )
-            )
-    return found
+        for start in _raw_ext4_scan_offsets(dev):
+            if add_candidate(
+                start,
+                0,
+                0,
+                "RAW EXT4",
+                "RAW-SCAN",
+                raw_scan=True,
+            ):
+                # The user's common case is one large removable-media
+                # filesystem. Keep scanning the small prefix in case there are
+                # multiple explicitly aligned EXT filesystems, but never scan
+                # the whole disk.
+                continue
 
+    return found
 
 def format_bytes(n: int) -> str:
     n = float(n)

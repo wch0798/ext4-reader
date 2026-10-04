@@ -95,17 +95,33 @@ def _parse_mbr(dev: BlockDevice, sector: int) -> list[Partition]:
     return parts
 
 
-def _parse_gpt(dev: BlockDevice, sector: int) -> list[Partition]:
-    header = dev.read(sector, sector)
-    if header[0:8] != b"EFI PART":
+def _parse_gpt_at_lba(
+    dev: BlockDevice, sector: int, header_lba: int
+) -> list[Partition]:
+    if header_lba <= 0:
+        return []
+    header = dev.read(header_lba * sector, sector)
+    if len(header) < 92 or header[0:8] != b"EFI PART":
         return []
     part_lba = struct.unpack_from("<Q", header, 72)[0]
     part_count = struct.unpack_from("<I", header, 80)[0]
     part_size = struct.unpack_from("<I", header, 84)[0]
     if part_size < 128 or part_count == 0 or part_count > 4096:
         return []
-    table = dev.read(part_lba * sector, part_count * part_size)
+    disk_size = int(dev.size() or 0)
+    table_bytes = part_count * part_size
+    table_offset = part_lba * sector
+    if (
+        table_offset < 0
+        or table_bytes <= 0
+        or (disk_size and table_offset + table_bytes > disk_size)
+    ):
+        return []
+    table = dev.read(table_offset, table_bytes)
+    if len(table) < table_bytes:
+        return []
     parts: list[Partition] = []
+    total_lbas = disk_size // sector if disk_size else 0
     for i in range(part_count):
         rec = table[i * part_size : (i + 1) * part_size]
         type_guid = rec[0:16]
@@ -113,6 +129,10 @@ def _parse_gpt(dev: BlockDevice, sector: int) -> list[Partition]:
             continue
         first = struct.unpack_from("<Q", rec, 32)[0]
         last = struct.unpack_from("<Q", rec, 40)[0]
+        if first == 0 or last < first:
+            continue
+        if total_lbas and last >= total_lbas:
+            continue
         name = rec[56:128].decode("utf-16le", errors="ignore").rstrip("\x00")
         guid_s = _guid_from_le(type_guid)
         linux = guid_s in LINUX_GPT_GUIDS
@@ -129,6 +149,23 @@ def _parse_gpt(dev: BlockDevice, sector: int) -> list[Partition]:
             )
         )
     return parts
+
+
+def _parse_gpt(dev: BlockDevice, sector: int) -> list[Partition]:
+    primary = _parse_gpt_at_lba(dev, sector, 1)
+    if primary:
+        return primary
+
+    # A card reader/driver may expose media where the primary GPT cannot be
+    # read even though the backup GPT at the end of the disk is intact. Linux
+    # and partition-repair tools use the backup copy for recovery, so do the
+    # same for discovery. We only use it to locate partitions; writes never
+    # modify GPT metadata.
+    disk_size = int(dev.size() or 0)
+    total_lbas = disk_size // sector if sector else 0
+    if total_lbas > 2:
+        return _parse_gpt_at_lba(dev, sector, total_lbas - 1)
+    return []
 
 
 def list_partitions(dev: BlockDevice) -> list[Partition]:
