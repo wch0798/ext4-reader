@@ -76,6 +76,8 @@ class Superblock:
     want_extra_isize: int
     min_extra_isize: int
     checksum_seed: int
+    last_orphan: int = 0
+    orphan_file_inum: int = 0
     groups_count: int = 0
     block_size: int = 4096
     groups: list[GroupDesc] = field(default_factory=list)
@@ -211,7 +213,8 @@ def parse_superblock(data: bytes) -> Superblock:
         volume_name=raw_name.decode("utf-8", errors="replace"),
         last_mounted=raw_mount.decode("utf-8", errors="replace"),
         desc_size=desc_size,
-        hash_seed=bytes(data[0xE8:0xF8]),
+        # 0xE8 is s_last_orphan. HTREE s_hash_seed starts at 0xEC.
+        hash_seed=bytes(data[0xEC:0xFC]),
         def_hash_version=data[0xF8],
         default_mount_opts=_u32(data, 0xFC),
         first_meta_bg=_u32(data, 0x104),
@@ -220,6 +223,8 @@ def parse_superblock(data: bytes) -> Superblock:
         want_extra_isize=_u16(data, 0x15C) or 32,
         min_extra_isize=_u16(data, 0x15A) or 32,
         checksum_seed=csum_seed,
+        last_orphan=_u32(data, 0xE8),
+        orphan_file_inum=_u32(data, 0x280),
         groups_count=groups,
         block_size=block_size,
     )
