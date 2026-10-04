@@ -226,6 +226,56 @@ def parse_superblock(data: bytes) -> Superblock:
     return sb
 
 
+
+
+def superblock_checksum_valid(sb: Superblock) -> bool:
+    if not sb.has_metadata_csum:
+        return True
+    stored = _u32(sb.raw, 0x3FC)
+    tmp = bytearray(sb.raw)
+    struct.pack_into("<I", tmp, 0x3FC, 0)
+    calc = crc32c(0xFFFFFFFF, tmp[:0x3FC])
+    return stored == calc
+
+
+def group_desc_checksum_valid(sb: Superblock, gd: GroupDesc) -> bool:
+    if not (sb.has_metadata_csum or sb.has_gdt_csum):
+        return True
+    stored = _u16(gd.raw, 0x1E)
+    tmp = GroupDesc(
+        group=gd.group,
+        block_bitmap=gd.block_bitmap,
+        inode_bitmap=gd.inode_bitmap,
+        inode_table=gd.inode_table,
+        free_blocks=gd.free_blocks,
+        free_inodes=gd.free_inodes,
+        used_dirs=gd.used_dirs,
+        flags=gd.flags,
+        itable_unused=gd.itable_unused,
+        raw=bytearray(gd.raw),
+    )
+    apply_gdt_checksum(sb, tmp)
+    return stored == _u16(tmp.raw, 0x1E)
+
+
+def superblock_error_info(sb: Superblock) -> dict[str, int | str]:
+    raw = sb.raw
+    def cstr(off: int, length: int) -> str:
+        return bytes(raw[off:off + length]).split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+    return {
+        "count": _u32(raw, 0x194),
+        "first_time": _u32(raw, 0x198),
+        "first_ino": _u32(raw, 0x19C),
+        "first_block": struct.unpack_from("<Q", raw, 0x1A0)[0],
+        "first_func": cstr(0x1A8, 32),
+        "first_line": _u32(raw, 0x1C8),
+        "last_time": _u32(raw, 0x1CC),
+        "last_ino": _u32(raw, 0x1D0),
+        "last_line": _u32(raw, 0x1D4),
+        "last_block": struct.unpack_from("<Q", raw, 0x1D8)[0],
+        "last_func": cstr(0x1E0, 32),
+    }
+
 def _gdt_csum_old(sb: Superblock, group: int, raw: bytearray) -> int:
     """Original crc16 GDT checksum (RO_COMPAT_GDT_CSUM without metadata_csum)."""
     # crc16-itu-t of uuid + le16(group) [+ le16(group>>16) if 64bit] + desc with csum zero
