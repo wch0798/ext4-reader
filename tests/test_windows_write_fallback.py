@@ -389,6 +389,61 @@ class WriteFallbackTests(unittest.TestCase):
         self.assertEqual(str(cm.exception), "BOT probe failed")
         self.assertEqual(restored, [True])
 
+    def test_scsi_large_write_is_split_into_bridge_safe_chunks(self):
+        dev = self.make_dev()
+        dev._scsi_max_transfer = 256 * 1024
+        calls = []
+        dev._scsi_write10_one = lambda offset, data: calls.append(
+            (offset, len(data))
+        )
+
+        base = 1048576
+        payload = b"x" * (1024 * 1024)
+        dev._scsi_write10(base, payload)
+
+        self.assertEqual(len(calls), 4)
+        self.assertEqual([n for _off, n in calls], [256 * 1024] * 4)
+        self.assertEqual(
+            [off for off, _n in calls],
+            [base + i * 256 * 1024 for i in range(4)],
+        )
+
+    def test_scsi_invalid_parameter_halves_transfer_and_retries_same_range(self):
+        dev = self.make_dev()
+        dev._scsi_max_transfer = 256 * 1024
+        calls = []
+
+        def one(offset, data):
+            calls.append((offset, len(data)))
+            if len(data) > 64 * 1024:
+                raise IoError("bridge transfer too large", winerr=87)
+
+        base = 1048576
+        payload = b"y" * (256 * 1024)
+        dev._scsi_write10_one = one
+        dev._scsi_write10(base, payload)
+
+        self.assertEqual(calls[0], (base, 256 * 1024))
+        self.assertEqual(calls[1], (base, 128 * 1024))
+        self.assertEqual(calls[2], (base, 64 * 1024))
+        self.assertEqual(
+            [item[1] for item in calls[2:]],
+            [64 * 1024] * 4,
+        )
+        self.assertEqual(dev._scsi_max_transfer, 64 * 1024)
+
+    def test_scsi_non_size_error_is_not_hidden_by_chunk_retry(self):
+        dev = self.make_dev()
+        dev._scsi_max_transfer = 256 * 1024
+        dev._scsi_write10_one = lambda offset, data: (_ for _ in ()).throw(
+            IoError("media write failure", winerr=23)
+        )
+
+        with self.assertRaises(IoError) as cm:
+            dev._scsi_write10(1048576, b"z" * (256 * 1024))
+
+        self.assertEqual(cm.exception.winerr, 23)
+
     def test_partition_write_target_is_relative_to_partition_start(self):
         dev = self.make_dev()
         item = object()

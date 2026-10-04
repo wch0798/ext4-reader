@@ -70,6 +70,11 @@ SCSI_WRITE10 = 0x2A
 SCSI_SYNCHRONIZE_CACHE10 = 0x35
 SCSI_WRITE_FUA = 0x08
 
+# Many USB/SD bridges reject large SCSI pass-through buffers even though
+# WRITE(10) itself can encode far more blocks. Start conservatively and adapt
+# downward on ERROR_INVALID_PARAMETER rather than failing a filesystem write.
+SCSI_WRITE_DEFAULT_CHUNK = 256 * 1024
+
 TOKEN_QUERY = 0x0008
 TOKEN_ADJUST_PRIVILEGES = 0x0020
 SE_PRIVILEGE_ENABLED = 0x00000002
@@ -1890,6 +1895,8 @@ class WindowsPhysicalDevice(BlockDevice):
         self._fallback_write_route: str | None = None
         self._scsi_write_count = 0
         self._scsi_write_bytes = 0
+        self._scsi_max_transfer = SCSI_WRITE_DEFAULT_CHUNK
+        self._scsi_chunk_log_once = False
         LOG.info(
             "디스크 열기 %s writable=%s sector=%s part=%s part_offset=%s part_size=%s",
             path,
@@ -2629,8 +2636,8 @@ class WindowsPhysicalDevice(BlockDevice):
             self._scsi_dirty = True
         self._note_scsi_write(len(data))
 
-    def _scsi_write10(self, absolute_offset: int, data: bytes) -> None:
-        """Adaptive SCSI write for USB/SD bridges.
+    def _scsi_write10_one(self, absolute_offset: int, data: bytes) -> None:
+        """Send one adaptive SCSI WRITE(10) command.
 
         Prefer FUA so successful command completion is itself the durability
         barrier. If the bridge rejects only the FUA field, remember that once
@@ -2678,6 +2685,70 @@ class WindowsPhysicalDevice(BlockDevice):
                 f"DIRECT={direct_error} | BUFFERED={exc}",
                 winerr=getattr(exc, "winerr", 5) or 5,
             ) from exc
+
+    def _scsi_write10(self, absolute_offset: int, data: bytes) -> None:
+        """Write arbitrary aligned payloads using bridge-safe WRITE(10) chunks.
+
+        Windows USBSTOR/card-reader miniports can reject a 1 MiB SCSI pass-
+        through buffer with ERROR_INVALID_PARAMETER even when smaller commands
+        work. Split large filesystem writes before issuing WRITE(10), and if a
+        bridge still reports Win32 87, halve the learned transfer size and
+        retry the same unwritten range.
+        """
+        from ext4lib.debuglog import LOG
+
+        if not data:
+            return
+        ss = int(self.sector_size or 512)
+        if absolute_offset < 0 or absolute_offset % ss or len(data) % ss:
+            raise IoError(
+                f"SCSI fallback 정렬 오류 offset={absolute_offset} "
+                f"len={len(data)} sector={ss}",
+                winerr=87,
+            )
+
+        limit = int(
+            getattr(self, "_scsi_max_transfer", SCSI_WRITE_DEFAULT_CHUNK)
+            or SCSI_WRITE_DEFAULT_CHUNK
+        )
+        limit = max(ss, (limit // ss) * ss)
+        if len(data) > limit and not getattr(self, "_scsi_chunk_log_once", False):
+            LOG.info(
+                "대용량 SCSI WRITE(10) 분할 활성화 total=%s chunk=%s sector=%s",
+                len(data),
+                limit,
+                ss,
+            )
+            self._scsi_chunk_log_once = True
+
+        pos = 0
+        while pos < len(data):
+            n = min(limit, len(data) - pos)
+            n = max(ss, (n // ss) * ss)
+            chunk = data[pos : pos + n]
+            try:
+                self._scsi_write10_one(absolute_offset + pos, chunk)
+            except IoError as exc:
+                if getattr(exc, "winerr", 0) == 87 and n > ss:
+                    new_limit = max(ss, ((n // 2) // ss) * ss)
+                    if new_limit >= n:
+                        new_limit = max(ss, n - ss)
+                    self._scsi_max_transfer = new_limit
+                    limit = new_limit
+                    LOG.warning(
+                        "카드리더 SCSI 전송 크기 제한 감지: %s -> %s bytes로 축소 후 재시도",
+                        n,
+                        new_limit,
+                    )
+                    continue
+                raise
+            pos += n
+
+        # Keep the smallest proven limit for the rest of this device session.
+        self._scsi_max_transfer = min(
+            int(getattr(self, "_scsi_max_transfer", limit) or limit),
+            limit,
+        )
 
     def _write_locked_partition_device(self, offset: int, data: bytes) -> None:
         """Write via the partition device after the real matching volume is locked.
