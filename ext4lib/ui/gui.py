@@ -13,6 +13,7 @@ import webbrowser
 from tkinter import filedialog, messagebox, ttk
 
 from ext4lib import __app_name__, __version__
+from ext4lib.i18n import LANGUAGES, language_from_label, language_label, load_language, save_language, tr
 from ext4lib.debuglog import LOG, setup_logging
 from ext4lib.ui.dnd import DropTarget
 from ext4lib.mount.fuse import (
@@ -76,6 +77,7 @@ class App(tk.Tk):
         self._log_q: queue.Queue = queue.Queue()
         self._busy = False
         self._operation_active = False
+        self.language = load_language()
         self._nodes: dict[str, tuple[str, object]] = {}
         self._mounts: dict[str, MountSession] = {}
         self._drop: DropTarget | None = None
@@ -90,6 +92,21 @@ class App(tk.Tk):
         self.after(200, self._startup)
         self.after(400, self._hook_dnd)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _t(self, key: str, **kwargs) -> str:
+        return tr(self.language, key, **kwargs)
+
+    def _on_language_change(self, _event=None) -> None:
+        language = language_from_label(self.language_var.get())
+        if language == self.language:
+            return
+        self.language = language
+        save_language(language)
+        messagebox.showinfo(
+            self._t("language_changed_title"),
+            self._t("language_changed_message"),
+            parent=self,
+        )
 
     def _style(self) -> None:
         st = ttk.Style()
@@ -122,15 +139,27 @@ class App(tk.Tk):
         top = ttk.Frame(self)
         top.pack(fill="x", padx=16, pady=(14, 4))
         ttk.Label(top, text=f"{__app_name__} {__version__}", style="Head.TLabel").pack(side="left")
-        ttk.Label(top, text="  탐색기 드라이브로 연결", style="Dim.TLabel").pack(side="left")
+        ttk.Label(top, text=self._t("subtitle"), style="Dim.TLabel").pack(side="left")
+        self.language_var = tk.StringVar(value=language_label(self.language))
+        self.language_combo = ttk.Combobox(
+            top,
+            textvariable=self.language_var,
+            values=list(LANGUAGES.values()),
+            width=9,
+            state="readonly",
+        )
+        self.language_combo.pack(side="right", padx=(4, 0))
+        self.language_combo.bind("<<ComboboxSelected>>", self._on_language_change)
+        ttk.Label(top, text=self._t("language")).pack(side="right", padx=(12, 2))
+
         self.write_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(top, text="쓰기 허용", variable=self.write_var, command=self._on_write_toggle).pack(
+        ttk.Checkbutton(top, text=self._t("write_enable"), variable=self.write_var, command=self._on_write_toggle).pack(
             side="right", padx=8
         )
-        self.admin_btn = ttk.Button(top, text="관리자 권한으로 다시 시작", command=self._elevate)
+        self.admin_btn = ttk.Button(top, text=self._t("admin_restart"), command=self._elevate)
         self.admin_badge = tk.Label(
             top,
-            text="관리자 실행 중",
+            text=self._t("admin_running"),
             bg="#40a02b",
             fg="white",
             font=("Segoe UI", 9, "bold"),
@@ -139,41 +168,40 @@ class App(tk.Tk):
         )
         if is_admin():
             self.admin_badge.pack(side="right", padx=6)
-            self.title(f"{__app_name__} {__version__} — 관리자 실행 중")
+            self.title(f"{__app_name__} {__version__} — {self._t('admin_running')}")
             LOG.info("GUI: 관리자 실행 중")
         else:
             self.admin_btn.pack(side="right", padx=4)
-            self.title(f"{__app_name__} {__version__} — 관리자 권한 필요")
+            self.title(f"{__app_name__} {__version__} — {self._t('admin_required')}")
             LOG.info("GUI: 일반 권한으로 실행 중")
 
         ttk.Label(
             self,
-            text="연결한 뒤 탐색기에서 파일을 끌어다 놓으면 복사됩니다. "
-            "이 창으로 끌어다 놓아도 선택한 드라이브로 들어갑니다. 창은 닫지 마세요.",
+            text=self._t("main_hint"),
             style="Dim.TLabel",
             wraplength=780,
         ).pack(fill="x", padx=16, pady=(0, 8))
 
         bar = ttk.Frame(self)
         bar.pack(fill="x", padx=16, pady=4)
-        ttk.Button(bar, text="디스크 다시 검색", command=self.scan_disks).pack(side="left", padx=2)
-        ttk.Button(bar, text="이미지 파일 열기…", command=self.open_image).pack(side="left", padx=2)
-        ttk.Label(bar, text="  드라이브").pack(side="left", padx=(12, 4))
+        ttk.Button(bar, text=self._t("scan"), command=self.scan_disks).pack(side="left", padx=2)
+        ttk.Button(bar, text=self._t("open_image"), command=self.open_image).pack(side="left", padx=2)
+        ttk.Label(bar, text="  " + self._t("drive")).pack(side="left", padx=(12, 4))
         self.drive_var = tk.StringVar()
         self.drive_combo = ttk.Combobox(bar, textvariable=self.drive_var, width=6, state="readonly")
         self.drive_combo.pack(side="left")
         self.drive_combo.bind("<Button-1>", lambda _e: self.refresh_drive_letters())
         self.drive_combo.bind("<FocusIn>", lambda _e: self.refresh_drive_letters())
-        ttk.Button(bar, text="탐색기에서 열기", style="Accent.TButton", command=self.mount_selected).pack(
+        ttk.Button(bar, text=self._t("open_explorer"), style="Accent.TButton", command=self.mount_selected).pack(
             side="left", padx=10
         )
-        ttk.Button(bar, text="연결 해제", command=self.unmount_selected).pack(side="left", padx=2)
-        ttk.Button(bar, text="로그 복사", command=self.copy_logs).pack(side="right", padx=2)
-        ttk.Button(bar, text="WinFsp 설치", command=self.check_winfsp).pack(side="right", padx=2)
-        ttk.Button(bar, text="UsbDk 설치(선택)", command=self.check_usbdk).pack(side="right", padx=2)
+        ttk.Button(bar, text=self._t("disconnect"), command=self.unmount_selected).pack(side="left", padx=2)
+        ttk.Button(bar, text=self._t("copy_log"), command=self.copy_logs).pack(side="right", padx=2)
+        ttk.Button(bar, text=self._t("install_winfsp"), command=self.check_winfsp).pack(side="right", padx=2)
+        ttk.Button(bar, text=self._t("install_usbdk"), command=self.check_usbdk).pack(side="right", padx=2)
 
         self.status = tk.StringVar(
-            value="관리자 실행 중 — 디스크를 검색합니다" if is_admin() else "관리자 권한이 필요합니다. 오른쪽 위 버튼으로 다시 시작하세요."
+            value=self._t("status_admin_scanning") if is_admin() else self._t("status_admin_required")
         )
         tk.Label(
             self,
@@ -188,7 +216,7 @@ class App(tk.Tk):
 
         log_wrap = ttk.Frame(self)
         log_wrap.pack(fill="x", side="bottom", padx=16, pady=(0, 4))
-        ttk.Label(log_wrap, text="로그 (복사해서 붙여넣을 수 있습니다)", style="Dim.TLabel").pack(anchor="w")
+        ttk.Label(log_wrap, text=self._t("log_caption"), style="Dim.TLabel").pack(anchor="w")
         log_box = ttk.Frame(log_wrap)
         log_box.pack(fill="x")
         self.log_text = tk.Text(
@@ -210,7 +238,7 @@ class App(tk.Tk):
 
         tk.Label(
             self,
-            text="파일을 이 창으로 끌어다 놓으면 연결된 EXT4 드라이브로 복사됩니다.",
+            text=self._t("drop_hint"),
             bg="#45475a",
             fg="white",
             font=("Segoe UI", 10),
@@ -221,11 +249,11 @@ class App(tk.Tk):
         mid = ttk.Frame(self)
         mid.pack(fill="both", expand=True, padx=16, pady=8)
         self.tree = ttk.Treeview(mid, columns=cols, show="tree headings", selectmode="browse")
-        self.tree.heading("#0", text="장치 / 볼륨")
-        self.tree.heading("kind", text="종류")
-        self.tree.heading("size", text="용량")
-        self.tree.heading("state", text="상태")
-        self.tree.heading("drive", text="드라이브")
+        self.tree.heading("#0", text=self._t("tree_device"))
+        self.tree.heading("kind", text=self._t("tree_kind"))
+        self.tree.heading("size", text=self._t("tree_size"))
+        self.tree.heading("state", text=self._t("tree_state"))
+        self.tree.heading("drive", text=self._t("tree_drive"))
         self.tree.column("#0", width=340)
         self.tree.column("kind", width=90)
         self.tree.column("size", width=90, anchor="e")
