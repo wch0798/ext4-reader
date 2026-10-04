@@ -75,6 +75,7 @@ class App(tk.Tk):
         self._scan_q: queue.Queue = queue.Queue()
         self._log_q: queue.Queue = queue.Queue()
         self._busy = False
+        self._operation_active = False
         self._nodes: dict[str, tuple[str, object]] = {}
         self._mounts: dict[str, MountSession] = {}
         self._drop: DropTarget | None = None
@@ -642,26 +643,75 @@ class App(tk.Tk):
         return f"{kind}:{path}:{vinfo.offset}"
 
     def _run_with_progress(self, title: str, message: str, func):
-        """Run blocking storage work off the Tk thread while keeping the UI responsive."""
-        dialog = tk.Toplevel(self)
-        dialog.title(title)
-        dialog.transient(self)
-        dialog.resizable(False, False)
-        dialog.configure(bg=BG)
-        dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+        """Run blocking storage work off the Tk thread with an in-window overlay."""
+        if self._operation_active:
+            raise RuntimeError("이미 저장장치 작업을 처리하고 있습니다.")
 
-        frame = ttk.Frame(dialog, padding=16)
-        frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text=message, wraplength=420, justify="left").pack(
-            fill="x", pady=(0, 10)
+        self._operation_active = True
+        overlay = tk.Frame(
+            self,
+            bg=BG3,
+            cursor="watch",
+            highlightthickness=0,
+            bd=0,
         )
+        overlay.place(x=0, y=0, relwidth=1, relheight=1)
+        overlay.lift()
+
+        # This is intentionally a child of the main window rather than a
+        # Toplevel.  It therefore cannot appear on another monitor or behind
+        # the parent window while journal/UsbDk work is running.
+        card = tk.Frame(
+            overlay,
+            bg=BG2,
+            highlightbackground="#45475a",
+            highlightthickness=1,
+            padx=24,
+            pady=20,
+        )
+        card.place(relx=0.5, rely=0.43, anchor="center", relwidth=0.74)
+
+        tk.Label(
+            card,
+            text=title,
+            bg=BG2,
+            fg=ACCENT,
+            font=("Segoe UI", 13, "bold"),
+            anchor="w",
+        ).pack(fill="x", pady=(0, 10))
+        tk.Label(
+            card,
+            text=message,
+            bg=BG2,
+            fg=FG,
+            font=("Segoe UI", 10),
+            justify="left",
+            anchor="w",
+            wraplength=560,
+        ).pack(fill="x", pady=(0, 12))
+
         detail = tk.StringVar(value="장치 응답을 기다리는 중…")
-        ttk.Label(frame, textvariable=detail, style="Dim.TLabel").pack(
-            fill="x", pady=(0, 8)
-        )
-        progress = ttk.Progressbar(frame, mode="indeterminate", length=420)
+        tk.Label(
+            card,
+            textvariable=detail,
+            bg=BG2,
+            fg=FG_DIM,
+            font=("Segoe UI", 9),
+            anchor="w",
+        ).pack(fill="x", pady=(0, 8))
+
+        progress = ttk.Progressbar(card, mode="indeterminate")
         progress.pack(fill="x")
         progress.start(12)
+
+        tk.Label(
+            card,
+            text="작업이 끝날 때까지 장치를 분리하거나 프로그램을 종료하지 마세요.",
+            bg=BG2,
+            fg=FG_DIM,
+            font=("Segoe UI", 9),
+            anchor="w",
+        ).pack(fill="x", pady=(10, 0))
 
         state: dict[str, object] = {}
         finished = threading.Event()
@@ -695,18 +745,23 @@ class App(tk.Tk):
         self.after(100, poll)
 
         try:
-            dialog.grab_set()
+            overlay.grab_set()
+            overlay.focus_set()
             self.wait_variable(done_var)
         finally:
             try:
                 progress.stop()
-                dialog.grab_release()
             except tk.TclError:
                 pass
             try:
-                dialog.destroy()
+                overlay.grab_release()
             except tk.TclError:
                 pass
+            try:
+                overlay.destroy()
+            except tk.TclError:
+                pass
+            self._operation_active = False
 
         if "error" in state:
             raise state["error"]
@@ -992,6 +1047,10 @@ class App(tk.Tk):
             pass
 
     def on_close(self) -> None:
+        if self._operation_active:
+            self.bell()
+            self.set_status("저장장치 작업이 끝날 때까지 프로그램을 종료할 수 없습니다.")
+            return
         self.set_status("드라이브를 해제하는 중…")
         try:
             self.update_idletasks()
