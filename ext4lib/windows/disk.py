@@ -2393,11 +2393,11 @@ class WindowsPhysicalDevice(BlockDevice):
             self._scsi_dirty = False
             return
 
-        results = [
-            self._scsi_sync_cache_once(True),
-            self._scsi_sync_cache_once(False),
-        ]
-        for ok, _sense, label in results:
+        results = []
+        for direct in (True, False):
+            result = self._scsi_sync_cache_once(direct)
+            results.append(result)
+            ok, _sense, label = result
             if ok:
                 self._scsi_sync_cache_supported = True
                 self._scsi_dirty = False
