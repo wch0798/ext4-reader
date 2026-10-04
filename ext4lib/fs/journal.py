@@ -9,6 +9,7 @@ transactions leave the filesystem untouched and the caller can mount read-only.
 from __future__ import annotations
 
 import struct
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -55,6 +56,10 @@ JBD2_CRC32C_CHKSUM = 4
 
 class JournalRecoveryError(RuntimeError):
     """Journal cannot be replayed safely by this implementation."""
+
+
+class JournalWriteError(RuntimeError):
+    """A new JBD2 transaction cannot be written safely."""
 
 
 @dataclass(frozen=True)
@@ -317,11 +322,16 @@ class _JournalLog:
             raise JournalRecoveryError("JBD2 descriptor의 마지막 tag를 찾지 못했습니다.")
         return out
 
+    def data_checksum(self, sequence: int, block: bytes) -> int:
+        if not self.has_csum:
+            return 0
+        crc = crc32c(self.csum_seed, struct.pack(">I", sequence & 0xFFFFFFFF))
+        return crc32c(crc, block)
+
     def verify_data_checksum(self, sequence: int, block: bytes, checksum: int) -> None:
         if not self.has_csum:
             return
-        crc = crc32c(self.csum_seed, struct.pack(">I", sequence & 0xFFFFFFFF))
-        crc = crc32c(crc, block)
+        crc = self.data_checksum(sequence, block)
         if self.has_csum3:
             ok = checksum == crc
             expected = f"0x{checksum:08X}"
@@ -332,6 +342,99 @@ class _JournalLog:
             raise JournalRecoveryError(
                 f"JBD2 data checksum 오류: disk={expected} calc=0x{crc:08X}"
             )
+
+    def build_descriptor(
+        self, sequence: int, target_block: int, block: bytes
+    ) -> tuple[bytes, bytes]:
+        """Build a one-tag descriptor and the exact journal data image.
+
+        Using one descriptor per metadata block is deliberately conservative:
+        it avoids tag packing ambiguity across checksum/64-bit variants while
+        remaining fully valid JBD2. The transaction writer still batches all
+        descriptors under one commit record.
+        """
+        if len(block) != self.fs_block_size:
+            raise JournalWriteError("JBD2 metadata block size가 파일시스템 블록 크기와 다릅니다.")
+
+        stored = bytearray(block)
+        flags = JBD2_FLAG_LAST_TAG
+        if struct.unpack_from(">I", stored, 0)[0] == C.JBD2_MAGIC_NUMBER:
+            struct.pack_into(">I", stored, 0, 0)
+            flags |= JBD2_FLAG_ESCAPE
+
+        checksum = self.data_checksum(sequence, bytes(stored))
+        tag_bytes = self._tag_bytes()
+        tail = 4 if self.has_csum else 0
+        need = 12 + tag_bytes + 16 + tail
+        if need > self.fs_block_size:
+            raise JournalWriteError("JBD2 descriptor에 tag와 UUID를 넣을 공간이 없습니다.")
+
+        desc = bytearray(self.fs_block_size)
+        struct.pack_into(
+            ">III",
+            desc,
+            0,
+            C.JBD2_MAGIC_NUMBER,
+            JBD2_DESCRIPTOR_BLOCK,
+            sequence & 0xFFFFFFFF,
+        )
+        off = 12
+        lo = target_block & 0xFFFFFFFF
+        hi = (target_block >> 32) & 0xFFFFFFFF
+        if self.has_csum3:
+            struct.pack_into(">IIII", desc, off, lo, flags, hi if self.has_64bit else 0, checksum)
+        else:
+            struct.pack_into(">IHH", desc, off, lo, checksum & 0xFFFF, flags & 0xFFFF)
+            if self.has_64bit:
+                struct.pack_into(">I", desc, off + 8, hi)
+            # checksum-v2's on-disk tag length contains two historical
+            # compatibility bytes beyond the fields parsed above. The buffer is
+            # zero-filled, so advancing by _tag_bytes() produces Linux's layout.
+        off += tag_bytes
+        desc[off : off + 16] = self.info.uuid
+
+        if self.has_csum:
+            struct.pack_into(">I", desc, self.fs_block_size - 4, 0)
+            csum = crc32c(self.csum_seed, desc)
+            struct.pack_into(">I", desc, self.fs_block_size - 4, csum)
+        return bytes(desc), bytes(stored)
+
+    def build_commit(self, sequence: int) -> bytes:
+        block = bytearray(self.fs_block_size)
+        struct.pack_into(
+            ">III",
+            block,
+            0,
+            C.JBD2_MAGIC_NUMBER,
+            JBD2_COMMIT_BLOCK,
+            sequence & 0xFFFFFFFF,
+        )
+        now = time.time_ns()
+        struct.pack_into(">Q", block, 0x30, (now // 1_000_000_000) & 0xFFFFFFFFFFFFFFFF)
+        struct.pack_into(">I", block, 0x38, (now % 1_000_000_000) & 0xFFFFFFFF)
+        if self.has_csum:
+            # checksum-v2/v3 leaves h_chksum_type/size zero and stores the
+            # CRC32C in h_chksum[0].
+            struct.pack_into(">I", block, 0x10, 0)
+            csum = crc32c(self.csum_seed, block)
+            struct.pack_into(">I", block, 0x10, csum)
+        return bytes(block)
+
+    def write_dynamic_super(
+        self, *, sequence: int, start: int, head: int | None = None
+    ) -> None:
+        raw = bytearray(self.super_raw)
+        struct.pack_into(">I", raw, 0x18, sequence & 0xFFFFFFFF)
+        struct.pack_into(">I", raw, 0x1C, start & 0xFFFFFFFF)
+        blocktype = struct.unpack_from(">I", raw, 4)[0]
+        if head is not None and blocktype == C.JBD2_SUPERBLOCK_V2:
+            struct.pack_into(">I", raw, 0x58, head & 0xFFFFFFFF)
+        if self.has_csum:
+            struct.pack_into(">I", raw, 0xFC, 0)
+            csum = crc32c(0xFFFFFFFF, raw)
+            struct.pack_into(">I", raw, 0xFC, csum)
+        self.write_superblock(bytes(raw))
+        self.super_raw = raw
 
     def parse_revokes(self, block: bytes) -> set[int]:
         self._verify_descriptor_checksum(block, "JBD2 revoke")
@@ -427,15 +530,138 @@ class _JournalLog:
         # transaction is not durable and must not be replayed.
         return transactions, sequence, cursor
 
-    def mark_clean(self, next_sequence: int) -> None:
-        raw = bytearray(self.super_raw)
-        struct.pack_into(">I", raw, 0x18, next_sequence & 0xFFFFFFFF)
-        struct.pack_into(">I", raw, 0x1C, 0)
-        if self.has_csum:
-            struct.pack_into(">I", raw, 0xFC, 0)
-            csum = crc32c(0xFFFFFFFF, raw)
-            struct.pack_into(">I", raw, 0xFC, csum)
-        self.write_superblock(bytes(raw))
+    def mark_clean(self, next_sequence: int, head: int | None = None) -> None:
+        self.write_dynamic_super(sequence=next_sequence, start=0, head=head)
+
+
+class JournalWriter:
+    """Synchronous metadata-only JBD2 writer.
+
+    The implementation intentionally keeps at most one live transaction.
+    File data is flushed to its home blocks first (ordered mode), metadata is
+    written to the journal and committed, then checkpointed synchronously to
+    home blocks. Before the next transaction the journal tail is advanced only
+    after the previous checkpoint is durable.
+    """
+
+    def __init__(self, vol: "Ext4Volume"):
+        try:
+            self.log = _JournalLog(vol)
+        except JournalRecoveryError as exc:
+            raise JournalWriteError(str(exc)) from exc
+        if self.log.info.start != 0:
+            raise JournalWriteError("미복구 JBD2 transaction이 남아 있어 새 transaction을 시작할 수 없습니다.")
+        self.vol = vol
+        head = self.log.info.first
+        blocktype = struct.unpack_from(">I", self.log.super_raw, 4)[0]
+        if blocktype == C.JBD2_SUPERBLOCK_V2:
+            disk_head = struct.unpack_from(">I", self.log.super_raw, 0x58)[0]
+            if self.log.info.first <= disk_head < self.log.info.maxlen:
+                head = disk_head
+        self.head = head
+        self.sequence = (self.log.info.sequence + 1) & 0xFFFFFFFF
+        self.last_sequence = self.log.info.sequence & 0xFFFFFFFF
+        self.committed = False
+
+    def _next(self, block: int) -> int:
+        return self.log.next_block(block)
+
+    def _write_log_block(self, logical: int, data: bytes) -> None:
+        if len(data) != self.log.fs_block_size:
+            raise JournalWriteError("JBD2 log block 크기가 올바르지 않습니다.")
+        phys = self.log._physical(logical)
+        self.vol.write_bytes(phys * self.log.fs_block_size, data)
+
+    def _declare(self, sequence: int, start: int) -> None:
+        # EXT4 must advertise recovery before a new transaction can become
+        # durable. A crash in this window is safe: recovery will see either the
+        # previous checkpointed transaction or an incomplete new transaction.
+        if not self.vol.sb.needs_recovery:
+            self.vol._set_home_super_flags(recover=True, valid=False, flush=True)
+        self.log.write_dynamic_super(sequence=sequence, start=start)
+        self.vol.dev.flush()
+        self.vol._data_dirty = False
+        # The EXT4 superblock itself is metadata. Keep the journaled copy in
+        # sync with the direct RECOVER flag update without leaking other pending
+        # metadata to its home location.
+        self.vol._refresh_pending_superblock()
+
+    def commit(self) -> int:
+        """Commit pending metadata and checkpoint it to home blocks."""
+        if not self.vol._metadata_overlay:
+            if self.vol._data_dirty:
+                self.vol.dev.flush()
+                self.vol._data_dirty = False
+            return 0
+
+        # ordered mode: file data reaches stable storage before the metadata
+        # transaction that can make those blocks reachable.
+        self.vol.dev.flush()
+        self.vol._data_dirty = False
+
+        sequence = self.sequence
+        start = self.head
+        self._declare(sequence, start)
+        metadata = {
+            block: bytes(data)
+            for block, data in sorted(self.vol._metadata_overlay.items())
+        }
+        needed = len(metadata) * 2 + 1
+        capacity = self.log.info.maxlen - self.log.info.first
+        if needed >= capacity:
+            raise JournalWriteError(
+                f"JBD2 transaction이 저널보다 큽니다: need={needed} capacity={capacity}"
+            )
+        for target in metadata:
+            if target < 0 or target >= self.vol.sb.blocks_count:
+                raise JournalWriteError(f"JBD2 대상 블록이 EXT4 범위를 벗어났습니다: {target}")
+
+        cursor = start
+        for target, home_image in metadata.items():
+            descriptor, journal_image = self.log.build_descriptor(
+                sequence, target, home_image
+            )
+            self._write_log_block(cursor, descriptor)
+            cursor = self._next(cursor)
+            self._write_log_block(cursor, journal_image)
+            cursor = self._next(cursor)
+
+        # Descriptor + metadata copies must be durable before the commit record.
+        self.vol.dev.flush()
+        self.vol._data_dirty = False
+
+        commit_block = self.log.build_commit(sequence)
+        self._write_log_block(cursor, commit_block)
+        cursor = self._next(cursor)
+        self.vol.dev.flush()
+        self.vol._data_dirty = False
+
+        # Only a committed transaction may reach the metadata home locations.
+        self.vol._checkpoint_metadata_blocks(metadata)
+        self.vol.dev.flush()
+        self.vol._data_dirty = False
+        self.vol._metadata_overlay.clear()
+
+        self.head = cursor
+        self.last_sequence = sequence
+        self.sequence = (sequence + 1) & 0xFFFFFFFF
+        self.committed = True
+        LOG.info(
+            "JBD2 write commit 완료 sequence=%s metadata_blocks=%s next_head=%s",
+            sequence,
+            len(metadata),
+            self.head,
+        )
+        return len(metadata)
+
+    def mark_clean(self) -> None:
+        """Mark the journal empty after the final metadata checkpoint."""
+        if not self.committed and not self.vol.sb.needs_recovery:
+            return
+        self.log.mark_clean(self.last_sequence, head=self.head)
+        self.vol.dev.flush()
+        self.vol._data_dirty = False
+        self.committed = False
 
 
 def _tid_geq(x: int, y: int) -> bool:
@@ -464,18 +690,26 @@ def recover_journal(vol: "Ext4Volume") -> ReplayStats:
 
     log = _JournalLog(vol)
     if log.info.start == 0:
+        # Linux JBD2 treats a zero journal tail as "no recovery required".
+        # RECOVER can remain set if power is lost between cleaning the journal
+        # superblock and clearing the EXT4 flag, so clear that flag here.
         if vol.sb.needs_recovery:
-            raise JournalRecoveryError(
-                "EXT4 RECOVER 플래그가 남아 있지만 JBD2 s_start=0입니다. "
-                "s_start만으로 clean 여부를 확정할 수 없어 자동 복구를 중단합니다."
-            )
+            _clear_ext4_recovery_flag(vol)
+            vol.dev.flush()
+            vol.reload_metadata()
         return ReplayStats(0, 0, 0, log.info.sequence)
 
     transactions, next_sequence, _head = log.scan_transactions()
     if not transactions:
-        raise JournalRecoveryError(
-            "완료된 JBD2 transaction을 찾지 못했습니다. 안전을 위해 쓰기를 중단합니다."
-        )
+        # A declared transaction without a commit record is intentionally
+        # discarded by JBD2. No metadata from it has reached home through our
+        # writer, so invalidate the incomplete log and clear RECOVER.
+        log.mark_clean(log.info.sequence, head=_head or log.info.first)
+        _clear_ext4_recovery_flag(vol)
+        vol.dev.flush()
+        vol.reload_metadata()
+        LOG.warning("미완료 JBD2 transaction을 버리고 저널을 clean 상태로 되돌렸습니다.")
+        return ReplayStats(0, 0, 0, log.info.sequence)
 
     # Recovery uses a separate revoke pass. A revoke from a later transaction
     # suppresses replay of the same filesystem block from an earlier transaction.
@@ -505,7 +739,7 @@ def recover_journal(vol: "Ext4Volume") -> ReplayStats:
     # First make replayed metadata durable. If power is lost here, repeating the
     # replay is safe. Only afterwards clear the journal and EXT4 recovery flag.
     vol.dev.flush()
-    log.mark_clean(next_sequence)
+    log.mark_clean(next_sequence, head=_head)
     _clear_ext4_recovery_flag(vol)
     vol.dev.flush()
     vol.reload_metadata()
