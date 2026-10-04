@@ -44,7 +44,7 @@ def ensure_host_exe() -> str:
             "Microsoft Store용 Python이 실행되었습니다.\n"
             "run_as_admin.bat 으로 다시 시작해 주세요."
         )
-    if os.path.normcase(os.path.basename(src)) == "exe":
+    if os.path.normcase(os.path.basename(src)) == "ext4reader.exe":
         return src
     try:
         if (not os.path.isfile(dst)) or (os.path.getmtime(src) > os.path.getmtime(dst)):
@@ -60,7 +60,7 @@ def relaunch_as_host() -> None:
         return
     if os.environ.get("EXT4READER_HOST") == "1":
         return
-    if os.path.normcase(os.path.basename(sys.executable)) == "exe":
+    if os.path.normcase(os.path.basename(sys.executable)) == "ext4reader.exe":
         os.environ["EXT4READER_HOST"] = "1"
         return
     host = ensure_host_exe()
