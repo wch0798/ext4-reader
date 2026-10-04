@@ -737,15 +737,16 @@ class Ext4FuseOps:
         self._ensure_write_healthy()
         try:
             self._wb_flush()
-            if sync and self.vol._write_session_active:
-                self.vol.finish_write_session()
-            else:
-                self.vol.commit_metadata(sync=sync)
+            # fsync/release is a durability boundary for this file, not a whole
+            # filesystem unmount boundary. Commit the current JBD2 transaction
+            # but keep the write session alive. sync_pending()/close() performs
+            # the final journal-empty + EXT4_VALID_FS transition once.
+            self.vol.commit_metadata(sync=sync)
         except Exception as exc:
             self._latch_write_failure(exc, "fsync" if sync else "flush")
             raise
         if sync:
-            LOG.info("파일 데이터/메타데이터 flush + EXT4 clean 성공")
+            LOG.debug("파일 데이터/메타데이터 durable commit 성공")
         return 0
 
     def flush(self, path, fh):
