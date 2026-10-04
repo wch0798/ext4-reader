@@ -150,7 +150,13 @@ def create_file(
     nblocks = (size + bs - 1) // bs
     prefer = (parent.ino - 1) // vol.sb.inodes_per_group
     ino = alloc_inode(vol, prefer)
-    inode = new_inode_raw(vol.sb, ino, C.S_IFREG | 0o644)
+    inode = new_inode_raw(
+        vol.sb,
+        ino,
+        C.S_IFREG | int(getattr(vol, "default_file_mode", C.DEFAULT_LINUX_FILE_MODE)),
+        uid=int(getattr(vol, "default_uid", C.DEFAULT_LINUX_UID)),
+        gid=int(getattr(vol, "default_gid", C.DEFAULT_LINUX_GID)),
+    )
     inode.set_size(size)
     inode.set_links(1)
     if nblocks:
@@ -195,7 +201,13 @@ def mkdir(vol: Ext4Volume, parent: Inode, name: str) -> Inode:
     vol.require_write()
     prefer = (parent.ino - 1) // vol.sb.inodes_per_group
     ino = alloc_inode(vol, prefer)
-    inode = new_inode_raw(vol.sb, ino, C.S_IFDIR | 0o755)
+    inode = new_inode_raw(
+        vol.sb,
+        ino,
+        C.S_IFDIR | int(getattr(vol, "default_dir_mode", C.DEFAULT_LINUX_DIR_MODE)),
+        uid=int(getattr(vol, "default_uid", C.DEFAULT_LINUX_UID)),
+        gid=int(getattr(vol, "default_gid", C.DEFAULT_LINUX_GID)),
+    )
     inode.set_links(2)
     inode.flags |= C.EXT4_EXTENTS_FL
     inode.set_flags(inode.flags)
@@ -525,11 +537,27 @@ def _commit_mapping(vol: Ext4Volume, inode: Inode, mapping: list[int | None]) ->
     inode.set_blocks(sum(1 for b in mapping if b is not None), vol.sb.block_size)
 
 
-def create_empty_file(vol: Ext4Volume, parent: Inode, name: str, mode: int = 0o644) -> Inode:
+def create_empty_file(
+    vol: Ext4Volume,
+    parent: Inode,
+    name: str,
+    mode: int | None = None,
+) -> Inode:
     vol.require_write()
     prefer = (parent.ino - 1) // vol.sb.inodes_per_group
     ino = alloc_inode(vol, prefer)
-    inode = new_inode_raw(vol.sb, ino, C.S_IFREG | (mode & 0o777))
+    file_mode = (
+        int(getattr(vol, "default_file_mode", C.DEFAULT_LINUX_FILE_MODE))
+        if mode is None
+        else int(mode) & 0o777
+    )
+    inode = new_inode_raw(
+        vol.sb,
+        ino,
+        C.S_IFREG | file_mode,
+        uid=int(getattr(vol, "default_uid", C.DEFAULT_LINUX_UID)),
+        gid=int(getattr(vol, "default_gid", C.DEFAULT_LINUX_GID)),
+    )
     inode.set_size(0)
     inode.set_links(1)
     inode.set_blocks(0, vol.sb.block_size)
