@@ -9,6 +9,7 @@ transactions leave the filesystem untouched and the caller can mount read-only.
 from __future__ import annotations
 
 import struct
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -57,6 +58,10 @@ class JournalRecoveryError(RuntimeError):
     """Journal cannot be replayed safely by this implementation."""
 
 
+class JournalWriteError(RuntimeError):
+    """A new JBD2 transaction cannot be written safely."""
+
+
 @dataclass(frozen=True)
 class JournalInfo:
     block_size: int
@@ -92,6 +97,14 @@ class ReplayStats:
     transactions: int
     replayed_blocks: int
     revoked_blocks: int
+    next_sequence: int
+
+
+@dataclass(frozen=True)
+class JournalWriteStats:
+    sequence: int
+    journal_blocks: int
+    checkpointed_blocks: int
     next_sequence: int
 
 
@@ -138,6 +151,11 @@ class _JournalLog:
             raise JournalRecoveryError("JBD2 슈퍼블록 크기가 잘못되었습니다.")
         phys = self._physical(0)
         self.vol.write_bytes(phys * self.fs_block_size, raw)
+
+    def write_block(self, logical: int, data: bytes) -> None:
+        if len(data) != self.fs_block_size:
+            raise JournalWriteError("JBD2 블록은 파일시스템 블록 크기와 같아야 합니다.")
+        self.vol.write_block(self._physical(logical), data)
 
     @staticmethod
     def _parse_superblock(raw: bytes) -> JournalInfo:
@@ -427,16 +445,210 @@ class _JournalLog:
         # transaction is not durable and must not be replayed.
         return transactions, sequence, cursor
 
-    def mark_clean(self, next_sequence: int) -> None:
+    def _write_dynamic_super(self, sequence: int, start: int) -> None:
         raw = bytearray(self.super_raw)
-        struct.pack_into(">I", raw, 0x18, next_sequence & 0xFFFFFFFF)
-        struct.pack_into(">I", raw, 0x1C, 0)
+        struct.pack_into(">I", raw, 0x18, sequence & 0xFFFFFFFF)
+        struct.pack_into(">I", raw, 0x1C, start & 0xFFFFFFFF)
+        if len(raw) >= 0x5C:
+            struct.pack_into(">I", raw, 0x58, (start if start else self.info.first) & 0xFFFFFFFF)
         if self.has_csum:
             struct.pack_into(">I", raw, 0xFC, 0)
             csum = crc32c(0xFFFFFFFF, raw)
             struct.pack_into(">I", raw, 0xFC, csum)
         self.write_superblock(bytes(raw))
+        self.super_raw = raw
 
+    def mark_active(self, sequence: int, start: int) -> None:
+        if not (self.info.first <= start < self.info.maxlen):
+            raise JournalWriteError("JBD2 transaction 시작 블록이 저널 범위를 벗어납니다.")
+        self._write_dynamic_super(sequence, start)
+
+    def mark_clean(self, next_sequence: int) -> None:
+        self._write_dynamic_super(next_sequence, 0)
+
+
+
+def _set_ext4_recovery_flag(vol: "Ext4Volume", enabled: bool) -> None:
+    """Persist EXT4 RECOVER without claiming the mounted filesystem is clean."""
+    raw = bytearray(vol.dev.read(vol.part_offset + 1024, 1024))
+    sb = parse_superblock(raw)
+    if enabled:
+        sb.feature_incompat |= C.EXT4_FEATURE_INCOMPAT_RECOVER
+        sb.state &= ~C.EXT4_VALID_FS
+    else:
+        sb.feature_incompat &= ~C.EXT4_FEATURE_INCOMPAT_RECOVER
+    struct.pack_into("<I", sb.raw, 0x60, sb.feature_incompat)
+    struct.pack_into("<H", sb.raw, 0x3A, sb.state & 0xFFFF)
+    sb.write_checksum()
+    vol.dev.write(vol.part_offset + 1024, bytes(sb.raw[:1024]))
+    vol.sb.feature_incompat = sb.feature_incompat
+    vol.sb.state = sb.state
+    vol.sb.raw[:] = sb.raw
+
+
+def _journal_data_checksum(log: _JournalLog, sequence: int, data: bytes) -> int:
+    crc = crc32c(log.csum_seed, struct.pack(">I", sequence & 0xFFFFFFFF))
+    return crc32c(crc, data)
+
+
+def _descriptor_block(
+    log: _JournalLog,
+    sequence: int,
+    entries: list[tuple[int, bytes, int]],
+) -> bytes:
+    bs = log.fs_block_size
+    tail = 4 if log.has_csum else 0
+    out = bytearray(bs)
+    struct.pack_into(">III", out, 0, C.JBD2_MAGIC_NUMBER, JBD2_DESCRIPTOR_BLOCK, sequence)
+    off = 12
+    for index, (target, stored, extra_flags) in enumerate(entries):
+        flags = extra_flags
+        if index:
+            flags |= JBD2_FLAG_SAME_UUID
+        if index == len(entries) - 1:
+            flags |= JBD2_FLAG_LAST_TAG
+        checksum = _journal_data_checksum(log, sequence, stored) if log.has_csum else 0
+        if log.has_csum3:
+            tag = struct.pack(
+                ">IIII",
+                target & 0xFFFFFFFF,
+                flags & 0xFFFFFFFF,
+                (target >> 32) & 0xFFFFFFFF if log.has_64bit else 0,
+                checksum & 0xFFFFFFFF,
+            )
+        else:
+            tag = struct.pack(
+                ">IHH",
+                target & 0xFFFFFFFF,
+                checksum & 0xFFFF,
+                flags & 0xFFFF,
+            )
+            if log.has_64bit:
+                tag += struct.pack(">I", (target >> 32) & 0xFFFFFFFF)
+        need = len(tag) + (0 if flags & JBD2_FLAG_SAME_UUID else 16)
+        if off + need > bs - tail:
+            raise JournalWriteError("JBD2 descriptor 한 블록에 transaction tag가 모두 들어가지 않습니다.")
+        out[off : off + len(tag)] = tag
+        off += len(tag)
+        if not (flags & JBD2_FLAG_SAME_UUID):
+            out[off : off + 16] = log.info.uuid
+            off += 16
+    if log.has_csum:
+        struct.pack_into(">I", out, bs - 4, 0)
+        struct.pack_into(">I", out, bs - 4, crc32c(log.csum_seed, out))
+    return bytes(out)
+
+
+def _commit_block(log: _JournalLog, sequence: int) -> bytes:
+    out = bytearray(log.fs_block_size)
+    struct.pack_into(">III", out, 0, C.JBD2_MAGIC_NUMBER, JBD2_COMMIT_BLOCK, sequence)
+    now = time.time_ns()
+    struct.pack_into(">Q", out, 0x30, now // 1_000_000_000)
+    struct.pack_into(">I", out, 0x38, now % 1_000_000_000)
+    if log.has_csum:
+        struct.pack_into(">I", out, 0x10, 0)
+        struct.pack_into(">I", out, 0x10, crc32c(log.csum_seed, out))
+    return bytes(out)
+
+
+def commit_journal_transaction(
+    vol: "Ext4Volume",
+    writes: list[tuple[int, bytes]] | tuple[tuple[int, bytes], ...],
+) -> JournalWriteStats:
+    """Commit one JBD2 transaction and checkpoint it to home blocks.
+
+    The first write-side milestone intentionally uses one descriptor block per
+    transaction. Oversized requests fail closed instead of spanning descriptors.
+    """
+    if not writes:
+        raise JournalWriteError("빈 JBD2 transaction은 기록하지 않습니다.")
+    log = _JournalLog(vol)
+    if log.info.start != 0 or vol.sb.needs_recovery:
+        raise JournalWriteError("미복구 JBD2 transaction이 남아 있어 새 transaction을 시작할 수 없습니다.")
+    if log.info.feature_incompat & JBD2_FEATURE_INCOMPAT_FAST_COMMIT:
+        raise JournalWriteError("fast-commit 저널에는 신규 transaction을 기록하지 않습니다.")
+
+    sequence = log.info.sequence & 0xFFFFFFFF
+    normalized: list[tuple[int, bytes, int]] = []
+    journal_phys = {log._physical(i) for i in range(log.info.maxlen)}
+    seen: set[int] = set()
+    originals: list[tuple[int, bytes]] = []
+    for target, block in writes:
+        if target in seen:
+            raise JournalWriteError(f"같은 대상 블록이 transaction에 두 번 포함되었습니다: {target}")
+        seen.add(target)
+        if target < 0 or target >= vol.sb.blocks_count:
+            raise JournalWriteError(f"대상 블록이 EXT4 범위를 벗어납니다: {target}")
+        if target in journal_phys:
+            raise JournalWriteError("내부 journal 자체를 transaction 대상으로 사용할 수 없습니다.")
+        original = bytes(block)
+        if len(original) != log.fs_block_size:
+            raise JournalWriteError("transaction 데이터는 정확히 한 블록이어야 합니다.")
+        stored = original
+        flags = 0
+        if struct.unpack_from(">I", stored, 0)[0] == C.JBD2_MAGIC_NUMBER:
+            escaped = bytearray(stored)
+            struct.pack_into(">I", escaped, 0, 0)
+            stored = bytes(escaped)
+            flags |= JBD2_FLAG_ESCAPE
+        originals.append((target, original))
+        normalized.append((target, stored, flags))
+
+    descriptor = _descriptor_block(log, sequence, normalized)
+    cursor = log.info.first
+    descriptor_pos = cursor
+    used = {descriptor_pos}
+    cursor = log.next_block(cursor)
+    data_positions: list[int] = []
+    for _ in normalized:
+        if cursor in used:
+            raise JournalWriteError("JBD2 journal 공간이 transaction보다 작습니다.")
+        data_positions.append(cursor)
+        used.add(cursor)
+        cursor = log.next_block(cursor)
+    commit_pos = cursor
+    if commit_pos in used:
+        raise JournalWriteError("JBD2 journal에 commit block 공간이 없습니다.")
+
+    # Descriptor and journaled data must be durable before commit publication.
+    log.write_block(descriptor_pos, descriptor)
+    for pos, (_target, stored, _flags) in zip(data_positions, normalized):
+        log.write_block(pos, stored)
+    vol.dev.flush()
+
+    # Publish the active log head and EXT4 recovery requirement.
+    log.mark_active(sequence, descriptor_pos)
+    _set_ext4_recovery_flag(vol, True)
+    vol.dev.flush()
+
+    # A durable commit block makes the transaction replayable.
+    log.write_block(commit_pos, _commit_block(log, sequence))
+    vol.dev.flush()
+
+    # Checkpoint committed blocks to their final filesystem locations.
+    for target, original in originals:
+        vol.write_block(target, original)
+    vol.dev.flush()
+
+    # Retire the transaction only after checkpointing is durable.
+    next_sequence = (sequence + 1) & 0xFFFFFFFF
+    log.mark_clean(next_sequence)
+    _set_ext4_recovery_flag(vol, False)
+    vol.dev.flush()
+    vol._data_dirty = False
+
+    LOG.info(
+        "JBD2 transaction 기록 완료 sequence=%s blocks=%s next_sequence=%s",
+        sequence,
+        len(originals),
+        next_sequence,
+    )
+    return JournalWriteStats(
+        sequence=sequence,
+        journal_blocks=len(originals) + 2,
+        checkpointed_blocks=len(originals),
+        next_sequence=next_sequence,
+    )
 
 def _tid_geq(x: int, y: int) -> bool:
     """JBD2 transaction-id comparison with 32-bit wraparound."""
