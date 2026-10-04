@@ -508,7 +508,7 @@ class App(tk.Tk):
                     "end",
                     text=f"{v.sb.fs_type}  {v.label}",
                     values=(
-                        self._partition_scheme_label(v),
+                        self._volume_kind_label(v),
                         format_bytes(v.sb.blocks_count * v.sb.block_size),
                         state,
                         letter,
@@ -553,7 +553,7 @@ class App(tk.Tk):
                     "end",
                     text=f"{x.sb.fs_type}  {x.label}",
                     values=(
-                        self._partition_scheme_label(x),
+                        self._volume_kind_label(x),
                         format_bytes(x.sb.blocks_count * x.sb.block_size),
                         self._t("readonly") if x.write_blockers else self._t("writable"),
                         "",
@@ -574,14 +574,11 @@ class App(tk.Tk):
     def _vol_key(self, kind: str, path: str, vinfo: VolumeInfo) -> str:
         return f"{kind}:{path}:{vinfo.offset}"
 
-    def _partition_scheme_label(self, vinfo: VolumeInfo) -> str:
-        if vinfo.scheme == "GPT":
-            return self._t("scheme_gpt")
-        if vinfo.scheme == "MBR":
-            return self._t("scheme_mbr")
-        if vinfo.scheme in ("전체", "슈퍼블록") or not vinfo.scheme:
-            return self._t("scheme_whole")
-        return vinfo.scheme
+    def _volume_kind_label(self, vinfo: VolumeInfo) -> str:
+        # The selectable child row represents the filesystem, not the disk's
+        # partition-table format. Keep GPT/MBR in vinfo.scheme for internal
+        # targeting/diagnostics, but present the user-facing item as EXT4.
+        return self._t("ext_partition", fs=vinfo.sb.fs_type)
 
     def _verify_physical_selection(self, disk: DiskInfo, vinfo: VolumeInfo) -> None:
         """Revalidate the selected medium before any lock/dismount/write action."""
