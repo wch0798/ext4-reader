@@ -159,9 +159,9 @@ def dirhash(name: bytes, hash_version: int, seed: bytes) -> int:
 
     buf = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476]
     if seed and any(seed):
-        vals = struct.unpack("<4I", seed[:16].ljust(16, b"\x00"))
-        for i in range(4):
-            buf[i] ^= vals[i]
+        # e2fsprogs ext2fs_dirhash(): a non-zero s_hash_seed REPLACES the
+        # default IV. It is not XORed with it.
+        buf = list(struct.unpack("<4I", seed[:16].ljust(16, b"\x00")))
 
     if hash_version in (C.DX_HASH_TEA, C.DX_HASH_TEA_UNSIGNED):
         msg = name
