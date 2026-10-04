@@ -12,6 +12,7 @@ from ext4lib.fs.journal import (
     JBD2_FLAG_LAST_TAG,
     JBD2_CRC32C_CHKSUM,
     JournalInfo,
+    JournalWriter,
     _JournalLog,
 )
 from ext4lib.fs.volume import Ext4Volume
@@ -65,6 +66,42 @@ class JournalCodecTests(unittest.TestCase):
             (C.JBD2_MAGIC_NUMBER, 2, 9),
         )
         log._verify_commit_checksum(commit)
+
+
+class JournalSequenceTests(unittest.TestCase):
+    def test_clean_journal_persists_next_unused_transaction_sequence(self):
+        class FakeLog:
+            def __init__(self):
+                self.calls = []
+
+            def mark_clean(self, sequence, head=None):
+                self.calls.append((sequence, head))
+
+        class FakeDevice:
+            def __init__(self):
+                self.flushes = 0
+
+            def flush(self):
+                self.flushes += 1
+
+        writer = JournalWriter.__new__(JournalWriter)
+        writer.log = FakeLog()
+        writer.vol = SimpleNamespace(
+            sb=SimpleNamespace(needs_recovery=True),
+            dev=FakeDevice(),
+            _data_dirty=True,
+        )
+        writer.head = 17
+        writer.last_sequence = 41
+        writer.sequence = 42
+        writer.committed = True
+
+        writer.mark_clean()
+
+        self.assertEqual(writer.log.calls, [(42, 17)])
+        self.assertEqual(writer.vol.dev.flushes, 1)
+        self.assertFalse(writer.vol._data_dirty)
+        self.assertFalse(writer.committed)
 
 
 class MemoryDevice:
