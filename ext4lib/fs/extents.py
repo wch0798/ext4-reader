@@ -124,6 +124,112 @@ def walk_indirect(vol, inode: Inode) -> list[Extent]:
     return extents
 
 
+def _collect_indirect_pointer_blocks(vol, inode: Inode) -> list[int]:
+    """Return classic indirect metadata blocks referenced by i_block."""
+    if inode.uses_extents:
+        return []
+    if inode.is_lnk and inode.size <= 60 and inode.blocks == 0:
+        return []
+    if inode.blocks == 0:
+        return []
+
+    bs = vol.sb.block_size
+    ptrs = struct.unpack(
+        "<15I",
+        inode.i_block + b"\x00" * (60 - len(inode.i_block)),
+    )[:15]
+    out: list[int] = []
+    seen: set[int] = set()
+
+    def add_pointer_block(phys: int, depth: int) -> None:
+        if not phys or phys in seen:
+            return
+        if phys < vol.sb.first_data_block or phys >= vol.sb.blocks_count:
+            raise ValueError(
+                f"inode {inode.ino} indirect block이 범위를 벗어났습니다: {phys}"
+            )
+        seen.add(phys)
+        out.append(phys)
+        if depth <= 1:
+            return
+        raw = vol.read_block(phys)
+        count = bs // 4
+        values = struct.unpack("<%dI" % count, raw[: count * 4])
+        for child in values:
+            if child:
+                add_pointer_block(child, depth - 1)
+
+    add_pointer_block(ptrs[12], 1)
+    add_pointer_block(ptrs[13], 2)
+    add_pointer_block(ptrs[14], 3)
+    return out
+
+
+def inode_allocation_blocks(vol, inode: Inode) -> set[int]:
+    """All filesystem blocks owned by one allocated inode.
+
+    Includes file data/unwritten extents, extent-tree or classic indirect
+    metadata blocks, and the external xattr block when present.
+    """
+    blocks: set[int] = set()
+
+    if inode.blocks:
+        if inode.uses_extents or (
+            inode.i_block[:2] == struct.pack("<H", C.EXT4_EXT_MAGIC)
+        ):
+            for ex in file_extents(vol, inode):
+                if ex.length <= 0:
+                    continue
+                if (
+                    ex.physical < vol.sb.first_data_block
+                    or ex.physical + ex.length > vol.sb.blocks_count
+                ):
+                    raise ValueError(
+                        f"inode {inode.ino} extent가 범위를 벗어났습니다: "
+                        f"{ex.physical}+{ex.length}"
+                    )
+                blocks.update(range(ex.physical, ex.physical + ex.length))
+            blocks.update(_collect_index_blocks(vol, inode))
+        elif inode.is_reg or inode.is_dir or inode.is_lnk:
+            for ex in walk_indirect(vol, inode):
+                if ex.length <= 0:
+                    continue
+                if (
+                    ex.physical < vol.sb.first_data_block
+                    or ex.physical + ex.length > vol.sb.blocks_count
+                ):
+                    raise ValueError(
+                        f"inode {inode.ino} indirect data가 범위를 벗어났습니다: "
+                        f"{ex.physical}+{ex.length}"
+                    )
+                blocks.update(range(ex.physical, ex.physical + ex.length))
+            blocks.update(_collect_indirect_pointer_blocks(vol, inode))
+
+    if inode.file_acl:
+        if (
+            inode.file_acl < vol.sb.first_data_block
+            or inode.file_acl >= vol.sb.blocks_count
+        ):
+            raise ValueError(
+                f"inode {inode.ino} external xattr block이 범위를 벗어났습니다: "
+                f"{inode.file_acl}"
+            )
+        blocks.add(inode.file_acl)
+
+    sectors_per_block = max(1, vol.sb.block_size // 512)
+    expected = inode.blocks // sectors_per_block if inode.blocks else 0
+    if inode.blocks and inode.blocks % sectors_per_block == 0:
+        # i_blocks counts data + extent/indirect metadata + external xattr.
+        # Matching it here is a strong guard that reconstruction did not miss
+        # an allocation category before using the result to rebuild a bitmap.
+        if len(blocks) != expected:
+            raise ValueError(
+                f"inode {inode.ino} 할당 블록 수 불일치: "
+                f"i_blocks={expected} reconstructed={len(blocks)}"
+            )
+    return blocks
+
+
 def extent_at(extents: list[Extent], lblk: int) -> Extent | None:
     lo = 0
     hi = len(extents)
