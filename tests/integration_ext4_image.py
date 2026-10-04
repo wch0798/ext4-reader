@@ -15,7 +15,7 @@ from ext4lib.fs import constants as C
 from ext4lib.fs.journal import _JournalLog
 from ext4lib.fs.extents import extent_at, file_extents
 from ext4lib.fs.orphan import _orphan_block_checksum
-from ext4lib.fs.bitmap import bitmap_checksum_valid
+from ext4lib.fs.bitmap import bitmap_checksum_valid, bitmap_free_count
 from ext4lib.fs.crc32c import crc32c
 from ext4lib.fs.superblock import parse_superblock, update_group_desc_fields
 from ext4lib.fs.volume import Ext4Volume, discover_volumes
@@ -293,6 +293,62 @@ def error_repair_roundtrip(path: str) -> None:
         assert read_range(final, node, 0, len(payload)) == payload
     finally:
         final.close()
+
+
+def full_block_bitmap_rebuild_roundtrip(path: str) -> None:
+    """Replace group-0 block bitmap with 0xFF and rebuild it from metadata."""
+    inject = open_volume(path, True)
+    try:
+        gd = inject.groups[0]
+        if gd.flags & C.BG_BLOCK_UNINIT:
+            raise AssertionError("group 0 block bitmap must be initialized")
+        original = inject.read_block(gd.block_bitmap)
+        original_free = gd.free_blocks
+        assert bitmap_checksum_valid(inject, gd, "block", original)
+
+        # Simulate the real device log: descriptor/free-count/checksum fields
+        # still describe the original bitmap, while the bitmap block itself has
+        # become all-used (free count = 0).
+        inject.dev.write(
+            gd.block_bitmap * inject.sb.block_size,
+            b"\xFF" * inject.sb.block_size,
+        )
+
+        raw = bytearray(inject.dev.read(1024, 1024))
+        sb = parse_superblock(raw)
+        sb.state |= C.EXT4_ERROR_FS | C.EXT4_VALID_FS
+        struct.pack_into("<H", sb.raw, 0x3A, sb.state & 0xFFFF)
+        struct.pack_into("<I", sb.raw, 0x194, 1)
+        func = b"ext4_validate_block_bitmap"
+        sb.raw[0x1A8:0x1C8] = b"\x00" * 32
+        sb.raw[0x1A8:0x1A8 + len(func)] = func
+        struct.pack_into("<I", sb.raw, 0x1C8, 423)
+        sb.write_checksum()
+        inject.dev.write(1024, bytes(sb.raw[:1024]))
+        inject.dev.flush()
+        inject.close(abort=True)
+    except Exception:
+        inject.close(abort=True)
+        raise
+
+    repair = open_volume(path, True)
+    try:
+        gd = repair.groups[0]
+        broken = repair.read_block(gd.block_bitmap)
+        assert bitmap_free_count(broken, repair.sb.blocks_per_group) == 0
+        stats = repair.repair_error_state_if_safe()
+        assert stats.repaired
+        assert stats.bitmap_checksums_repaired >= 1
+        assert not (repair.sb.state & C.EXT4_ERROR_FS)
+        gd = repair.groups[0]
+        rebuilt = repair.read_block(gd.block_bitmap)
+        assert gd.free_blocks == original_free
+        assert rebuilt == original
+        assert bitmap_checksum_valid(repair, gd, "block", rebuilt)
+        repair.close()
+    except Exception:
+        repair.close(abort=True)
+        raise
 
 
 def bitmap_high_half_repair_roundtrip(path: str) -> None:
@@ -592,6 +648,7 @@ def main() -> None:
             "orphan-repair",
             "legacy-bitmap-repair",
             "bitmap-high-repair",
+            "bitmap-rebuild",
             "htree",
         ),
         default="clean",
@@ -614,6 +671,8 @@ def main() -> None:
         legacy_bitmap_checksum_repair_roundtrip(args.image)
     elif args.mode == "bitmap-high-repair":
         bitmap_high_half_repair_roundtrip(args.image)
+    elif args.mode == "bitmap-rebuild":
+        full_block_bitmap_rebuild_roundtrip(args.image)
     else:
         htree_roundtrip(args.image)
 
