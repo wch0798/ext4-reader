@@ -29,6 +29,7 @@ from ext4lib.mount.fuse import (
     winfsp_available,
 )
 from ext4lib.io.backend import ImageDevice
+from ext4lib.fs import constants as C
 from ext4lib.fs.volume import Ext4Volume, VolumeInfo, discover_volumes, format_bytes, probe_superblock
 from ext4lib.windows.disk import (
     DiskInfo,
@@ -950,6 +951,30 @@ class App(tk.Tk):
                             self._t("journal_fail_title"),
                             self._t("journal_fail_message", error=exc),
                         )
+
+                if vol.sb.state & C.EXT4_ERROR_FS:
+                    try:
+                        self.set_status(self._t("error_repair_status"))
+                        self.update_idletasks()
+                        repair_stats = self._run_with_progress(
+                            self._t("error_repair_title"),
+                            self._t("error_repair_message"),
+                            vol.repair_error_state_if_safe,
+                            progress_aware=True,
+                        )
+                        if repair_stats.repaired:
+                            LOG.warning(
+                                "Windows EXT4 ERROR_FS 자동 복구 성공 groups=%s bitmaps=%s root_entries=%s historical_errors=%s",
+                                repair_stats.groups_checked,
+                                repair_stats.bitmaps_checked,
+                                repair_stats.root_entries_checked,
+                                repair_stats.error_count,
+                            )
+                            self.set_status(self._t("error_repair_done"))
+                    except Exception as exc:
+                        LOG.error("Windows EXT4 ERROR_FS 자동 복구 중단: %s", exc)
+                        self.set_status(self._t("error_repair_failed", error=exc))
+
                 hard = vol.hard_write_blockers()
                 soft = vol.soft_write_warnings()
                 LOG.info("쓰기 검사 hard=%s soft=%s", hard, soft)
