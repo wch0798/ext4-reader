@@ -12,6 +12,7 @@ class DummyVolume:
         self.fail_sync = fail_sync
         self.sync_calls = []
         self.closed = False
+        self.close_abort = None
         self.finished = False
         self._write_session_active = active
 
@@ -27,8 +28,9 @@ class DummyVolume:
         self.finished = True
         self._write_session_active = False
 
-    def close(self):
+    def close(self, abort=False):
         self.closed = True
+        self.close_abort = bool(abort)
 
 
 class WriteSafetyTests(unittest.TestCase):
@@ -60,6 +62,16 @@ class WriteSafetyTests(unittest.TestCase):
         self.assertFalse(vol._write_session_active)
         self.assertEqual(vol.sync_calls, [])
 
+    def test_file_fsync_commits_but_keeps_write_session_open(self):
+        vol = DummyVolume(active=True)
+        ops = fm.Ext4FuseOps(vol, read_only=False)
+
+        ops._flush_file(True)
+
+        self.assertEqual(vol.sync_calls, [True])
+        self.assertFalse(vol.finished)
+        self.assertTrue(vol._write_session_active)
+
     def test_buffered_write_failure_keeps_buffer_and_latches_error(self):
         vol = DummyVolume()
         ops = fm.Ext4FuseOps(vol, read_only=False)
@@ -80,6 +92,7 @@ class WriteSafetyTests(unittest.TestCase):
         class Ops:
             def __init__(self):
                 self._stop = threading.Event()
+                self._write_failure = None
 
             def sync_pending(self):
                 raise IoError("final flush failed", winerr=31)
