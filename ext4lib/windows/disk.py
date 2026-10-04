@@ -2281,6 +2281,24 @@ class WindowsPhysicalDevice(BlockDevice):
         )
 
     @staticmethod
+    def _parse_scsi_sense(raw: bytes) -> tuple[int, int, int]:
+        """Parse both fixed-format (0x70/0x71) and descriptor (0x72/0x73) sense."""
+        if not raw:
+            return (0, 0, 0)
+        response = raw[0] & 0x7F
+        if response in (0x72, 0x73):
+            return (
+                raw[1] & 0x0F if len(raw) > 1 else 0,
+                raw[2] if len(raw) > 2 else 0,
+                raw[3] if len(raw) > 3 else 0,
+            )
+        return (
+            raw[2] & 0x0F if len(raw) > 2 else 0,
+            raw[12] if len(raw) > 12 else 0,
+            raw[13] if len(raw) > 13 else 0,
+        )
+
+    @staticmethod
     def _scsi_sense_from_error(exc: BaseException) -> tuple[int, int, int] | None:
         sense = getattr(exc, "scsi_sense", None)
         if (
@@ -2360,11 +2378,7 @@ class WindowsPhysicalDevice(BlockDevice):
 
         if ok:
             sense = bytes(packet.raw[sense_off : sense_off + sense_len])
-            parsed = (
-                sense[2] & 0x0F if len(sense) > 2 else 0,
-                sense[12] if len(sense) > 12 else 0,
-                sense[13] if len(sense) > 13 else 0,
-            )
+            parsed = self._parse_scsi_sense(sense)
             detail = (
                 f"{label} status=0x{status:02X} "
                 f"sense=0x{parsed[0]:X}/0x{parsed[1]:02X}/0x{parsed[2]:02X}"
@@ -2487,11 +2501,7 @@ class WindowsPhysicalDevice(BlockDevice):
         result = SCSI_PASS_THROUGH_DIRECT.from_buffer(packet)
         if int(result.ScsiStatus) != SCSI_STATUS_GOOD:
             sense = bytes(packet.raw[sense_off : sense_off + sense_len])
-            parsed = (
-                sense[2] & 0x0F if len(sense) > 2 else 0,
-                sense[12] if len(sense) > 12 else 0,
-                sense[13] if len(sense) > 13 else 0,
-            )
+            parsed = self._parse_scsi_sense(sense)
             exc = IoError(
                 "SCSI WRITE(10) DIRECT 장치 오류 "
                 f"status=0x{int(result.ScsiStatus):02X} "
@@ -2586,11 +2596,7 @@ class WindowsPhysicalDevice(BlockDevice):
         result = SCSI_PASS_THROUGH.from_buffer(packet)
         if int(result.ScsiStatus) != SCSI_STATUS_GOOD:
             sense = bytes(packet.raw[sense_off : sense_off + sense_len])
-            parsed = (
-                sense[2] & 0x0F if len(sense) > 2 else 0,
-                sense[12] if len(sense) > 12 else 0,
-                sense[13] if len(sense) > 13 else 0,
-            )
+            parsed = self._parse_scsi_sense(sense)
             exc = IoError(
                 "SCSI WRITE(10) 장치 오류 "
                 f"status=0x{int(result.ScsiStatus):02X} "
