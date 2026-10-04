@@ -424,11 +424,23 @@ class Ext4FuseOps:
             LOG.warning("Ext4Error %s %s: %s", getattr(fn, "__name__", fn), args, exc)
             raise self._err(errno.EROFS if "쓸 수 없" in str(exc) else errno.EIO) from exc
         except IoError as exc:
+            was_failed = self._write_failure is not None
             self._latch_write_failure(exc, getattr(fn, "__name__", str(fn)))
-            key = (getattr(fn, "__name__", str(fn)), type(exc).__name__, str(exc)[:200])
-            if key not in self._logged:
-                self._logged.add(key)
-                LOG.exception("디스크 I/O 실패 %s %s", getattr(fn, "__name__", fn), _brief_args(args))
+            if was_failed:
+                LOG.debug(
+                    "이전 쓰기 오류로 EIO 반환 %s %s",
+                    getattr(fn, "__name__", fn),
+                    _brief_args(args),
+                )
+            else:
+                key = (getattr(fn, "__name__", str(fn)), type(exc).__name__, str(exc)[:200])
+                if key not in self._logged:
+                    self._logged.add(key)
+                    LOG.exception(
+                        "디스크 I/O 실패 %s %s",
+                        getattr(fn, "__name__", fn),
+                        _brief_args(args),
+                    )
             raise self._err(errno.EIO) from exc
         except OSError as exc:
             from fuse import FuseOSError
@@ -993,15 +1005,29 @@ def unmount(letter: str) -> None:
     sync_error: BaseException | None = None
     close_error: BaseException | None = None
 
-    # Flush before asking WinFsp to stop. Once the mount is torn down we can no
-    # longer honestly report a final write failure back through Explorer.
-    if session and not session.read_only and session.ops is not None:
-        try:
-            session.ops.sync_pending()
-            session.volume.finish_write_session()
-        except Exception as exc:
-            sync_error = exc
-            LOG.exception("언마운트 전 최종 디스크 flush/clean 처리 실패 %s", letter)
+    # Flush before asking WinFsp to stop. If a write error is already latched,
+    # do not execute the same known-failing barrier again just to print another
+    # traceback; preserve the original failure and tear the mount down safely.
+    if session and session.ops is not None:
+        latched = session.ops._write_failure
+        if latched is not None:
+            sync_error = latched
+            LOG.error(
+                "이전 쓰기 오류가 남아 있어 최종 flush 재시도를 생략합니다 %s: %s",
+                letter,
+                latched,
+            )
+        elif not session.read_only:
+            try:
+                session.ops.sync_pending()
+                session.volume.finish_write_session()
+            except Exception as exc:
+                sync_error = exc
+                LOG.error(
+                    "언마운트 전 최종 디스크 flush/clean 처리 실패 %s: %s",
+                    letter,
+                    exc,
+                )
 
     if session:
         session.stop.set()
@@ -1026,10 +1052,10 @@ def unmount(letter: str) -> None:
     _forget(letter)
     if session:
         try:
-            session.volume.close()
+            session.volume.close(abort=sync_error is not None)
         except Exception as exc:
             close_error = exc
-            LOG.exception("언마운트 중 볼륨 close/flush 실패 %s", letter)
+            LOG.error("언마운트 중 볼륨 close 실패 %s: %s", letter, exc)
 
     failure = sync_error or close_error
     if failure is not None:
