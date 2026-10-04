@@ -80,6 +80,7 @@ class UsbDkBotTests(unittest.TestCase):
         dev._redirect = 123
         dev._tag = 10
         dev._closed = False
+        dev._sync_cache_supported = None
         dev.bulk_in = 0x81
         dev.bulk_out = 0x02
         dev.lun = 0
@@ -162,6 +163,50 @@ class UsbDkBotTests(unittest.TestCase):
 
         self.assertIn("장치 준비 시간 초과", str(cm.exception))
         self.assertIn("reader not ready", str(cm.exception))
+
+    def test_flush_ignores_unsupported_synchronize_cache_and_health_checks(self):
+        dev = self.make_backend()
+        calls = []
+
+        def bot(cdb, **kwargs):
+            calls.append(cdb[0])
+            if cdb[0] == 0x35:
+                exc = UsbDkError(
+                    "USB BOT SCSI 명령 실패 opcode=0x35 status=1 residue=0 "
+                    "sense_key=0x05 asc=0x24 ascq=0x00",
+                    winerr=31,
+                )
+                exc.scsi_status = 1
+                exc.sense_key = 0x05
+                exc.asc = 0x24
+                exc.ascq = 0
+                raise exc
+            return b""
+
+        dev._bot = bot
+        dev.flush()
+
+        self.assertFalse(dev._sync_cache_supported)
+        self.assertEqual(calls, [0x35, 0x00])
+
+        # Once capability absence is known, do not resend opcode 0x35.
+        dev.flush()
+        self.assertEqual(calls, [0x35, 0x00, 0x00])
+
+    def test_flush_keeps_unexpected_scsi_errors_fatal(self):
+        dev = self.make_backend()
+
+        def bot(cdb, **kwargs):
+            exc = UsbDkError("medium error", winerr=31)
+            exc.scsi_status = 1
+            exc.sense_key = 0x03
+            exc.asc = 0x11
+            exc.ascq = 0
+            raise exc
+
+        dev._bot = bot
+        with self.assertRaises(UsbDkError):
+            dev.flush()
 
     def test_read10_and_read16_cdb_selection(self):
         dev = self.make_backend()
