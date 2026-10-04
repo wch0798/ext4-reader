@@ -1,5 +1,6 @@
 import struct
 import unittest
+from unittest.mock import patch
 
 from ext4reader.io_backend import IoError
 from ext4reader.usbdk_backend import (
@@ -128,6 +129,39 @@ class UsbDkBotTests(unittest.TestCase):
         with self.assertRaises(UsbDkError) as cm:
             dev.write(4096, b"x" * 512)
         self.assertIn("read-back", str(cm.exception))
+
+    def test_wait_until_ready_retries_transient_bot_errors(self):
+        dev = self.make_backend()
+        attempts = {"count": 0}
+
+        def tur():
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise UsbDkError("reader still re-enumerating", winerr=31)
+
+        dev.test_unit_ready = tur
+        with patch("ext4reader.usbdk_backend.time.sleep") as sleep:
+            dev.wait_until_ready(timeout=1.0)
+
+        self.assertEqual(attempts["count"], 3)
+        self.assertEqual(sleep.call_count, 2)
+        sleep.assert_called_with(0.20)
+
+    def test_wait_until_ready_reports_last_usb_error_on_timeout(self):
+        dev = self.make_backend()
+        dev.test_unit_ready = lambda: (_ for _ in ()).throw(
+            UsbDkError("reader not ready", winerr=31)
+        )
+
+        with patch(
+            "ext4reader.usbdk_backend.time.monotonic",
+            side_effect=[0.0, 2.0],
+        ):
+            with self.assertRaises(UsbDkError) as cm:
+                dev.wait_until_ready(timeout=1.0)
+
+        self.assertIn("장치 준비 시간 초과", str(cm.exception))
+        self.assertIn("reader not ready", str(cm.exception))
 
     def test_read10_and_read16_cdb_selection(self):
         dev = self.make_backend()
