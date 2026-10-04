@@ -120,14 +120,15 @@ class Ext4Volume:
 
     def read_bytes(self, fs_offset: int, length: int) -> bytes:
         data = bytearray(self.dev.read(self.part_offset + fs_offset, length))
-        if not data or not self._metadata_overlay:
+        overlay = getattr(self, "_metadata_overlay", None)
+        if not data or not overlay:
             return bytes(data)
         bs = self.sb.block_size
         first = fs_offset // bs
         last = (fs_offset + len(data) - 1) // bs
         req_end = fs_offset + len(data)
         for phys in range(first, last + 1):
-            pending = self._metadata_overlay.get(phys)
+            pending = overlay.get(phys)
             if pending is None:
                 continue
             block_start = phys * bs
@@ -239,6 +240,8 @@ class Ext4Volume:
         disk_sb.write_checksum()
         self.sb.write_checksum()
         self.dev.write(self.part_offset + 1024, bytes(disk_sb.raw[:1024]))
+        bs = self.sb.block_size
+        self._invalidate_block_cache(1024 // bs, (1024 + 1023) // bs)
         if flush:
             self.dev.flush()
             self._data_dirty = False
@@ -426,7 +429,9 @@ class Ext4Volume:
             self._write_super_state()
         self._write_session_active = False
         self._journal_writer = None
-        self._metadata_overlay.clear()
+        overlay = getattr(self, "_metadata_overlay", None)
+        if overlay is not None:
+            overlay.clear()
         LOG.info("RW 세션 정상 종료: JBD2/EXT4 clean 상태를 복원했습니다.")
 
     def journal_start(self) -> int | None:
