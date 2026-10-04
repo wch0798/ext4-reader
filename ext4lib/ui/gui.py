@@ -822,6 +822,9 @@ class App(tk.Tk):
                 partition_number=vinfo.partition_index,
                 partition_offset=vinfo.offset,
                 partition_size=vinfo.size,
+                expected_size=disk.size,
+                expected_serial=disk.serial,
+                expected_ext_uuid=vinfo.sb.uuid,
             )
             src = disk.path
         elif kind == "imgvol":
