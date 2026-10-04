@@ -11,6 +11,8 @@ import argparse
 import os
 
 from ext4lib.fs import constants as C
+from ext4lib.fs.extents import file_extents
+from ext4lib.fs.journal import commit_journal_transaction
 from ext4lib.fs.volume import Ext4Volume
 from ext4lib.fs.writer import (
     create_empty_file,
@@ -80,6 +82,45 @@ def clean_roundtrip(path: str) -> None:
         check.close()
 
 
+
+def journal_write_roundtrip(path: str) -> None:
+    vol = open_volume(path, True)
+    blockers = vol.hard_write_blockers()
+    if blockers:
+        raise AssertionError("mkfs image is not writable by ext4-reader: " + " | ".join(blockers))
+
+    vol.begin_write_session()
+    root = lookup_path(vol, "/")
+    node = create_empty_file(vol, root, "journal.bin")
+    initial = b"A" * vol.sb.block_size
+    write_range(vol, node, 0, initial, flush=True)
+
+    node = lookup_path(vol, "/journal.bin")
+    exts = file_extents(vol, node)
+    assert exts and exts[0].logical == 0 and exts[0].length >= 1
+    phys = exts[0].physical
+    payload = (b"JBD2-WRITE-TRANSACTION-" * ((vol.sb.block_size // 23) + 1))[: vol.sb.block_size]
+
+    stats = commit_journal_transaction(vol, [(phys, payload)])
+    assert stats.checkpointed_blocks == 1
+    assert stats.next_sequence == ((stats.sequence + 1) & 0xFFFFFFFF)
+    assert read_range(vol, node, 0, len(payload)) == payload
+    assert vol.journal_start() == 0
+    assert not vol.sb.needs_recovery
+
+    vol.finish_write_session()
+    vol.close()
+
+    check = open_volume(path, False)
+    try:
+        node = lookup_path(check, "/journal.bin")
+        assert read_range(check, node, 0, len(payload)) == payload
+        assert check.journal_start() == 0
+        assert not check.sb.needs_recovery
+        assert check.sb.state & C.EXT4_VALID_FS
+    finally:
+        check.close()
+
 def dirty_marker_roundtrip(path: str) -> None:
     vol = open_volume(path, True)
     blockers = vol.hard_write_blockers()
@@ -103,11 +144,13 @@ def dirty_marker_roundtrip(path: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("image")
-    parser.add_argument("--mode", choices=("clean", "dirty-marker"), default="clean")
+    parser.add_argument("--mode", choices=("clean", "dirty-marker", "journal-write"), default="clean")
     args = parser.parse_args()
 
     if args.mode == "clean":
         clean_roundtrip(args.image)
+    elif args.mode == "journal-write":
+        journal_write_roundtrip(args.image)
     else:
         dirty_marker_roundtrip(args.image)
 
