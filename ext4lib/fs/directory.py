@@ -425,7 +425,7 @@ def add_dir_entry(vol, dir_inode: Inode, name: str, ino: int, ftype: int) -> Ino
         phys = logical_to_phys(vol, inode, lblk)
         if phys is None:
             raise DirError("디렉터리 블록을 찾을 수 없습니다.")
-        vol.write_metadata_block(phys, bytes(data))
+        (getattr(vol, "write_metadata_block", None) or vol.write_block)(phys, bytes(data))
 
     if dir_inode.is_indexed:
         lblk, _root, h = _probe_leaf(vol, dir_inode, name_b)
@@ -544,7 +544,7 @@ def add_dir_entry(vol, dir_inode: Inode, name: str, ino: int, ftype: int) -> Ino
     vol.write_inode(dir_inode)
     discard_old_extent_indexes(vol, dir_inode)
     _dir_csum_set(vol, dir_inode, buf)
-    vol.write_metadata_block(new_phys, bytes(buf))
+    (getattr(vol, "write_metadata_block", None) or vol.write_block)(new_phys, bytes(buf))
     return dir_inode
 
 
@@ -579,7 +579,7 @@ def remove_dir_entry(vol, dir_inode: Inode, name: str) -> tuple[Inode, int]:
                 _dir_csum_set(vol, dir_inode, data)
                 phys = logical_to_phys(vol, dir_inode, lblk)
                 if phys is not None:
-                    vol.write_metadata_block(phys, bytes(data))
+                    (getattr(vol, "write_metadata_block", None) or vol.write_block)(phys, bytes(data))
                 return dir_inode, target
             prev = off
             off += rec
@@ -599,4 +599,4 @@ def init_directory_block(vol, inode: Inode, parent_ino: int, phys: int) -> None:
     struct.pack_into("<IHBB", buf, 12, parent_ino, rest, 2, C.EXT4_FT_DIR)
     buf[20:22] = b".."
     _dir_csum_set(vol, inode, buf)
-    vol.write_metadata_block(phys, bytes(buf))
+    (getattr(vol, "write_metadata_block", None) or vol.write_block)(phys, bytes(buf))
