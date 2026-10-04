@@ -147,6 +147,9 @@ jobs:
           truncate -s 256M bitmap-high.img
           mkfs.ext4 -F -q -b 4096 -O 64bit,metadata_csum,^orphan_file,^fast_commit bitmap-high.img
 
+          truncate -s 256M bitmap-rebuild.img
+          mkfs.ext4 -F -q -b 4096 -O 64bit,metadata_csum,^orphan_file,^fast_commit bitmap-rebuild.img
+
           # Modern ext4 layout used by Steam Deck-class Linux systems.
           truncate -s 256M orphan.img
           mkfs.ext4 -F -q -b 4096 -O 64bit,metadata_csum,orphan_file,^fast_commit orphan.img
@@ -182,6 +185,7 @@ jobs:
           python -m tests.integration_ext4_image repair.img --mode error-repair
           python -m tests.integration_ext4_image legacy-bitmap.img --mode legacy-bitmap-repair
           python -m tests.integration_ext4_image bitmap-high.img --mode bitmap-high-repair
+          python -m tests.integration_ext4_image bitmap-rebuild.img --mode bitmap-rebuild
           python -m tests.integration_ext4_image orphan.img --mode orphan-repair
           python -m tests.integration_ext4_image htree.img --mode htree
           python -m tests.integration_ext4_image gpt.img --mode gpt-portable
@@ -197,6 +201,7 @@ jobs:
           # bitmap-checksum placement bug must be clean to Linux/e2fsck.
           sudo e2fsck -fn legacy-bitmap.img
           sudo e2fsck -fn bitmap-high.img
+          sudo e2fsck -fn bitmap-rebuild.img
 
           sudo e2fsck -fn orphan.img
           debugfs -R "stat /orphan-keep.bin" orphan.img
