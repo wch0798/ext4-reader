@@ -233,6 +233,16 @@ def apply_legacy_bitmap_checksum_repair(
     apply_bitmap_csum(vol, gd, which, Bitmap(bytearray(data), nbits))
 
 
+def bitmap_padding_is_set(data: bytes, used_bits: int, total_bits: int) -> bool:
+    """Linux requires bitmap padding bits outside the real group to be set."""
+    if used_bits < 0 or total_bits < used_bits or total_bits > len(data) * 8:
+        return False
+    for bit in range(used_bits, total_bits):
+        if not (data[bit >> 3] & (1 << (bit & 7))):
+            return False
+    return True
+
+
 def bitmap_free_count(data: bytes, nbits: int) -> int:
     if nbits <= 0:
         return 0
