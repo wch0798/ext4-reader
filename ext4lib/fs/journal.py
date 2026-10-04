@@ -570,7 +570,9 @@ def commit_journal_transaction(
 
     sequence = log.info.sequence & 0xFFFFFFFF
     normalized: list[tuple[int, bytes, int]] = []
-    journal_phys = {log._physical(i) for i in range(log.info.maxlen)}
+    def is_journal_block(target: int) -> bool:
+        return any(ex.physical <= target < ex.physical + ex.length for ex in log.extents)
+
     seen: set[int] = set()
     originals: list[tuple[int, bytes]] = []
     for target, block in writes:
@@ -579,7 +581,7 @@ def commit_journal_transaction(
         seen.add(target)
         if target < 0 or target >= vol.sb.blocks_count:
             raise JournalWriteError(f"대상 블록이 EXT4 범위를 벗어납니다: {target}")
-        if target in journal_phys:
+        if is_journal_block(target):
             raise JournalWriteError("내부 journal 자체를 transaction 대상으로 사용할 수 없습니다.")
         original = bytes(block)
         if len(original) != log.fs_block_size:
