@@ -489,7 +489,8 @@ class Ext4Volume:
     def hard_write_blockers(self) -> list[str]:
         reasons = []
         owns_live_journal = bool(
-            self._write_session_active and self._journal_writer is not None
+            getattr(self, "_write_session_active", False)
+            and getattr(self, "_journal_writer", None) is not None
         )
         if not owns_live_journal and self.journal_needs_recovery():
             reasons.append(
