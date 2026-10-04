@@ -538,7 +538,7 @@ class Ext4Volume:
             raise Ext4Error("orphan 복구 진행 상태가 남아 있어 ERROR_FS 검사를 중단합니다.")
         if self.sb.feature_ro_compat & C.EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT:
             raise Ext4Error("ORPHAN_PRESENT 상태가 남아 있어 ERROR_FS 검사를 중단합니다.")
-        if self.sb.last_orphan:
+        if getattr(self.sb, "last_orphan", 0):
             raise Ext4Error("legacy orphan list가 남아 있어 ERROR_FS 검사를 중단합니다.")
         if not superblock_checksum_valid(self.sb):
             raise Ext4Error("EXT4 superblock checksum이 일치하지 않습니다.")
@@ -742,7 +742,7 @@ class Ext4Volume:
             reasons.append("EXT4 슈퍼블록에 파일시스템 오류 상태가 기록되어 있습니다.")
         if self.sb.feature_ro_compat & C.EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT:
             reasons.append("EXT4 orphan file 정리가 필요합니다.")
-        if self.sb.last_orphan:
+        if getattr(self.sb, "last_orphan", 0):
             reasons.append("EXT4 legacy orphan list 정리가 필요합니다.")
         if self.sb.feature_ro_compat & C.EXT4_FEATURE_RO_COMPAT_BIGALLOC:
             reasons.append("bigalloc 파일시스템은 쓰기를 지원하지 않습니다.")
