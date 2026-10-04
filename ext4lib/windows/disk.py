@@ -536,6 +536,8 @@ class _LockedVolume:
     name: str
     partition_number: int
     locked: bool
+    partition_offset: int = 0
+    partition_size: int = 0
     offline: bool = False
     volume_guid: str | None = None
     fve_name: str | None = None
@@ -1077,6 +1079,35 @@ def _query_partition_gpt_attributes(handle) -> tuple[int | None, int]:
     return int.from_bytes(raw[64:72], "little"), 0
 
 
+def _query_partition_extent(handle) -> tuple[int, int, int] | None:
+    """Return (starting_offset, partition_length, partition_number)."""
+    try:
+        raw = _ioctl(handle, IOCTL_DISK_GET_PARTITION_INFO_EX, out_cb=160)
+    except OSError:
+        return None
+    if len(raw) < 32:
+        return None
+    start = int.from_bytes(raw[8:16], "little", signed=False)
+    length = int.from_bytes(raw[16:24], "little", signed=False)
+    number = int.from_bytes(raw[24:28], "little", signed=False)
+    return start, length, number
+
+
+def _partition_extent_matches(
+    item: _LockedVolume,
+    partition_number: int,
+    partition_offset: int,
+    partition_size: int,
+) -> bool:
+    if int(item.partition_number) != int(partition_number):
+        return False
+    if partition_offset and int(item.partition_offset) != int(partition_offset):
+        return False
+    if partition_size and int(item.partition_size) != int(partition_size):
+        return False
+    return True
+
+
 def _log_write_environment(disk_handle=None, partition_handle=None) -> list[str]:
     from ext4lib.debuglog import LOG
 
@@ -1372,12 +1403,20 @@ def _lock_volumes_for_disk(disk_index: int) -> list[_LockedVolume]:
                             LOG.warning("볼륨 분리 실패 %s: %s", vol, exc)
                         offline_ok = _take_volume_offline(handle, vol) if dismount_ok else False
                         _allow_extended_io(handle)
+                        extent = _query_partition_extent(handle)
+                        part_offset = int(extent[0]) if extent is not None else 0
+                        part_size = int(extent[1]) if extent is not None else 0
+                        part_number = (
+                            int(extent[2]) if extent is not None else int(num.PartitionNumber)
+                        )
                         locked.append(
                             _LockedVolume(
                                 handle=int(handle),
                                 name=vol,
-                                partition_number=int(num.PartitionNumber),
+                                partition_number=part_number,
                                 locked=lock_ok,
+                                partition_offset=part_offset,
+                                partition_size=part_size,
                                 offline=offline_ok,
                                 volume_guid=_volume_guid_for_fve(name.value),
                             )
@@ -1433,7 +1472,12 @@ def _open_handle(path: str, writable: bool):
     raise IoError(f"{path} 를 열 수 없습니다. (Win32 {last_err})", winerr=last_err)
 
 
-def _open_hidden_volume_alias(disk_index: int, partition_number: int) -> _LockedVolume | None:
+def _open_hidden_volume_alias(
+    disk_index: int,
+    partition_number: int,
+    partition_offset: int = 0,
+    partition_size: int = 0,
+) -> _LockedVolume | None:
     """Find a matching volume through every DOS alias exposed by Windows.
 
     Some built-in SD/MMC readers expose an EXT4 partition only as
@@ -1468,9 +1512,16 @@ def _open_hidden_volume_alias(disk_index: int, partition_number: int) -> _Locked
                 out_cb=ctypes.sizeof(STORAGE_DEVICE_NUMBER),
             )
             num = STORAGE_DEVICE_NUMBER.from_buffer_copy(raw)
+            extent = _query_partition_extent(handle)
+            extent_ok = (
+                extent is not None
+                and (not partition_offset or int(extent[0]) == int(partition_offset))
+                and (not partition_size or int(extent[1]) == int(partition_size))
+            )
             matched = (
                 int(num.DeviceNumber) == int(disk_index)
                 and int(num.PartitionNumber) == int(partition_number)
+                and extent_ok
             )
         except OSError:
             matched = False
@@ -1501,6 +1552,21 @@ def _open_hidden_volume_alias(disk_index: int, partition_number: int) -> _Locked
 
         keep = False
         try:
+            extent = _query_partition_extent(handle)
+            if (
+                extent is None
+                or (partition_offset and int(extent[0]) != int(partition_offset))
+                or (partition_size and int(extent[1]) != int(partition_size))
+            ):
+                LOG.warning(
+                    "파티션 DASD 범위 불일치 %s expected_offset=%s expected_size=%s actual=%s",
+                    path,
+                    partition_offset,
+                    partition_size,
+                    extent,
+                )
+                kernel32.CloseHandle(handle)
+                continue
             writable_ok, writable_err = _is_writable_ioctl(handle)
             LOG.info(
                 "볼륨 별칭 발견 %s target=%s -> PhysicalDrive%s part=%s "
@@ -1532,11 +1598,14 @@ def _open_hidden_volume_alias(disk_index: int, partition_number: int) -> _Locked
             offline_ok = _take_volume_offline(handle, path) if dismount_ok else False
             _allow_extended_io(handle)
             keep = True
+            extent = _query_partition_extent(handle)
             return _LockedVolume(
                 handle=int(handle),
                 name=path,
                 partition_number=int(partition_number),
                 locked=lock_ok,
+                partition_offset=int(extent[0]) if extent is not None else 0,
+                partition_size=int(extent[1]) if extent is not None else 0,
                 offline=offline_ok,
                 volume_guid=volume_guid,
                 fve_name=fve_name,
@@ -1551,7 +1620,12 @@ def _open_hidden_volume_alias(disk_index: int, partition_number: int) -> _Locked
                     _fve_raw_access(fve_name, False)
     return None
 
-def _open_partition_device(disk_index: int, partition_number: int) -> _LockedVolume | None:
+def _open_partition_device(
+    disk_index: int,
+    partition_number: int,
+    partition_offset: int = 0,
+    partition_size: int = 0,
+) -> _LockedVolume | None:
     """Open a partition DASD handle when Mount Manager exposes no Volume GUID."""
     from ext4lib.debuglog import LOG
 
@@ -1618,6 +1692,8 @@ def _open_partition_device(disk_index: int, partition_number: int) -> _LockedVol
                 name=path,
                 partition_number=int(partition_number),
                 locked=lock_ok,
+                partition_offset=int(extent[0]),
+                partition_size=int(extent[1]),
                 offline=False,
                 volume_guid=None,
                 fve_raw=False,
@@ -1821,7 +1897,12 @@ class WindowsPhysicalDevice(BlockDevice):
                         (
                             item
                             for item in self._volume_locks
-                            if item.partition_number == int(partition_number)
+                            if _partition_extent_matches(
+                                item,
+                                int(partition_number),
+                                self._partition_offset,
+                                self._partition_size,
+                            )
                         ),
                         None,
                     )
@@ -1839,7 +1920,12 @@ class WindowsPhysicalDevice(BlockDevice):
                             idx,
                             partition_number,
                         )
-                        hidden = _open_hidden_volume_alias(idx, int(partition_number))
+                        hidden = _open_hidden_volume_alias(
+                            idx,
+                            int(partition_number),
+                            self._partition_offset,
+                            self._partition_size,
+                        )
                         if hidden is not None:
                             self._volume_locks.append(hidden)
                             self._partition_volume = hidden
@@ -1854,7 +1940,12 @@ class WindowsPhysicalDevice(BlockDevice):
                             LOG.warning(
                                 "Volume GUID/HarddiskVolume 별칭도 없어 파티션 DASD를 직접 엽니다."
                             )
-                            direct = _open_partition_device(idx, int(partition_number))
+                            direct = _open_partition_device(
+                                idx,
+                                int(partition_number),
+                                self._partition_offset,
+                                self._partition_size,
+                            )
                             if direct is not None:
                                 self._volume_locks.append(direct)
                                 self._partition_volume = direct
@@ -1973,17 +2064,32 @@ class WindowsPhysicalDevice(BlockDevice):
                         (
                             item
                             for item in self._volume_locks
-                            if item.partition_number == int(self._partition_number)
+                            if _partition_extent_matches(
+                                item,
+                                int(self._partition_number),
+                                self._partition_offset,
+                                self._partition_size,
+                            )
                         ),
                         None,
                     )
                     if self._partition_volume is None:
-                        hidden = _open_hidden_volume_alias(idx, int(self._partition_number))
+                        hidden = _open_hidden_volume_alias(
+                            idx,
+                            int(self._partition_number),
+                            self._partition_offset,
+                            self._partition_size,
+                        )
                         if hidden is not None:
                             self._volume_locks.append(hidden)
                             self._partition_volume = hidden
                     if self._partition_volume is None:
-                        direct = _open_partition_device(idx, int(self._partition_number))
+                        direct = _open_partition_device(
+                            idx,
+                            int(self._partition_number),
+                            self._partition_offset,
+                            self._partition_size,
+                        )
                         if direct is not None:
                             self._volume_locks.append(direct)
                             self._partition_volume = direct
