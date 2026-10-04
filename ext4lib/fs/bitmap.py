@@ -151,6 +151,36 @@ def apply_bitmap_csum(vol, gd: GroupDesc, which: str, bitmap: Bitmap) -> None:
     update_group_desc_fields(vol.sb, gd)
 
 
+
+
+def bitmap_checksum_valid(vol, gd: GroupDesc, which: str, data: bytes) -> bool:
+    if not vol.sb.has_metadata_csum:
+        return True
+    if which == "block":
+        csum_len = vol.sb.blocks_per_group // 8
+        low_off, high_off = 0x18, 0x38
+    elif which == "inode":
+        csum_len = vol.sb.inodes_per_group // 8
+        low_off, high_off = 0x1A, 0x3A
+    else:
+        raise ValueError("which must be block or inode")
+    crc = crc32c(vol.sb.csum_seed(), data[:csum_len])
+    stored = int.from_bytes(gd.raw[low_off:low_off + 2], "little")
+    if vol.sb.desc_size >= 64:
+        stored |= int.from_bytes(gd.raw[high_off:high_off + 2], "little") << 16
+        return stored == crc
+    return stored == (crc & 0xFFFF)
+
+
+def bitmap_free_count(data: bytes, nbits: int) -> int:
+    if nbits <= 0:
+        return 0
+    full, rem = divmod(nbits, 8)
+    used = sum(int(b).bit_count() for b in data[:full])
+    if rem:
+        used += (data[full] & ((1 << rem) - 1)).bit_count()
+    return nbits - used
+
 def _init_block_bitmap(vol, gd: GroupDesc) -> Bitmap:
     start, end = group_block_range(vol, gd.group)
     nbits = end - start
