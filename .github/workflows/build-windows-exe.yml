@@ -177,6 +177,16 @@ jobs:
           mkfs.ext4 -F -q -b 4096 -O 64bit,metadata_csum,^orphan_file,^fast_commit gpt-part-seed.img
           dd if=gpt-part-seed.img of=gpt.img bs=512 seek=2048 conv=notrunc status=none
 
+          # Same EXT4 payload at 1 MiB but with NO MBR/GPT at all. This
+          # reproduces readers/PCs that expose the card as a 953 GB raw disk.
+          truncate -s 320M raw-scan.img
+          dd if=gpt-part-seed.img of=raw-scan.img bs=512 seek=2048 conv=notrunc status=none
+
+          # Corrupt only the primary GPT header; backup GPT must still locate
+          # the EXT4 partition.
+          cp gpt.img backup-gpt.img
+          dd if=/dev/zero of=backup-gpt.img bs=512 seek=1 count=1 conv=notrunc status=none
+
       - name: Exercise EXT4 writer
         run: |
           python -m tests.integration_ext4_image clean.img --mode clean
@@ -189,6 +199,8 @@ jobs:
           python -m tests.integration_ext4_image orphan.img --mode orphan-repair
           python -m tests.integration_ext4_image htree.img --mode htree
           python -m tests.integration_ext4_image gpt.img --mode gpt-portable
+          python -m tests.integration_ext4_image raw-scan.img --mode raw-scan
+          python -m tests.integration_ext4_image backup-gpt.img --mode backup-gpt
 
       - name: Validate clean images with e2fsck
         run: |
@@ -218,6 +230,16 @@ jobs:
           sudo e2fsck -fn gpt-part-after.img
           dumpe2fs -h gpt-part-after.img >/dev/null
           debugfs -R "stat /portable.bin" gpt-part-after.img
+
+          # Verify raw-scan writes landed only inside the 1 MiB-offset EXT4.
+          dd if=raw-scan.img of=raw-scan-part.img bs=512 skip=2048 count=524288 status=none
+          sudo e2fsck -fn raw-scan-part.img
+          debugfs -R "stat /raw-discovered.bin" raw-scan-part.img
+
+          # The primary GPT is intentionally missing. Extract the partition at
+          # the backup-GPT-discovered location and validate its filesystem.
+          dd if=backup-gpt.img of=backup-gpt-part.img bs=512 skip=2048 count=524288 status=none
+          sudo e2fsck -fn backup-gpt-part.img
 
       - name: Validate crash-marked image with e2fsck
         run: |
