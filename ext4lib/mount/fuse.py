@@ -382,6 +382,11 @@ class Ext4FuseOps:
             self._ensure_write_healthy()
             try:
                 self._wb_flush()
+                root = lookup_path(self.vol, "/")
+                linux_trash = [e.name for e in list(list_dir(self.vol, root)) if e.name.startswith(".Trash-") and e.name[7:].isdigit()]
+                for trash_name in linux_trash:
+                    LOG.warning("Linux trash cleanup on Windows mount: /%s", trash_name)
+                    self._purge_trash_tree("/" + trash_name)
                 if getattr(self.vol, "_write_session_active", False):
                     self.vol.finish_write_session()
                 else:
