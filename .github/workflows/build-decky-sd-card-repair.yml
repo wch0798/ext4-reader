@@ -1,0 +1,42 @@
+name: Build Decky SD Card Repair
+on:
+  workflow_dispatch:
+  push:
+    branches: [decky-sd-card-repair-v1.0.1]
+  pull_request:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install
+        working-directory: decky-sd-card-repair
+        run: pnpm install --no-frozen-lockfile
+      - name: Build frontend
+        working-directory: decky-sd-card-repair
+        run: pnpm run build
+      - name: Verify
+        run: |
+          test -s decky-sd-card-repair/dist/index.js
+          ! grep -Eq '^[[:space:]]*import[[:space:]]' decky-sd-card-repair/dist/index.js
+          python -m py_compile decky-sd-card-repair/main.py
+          grep -q '"_root"' decky-sd-card-repair/plugin.json
+      - name: Package
+        run: |
+          mkdir -p package/SDCardRepair/dist
+          cp decky-sd-card-repair/dist/index.js package/SDCardRepair/dist/
+          cp decky-sd-card-repair/main.py decky-sd-card-repair/plugin.json decky-sd-card-repair/package.json decky-sd-card-repair/LICENSE decky-sd-card-repair/README.md package/SDCardRepair/
+          cd package
+          zip -r ../SDCardRepair-v1.0.1.zip SDCardRepair
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SDCardRepair-v1.0.1
+          path: SDCardRepair-v1.0.1.zip
+          if-no-files-found: error
