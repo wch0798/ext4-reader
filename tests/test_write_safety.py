@@ -121,6 +121,31 @@ class WriteSafetyTests(unittest.TestCase):
         self.assertNotIn("E:", fm._SESSIONS)
 
 
+
+
+    def test_rename_to_windows_recycle_bin_permanently_unlinks_source(self):
+        vol = DummyVolume()
+        ops = fm.Ext4FuseOps(vol, read_only=False)
+        parent = SimpleNamespace(ino=2)
+        with (
+            patch("ext4lib.mount.fuse.lookup_parent", return_value=(parent, "Game")),
+            patch("ext4lib.mount.fuse.unlink_checked") as unlink,
+            patch("ext4lib.mount.fuse.move_entry") as move,
+        ):
+            ops._rename("/Game", "/$RECYCLE.BIN/S-1-5-21/$R123")
+
+        unlink.assert_called_once_with(vol, parent, "Game")
+        move.assert_not_called()
+
+    def test_linux_trash_is_not_auto_deleted_by_sync(self):
+        vol = DummyVolume(active=False)
+        ops = fm.Ext4FuseOps(vol, read_only=False)
+        with patch.object(ops, "_purge_trash_tree") as purge:
+            ops.sync_pending()
+        purge.assert_not_called()
+        self.assertEqual(vol.sync_calls, [True])
+
+
 class WriteSessionStateTests(unittest.TestCase):
     def _make_volume(self):
         class Device:

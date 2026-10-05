@@ -392,6 +392,32 @@ class Ext4Volume:
             from ext4lib.fs.bitmap import apply_pending_block_frees
 
             apply_pending_block_frees(self)
+
+        # The block bitmap is the allocation source of truth. Reconcile every
+        # dirty group's descriptor count before serializing either structure.
+        # This prevents a torn/duplicated allocation update from advertising
+        # more free blocks than the bitmap actually contains (the Steam Deck
+        # failure was exactly +8192 blocks in one group).
+        if self._dirty_block_bm:
+            from ext4lib.fs.bitmap import bitmap_free_count, group_block_range
+
+            for g in sorted(self._dirty_block_bm):
+                bm = self._block_bm_cache.get(g)
+                if bm is None:
+                    continue
+                start, end = group_block_range(self, g)
+                actual = bitmap_free_count(bm.data, max(0, end - start))
+                gd = self.groups[g]
+                if gd.free_blocks != actual:
+                    delta = actual - gd.free_blocks
+                    LOG.warning(
+                        "block group free count 자동 보정 group=%s stored=%s bitmap=%s delta=%+d",
+                        g, gd.free_blocks, actual, delta,
+                    )
+                    gd.free_blocks = actual
+                    self.sb.free_blocks_count += delta
+                    self.dirty_groups.add(g)
+                    self.dirty_super = True
         self._store_dirty_bitmaps()
         if self.dirty_groups:
             gdt_block = self.sb.first_data_block + 1

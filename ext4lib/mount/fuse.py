@@ -706,12 +706,52 @@ class Ext4FuseOps:
         parent, name = lookup_parent(self.vol, path)
         unlink_checked(self.vol, parent, name)
 
+    def _purge_trash_tree(self, path: str) -> None:
+        """Permanently remove a freedesktop trash tree when Windows deletes it."""
+        try:
+            node = lookup_path(self.vol, path)
+        except FileNotFoundError:
+            return
+        if not node.is_dir:
+            parent, name = lookup_parent(self.vol, path)
+            unlink_checked(self.vol, parent, name)
+            return
+        for ent in list(list_dir(self.vol, node)):
+            if ent.name in (".", ".."):
+                continue
+            child = path.rstrip("/") + "/" + ent.name
+            self._purge_trash_tree(child)
+            node = self.vol.read_inode(node.ino)
+        if path != "/":
+            parent, name = lookup_parent(self.vol, path)
+            unlink_checked(self.vol, parent, name)
+
+    def _maybe_empty_linux_trash(self, path: str) -> None:
+        # Linux/Steam Deck freedesktop trash lives at .Trash-<uid>. When
+        # Explorer deletes that trash directory, do not translate the request
+        # into another recycle/rename cycle: permanently unlink its files and
+        # matching .trashinfo metadata so space is actually returned.
+        norm = path.rstrip("/")
+        leaf = norm.rsplit("/", 1)[-1]
+        if not (leaf.startswith(".Trash-") and leaf[7:].isdigit()):
+            return
+        self._purge_trash_tree(norm)
+        self.vol.commit_metadata(sync=True)
+
     def rename(self, old, new):
         self._ro()
         return self._wrap(self._rename, self._fuse_path(old), self._fuse_path(new))
 
     def _rename(self, old, new):
         self._drop_paths()
+        # Windows policy: do not retain files in Windows Recycle Bin on EXT4.
+        # Explorer normally implements delete as a rename into $RECYCLE.BIN;
+        # convert that operation into a permanent unlink of the source instead.
+        # Linux freedesktop .Trash-<uid> is deliberately left untouched.
+        if "$RECYCLE.BIN" in new.upper():
+            parent, name = lookup_parent(self.vol, old)
+            unlink_checked(self.vol, parent, name)
+            return
         move_entry(self.vol, old, new, True)
 
     def read(self, path, size, offset, fh):

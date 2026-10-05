@@ -278,6 +278,15 @@ def unlink(vol: Ext4Volume, parent: Inode, name: str) -> None:
     parent.set_times()
     vol.write_inode(parent)
 
+    # Make the namespace removal durable before the inode can become free.
+    # If power/media removal happens between these two commits, the safe
+    # failure mode is an unreachable allocated inode (recoverable by fsck),
+    # never a directory entry that points at a freed/reused inode.
+    vol.flush_metadata()
+    parent = vol.read_inode(parent.ino)
+    if any(e.name == name for e in list_dir(vol, parent)):
+        raise Ext4Error(f"디렉터리 항목 삭제가 디스크에 반영되지 않았습니다: {name}")
+
     release_inode_blocks(vol, child)
     # zero inode
     child.raw[:] = b"\x00" * len(child.raw)
@@ -616,21 +625,14 @@ def write_range(vol: Ext4Volume, inode: Inode, offset: int, data: bytes, flush: 
             need = hole_last - lblk + 1
             if need <= 0:
                 raise Ext4Error("할당할 블록이 없습니다.")
-            extra = 0
-            if next_l is None and need < _PREALLOC_BLOCKS:
-                extra = _PREALLOC_BLOCKS - need
-            try:
-                phys_list = alloc_blocks(vol, need + extra, prefer)
-            except AllocError:
-                if not extra:
-                    raise
-                phys_list = alloc_blocks(vol, need, prefer)
-                extra = 0
-            if extra and len(phys_list) > need:
-                extents = _add_runs(extents, lblk, phys_list[:need])
-                extents = _add_runs(extents, lblk + need, phys_list[need:], uninit=True)
-            else:
-                extents = _add_runs(extents, lblk, phys_list)
+            # Allocate only blocks that this write actually reaches. The old
+            # 8192-block (32 MiB at 4 KiB) speculative preallocation left an
+            # entire unwritten extent behind when Explorer deleted/interrupted
+            # a copy; on the Steam Deck this showed up as an exact 8192-block
+            # bitmap/free-count mismatch. Correctness is more important than
+            # reducing extent count on removable media.
+            phys_list = alloc_blocks(vol, need, prefer)
+            extents = _add_runs(extents, lblk, phys_list)
             changed = True
             continue
         extent_end = (ex.logical + ex.length) * bs

@@ -143,7 +143,7 @@ class Superblock:
         struct.pack_into("<I", self.raw, 0x0C, self.free_blocks_count & 0xFFFFFFFF)
         struct.pack_into("<I", self.raw, 0x10, self.free_inodes_count & 0xFFFFFFFF)
         if self.has_64bit:
-            struct.pack_into("<I", self.raw, 0x150, self.free_blocks_count >> 32)
+            struct.pack_into("<I", self.raw, 0x154, self.free_blocks_count >> 32)
         import time as _t
         self.wtime = int(_t.time())
         struct.pack_into("<I", self.raw, 0x30, self.wtime)
