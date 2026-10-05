@@ -382,22 +382,6 @@ class Ext4FuseOps:
             self._ensure_write_healthy()
             try:
                 self._wb_flush()
-                # Windows policy: Linux freedesktop trash is not retained on an
-                # Ext4Reader writable mount. Recovery, when desired, is a Linux
-                # concern; Windows should reclaim the blocks automatically.
-                # Purge every root .Trash-<uid> tree at the durability boundary
-                # so stale trash cannot silently consume tens of GiB.
-                try:
-                    root = lookup_path(self.vol, "/")
-                    trash_names = [
-                        ent.name for ent in list(list_dir(self.vol, root))
-                        if ent.name.startswith(".Trash-") and ent.name[7:].isdigit()
-                    ]
-                    for name in trash_names:
-                        LOG.warning("Linux 휴지통 자동 삭제: /%s", name)
-                        self._purge_trash_tree("/" + name)
-                except FileNotFoundError:
-                    pass
                 if getattr(self.vol, "_write_session_active", False):
                     self.vol.finish_write_session()
                 else:
@@ -760,13 +744,13 @@ class Ext4FuseOps:
 
     def _rename(self, old, new):
         self._drop_paths()
-        # A Windows shell delete may arrive as a rename into $RECYCLE.BIN.
-        # Preserve normal Windows semantics, but if the source itself is a
-        # Linux freedesktop trash directory, empty it instead of nesting one
-        # trash system inside the other.
-        leaf = old.rstrip("/").rsplit("/", 1)[-1]
-        if leaf.startswith(".Trash-") and leaf[7:].isdigit() and "$RECYCLE.BIN" in new.upper():
-            self._maybe_empty_linux_trash(old)
+        # Windows policy: do not retain files in Windows Recycle Bin on EXT4.
+        # Explorer normally implements delete as a rename into $RECYCLE.BIN;
+        # convert that operation into a permanent unlink of the source instead.
+        # Linux freedesktop .Trash-<uid> is deliberately left untouched.
+        if "$RECYCLE.BIN" in new.upper():
+            parent, name = lookup_parent(self.vol, old)
+            unlink_checked(self.vol, parent, name)
             return
         move_entry(self.vol, old, new, True)
 
