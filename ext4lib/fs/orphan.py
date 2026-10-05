@@ -198,8 +198,19 @@ def _truncate_orphan(vol, inode: Inode) -> None:
 
     if frees:
         free_phys_runs(vol, frees)
+
+    # i_blocks is not just file-data extents.  Linux/e2fsck counts every
+    # filesystem block owned by the inode, including extent-tree metadata and
+    # an external xattr (i_file_acl) block.  Set the data+xattr baseline before
+    # rebuilding the tree; build_extent_tree() then adds any newly allocated
+    # extent-index blocks.  Omitting i_file_acl leaves i_blocks short by one
+    # 4 KiB block (8 sectors), which is exactly what e2fsck reports on Steam
+    # Deck volumes after orphan truncation.
+    owned_blocks = sum(ex.length for ex in keep)
+    if inode.file_acl:
+        owned_blocks += 1
+    inode.set_blocks(owned_blocks, bs)
     inode.set_i_block(build_extent_tree(vol, inode, keep))
-    inode.set_blocks(sum(ex.length for ex in keep), bs)
     inode.dtime = 0
     struct.pack_into("<I", inode.raw, 0x14, 0)
     vol.write_inode(inode)
