@@ -266,5 +266,47 @@ class MetadataOverlayTests(unittest.TestCase):
         self.assertEqual(gd.raw[0x34:0x38], b"EXCL")
         self.assertNotEqual(gd.raw[0x38:0x3A], b"\x00\x00")
 
+
+class FreeCountReconcileTests(unittest.TestCase):
+    def test_commit_reconciles_group_and_super_free_counts_from_bitmap(self):
+        from ext4lib.fs.bitmap import Bitmap
+        from ext4lib.fs.superblock import GroupDesc
+
+        vol = Ext4Volume.__new__(Ext4Volume)
+        gd = GroupDesc(
+            group=0, block_bitmap=1, inode_bitmap=2, inode_table=3,
+            free_blocks=16, free_inodes=0, used_dirs=0, flags=0,
+            itable_unused=0, raw=bytearray(32),
+        )
+        # 8 real blocks; bits 0..3 allocated and 4..7 free => 4 free.
+        bm = Bitmap(bytearray([0x0F]), 8)
+        sb = SimpleNamespace(
+            block_size=1024, blocks_count=8, first_data_block=0,
+            blocks_per_group=8, desc_size=32, free_blocks_count=16,
+            free_inodes_count=0, has_64bit=False, has_metadata_csum=False,
+            has_gdt_csum=False,
+            update_counts=lambda: None, write_checksum=lambda: None,
+            raw=bytearray(1024),
+        )
+        vol.sb = sb
+        vol.groups = [gd]
+        vol._block_bm_cache = {0: bm}
+        vol._inode_bm_cache = {}
+        vol._dirty_block_bm = {0}
+        vol._dirty_inode_bm = set()
+        vol.dirty_groups = {0}
+        vol.dirty_super = True
+        vol._journal_writer = None
+        vol._pending_block_frees = []
+        vol._metadata_overlay = {}
+        vol._data_dirty = False
+        vol.write_metadata_block = lambda *args: None
+        vol.write_metadata_bytes = lambda *args: None
+
+        vol.commit_metadata(sync=False)
+
+        self.assertEqual(gd.free_blocks, 4)
+        self.assertEqual(vol.sb.free_blocks_count, 4)
+
 if __name__ == "__main__":
     unittest.main()
