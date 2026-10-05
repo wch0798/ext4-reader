@@ -1,0 +1,1 @@
+{"name":"SD Card Repair","author":"wch0798","flags":["_root"],"api_version":1,"publish":{"tags":["utility","root"],"description":"Safely unmount, repair and remount EXT2/3/4 SD and removable storage."}}
