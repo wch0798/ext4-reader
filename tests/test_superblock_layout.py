@@ -42,5 +42,25 @@ class SuperblockLayoutTests(unittest.TestCase):
         self.assertEqual(sb.default_mount_opts, 0xA1B2C3D4)
 
 
+    def test_update_counts_preserves_64bit_total_and_writes_free_hi(self):
+        raw = self._raw()
+        struct.pack_into("<I", raw, 0x60, C.EXT4_FEATURE_INCOMPAT_EXTENTS | C.EXT4_FEATURE_INCOMPAT_64BIT)
+        struct.pack_into("<I", raw, 0x04, 0x12345678)
+        struct.pack_into("<I", raw, 0x150, 0x00000001)
+        struct.pack_into("<I", raw, 0x0C, 0x89ABCDEF)
+        struct.pack_into("<I", raw, 0x154, 0x00000002)
+
+        sb = parse_superblock(raw)
+        total_before = sb.blocks_count
+        sb.free_blocks_count = 0x00000003FEDCBA98
+        sb.update_counts()
+
+        self.assertEqual(struct.unpack_from("<I", sb.raw, 0x150)[0], 0x00000001)
+        self.assertEqual(struct.unpack_from("<I", sb.raw, 0x154)[0], 0x00000003)
+        reparsed = parse_superblock(bytes(sb.raw))
+        self.assertEqual(reparsed.blocks_count, total_before)
+        self.assertEqual(reparsed.free_blocks_count, 0x00000003FEDCBA98)
+
+
 if __name__ == "__main__":
     unittest.main()
