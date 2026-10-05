@@ -464,6 +464,22 @@ class Ext4Volume:
         if not self.dev.writable:
             raise Ext4Error("쓰기 세션을 시작하려면 장치를 쓰기 가능으로 열어야 합니다.")
 
+        # s_free_blocks_count is only an aggregate cache.  If an earlier crash
+        # or buggy writer left it stale, using it as the allocation baseline
+        # can underflow during a perfectly valid large copy.  Group descriptor
+        # counters are maintained with the allocation bitmaps and are the same
+        # aggregate used by statfs, so repair the superblock baseline before
+        # the first writable transaction.
+        group_free = sum(max(0, int(gd.free_blocks)) for gd in self.groups)
+        group_free = min(group_free, int(self.sb.blocks_count))
+        if int(self.sb.free_blocks_count) != group_free:
+            LOG.warning(
+                "RW 시작 전 superblock free count 자동 보정: super=%d groups=%d",
+                int(self.sb.free_blocks_count), group_free,
+            )
+            self.sb.free_blocks_count = group_free
+            self.dirty_super = True
+
         writer = None
         if getattr(self.sb, "has_journal", False):
             try:
