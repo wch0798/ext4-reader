@@ -706,12 +706,52 @@ class Ext4FuseOps:
         parent, name = lookup_parent(self.vol, path)
         unlink_checked(self.vol, parent, name)
 
+    def _purge_trash_tree(self, path: str) -> None:
+        """Permanently remove a freedesktop trash tree when Windows deletes it."""
+        try:
+            node = lookup_path(self.vol, path)
+        except FileNotFoundError:
+            return
+        if not node.is_dir:
+            parent, name = lookup_parent(self.vol, path)
+            unlink_checked(self.vol, parent, name)
+            return
+        for ent in list(list_dir(self.vol, node)):
+            if ent.name in (".", ".."):
+                continue
+            child = path.rstrip("/") + "/" + ent.name
+            self._purge_trash_tree(child)
+            node = self.vol.read_inode(node.ino)
+        if path != "/":
+            parent, name = lookup_parent(self.vol, path)
+            unlink_checked(self.vol, parent, name)
+
+    def _maybe_empty_linux_trash(self, path: str) -> None:
+        # Linux/Steam Deck freedesktop trash lives at .Trash-<uid>. When
+        # Explorer deletes that trash directory, do not translate the request
+        # into another recycle/rename cycle: permanently unlink its files and
+        # matching .trashinfo metadata so space is actually returned.
+        norm = path.rstrip("/")
+        leaf = norm.rsplit("/", 1)[-1]
+        if not (leaf.startswith(".Trash-") and leaf[7:].isdigit()):
+            return
+        self._purge_trash_tree(norm)
+        self.vol.commit_metadata(sync=True)
+
     def rename(self, old, new):
         self._ro()
         return self._wrap(self._rename, self._fuse_path(old), self._fuse_path(new))
 
     def _rename(self, old, new):
         self._drop_paths()
+        # A Windows shell delete may arrive as a rename into $RECYCLE.BIN.
+        # Preserve normal Windows semantics, but if the source itself is a
+        # Linux freedesktop trash directory, empty it instead of nesting one
+        # trash system inside the other.
+        leaf = old.rstrip("/").rsplit("/", 1)[-1]
+        if leaf.startswith(".Trash-") and leaf[7:].isdigit() and "$RECYCLE.BIN" in new.upper():
+            self._maybe_empty_linux_trash(old)
+            return
         move_entry(self.vol, old, new, True)
 
     def read(self, path, size, offset, fh):
