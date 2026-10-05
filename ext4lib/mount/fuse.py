@@ -879,12 +879,17 @@ class Ext4FuseOps:
 
     def statfs(self, path):
         sb = self.vol.sb
-        # WinFsp/fusepy on Windows interprets these values as allocation-unit
-        # counts.  Keep the allocation unit equal to the EXT4 block size;
-        # advertising 64 KiB units while returning 4 KiB block counts makes
-        # Explorer's capacity/free-space calculation incorrect.
+        # Group descriptors are the authoritative aggregate for free blocks.
+        # A stale/corrupt superblock free counter can otherwise make Explorer
+        # report only a few MiB free even while Linux sees hundreds of GiB.
+        group_free = sum(max(0, int(gd.free_blocks)) for gd in self.vol.groups)
         blocks = int(sb.blocks_count)
-        free = max(0, min(int(sb.free_blocks_count), blocks))
+        free = max(0, min(group_free, blocks))
+        if int(sb.free_blocks_count) != free:
+            LOG.warning(
+                "statfs superblock free count 불일치: super=%d groups=%d; Windows에는 group 합계를 사용",
+                int(sb.free_blocks_count), free,
+            )
         LOG.debug(
             "statfs block_size=%d blocks=%d free=%d total_bytes=%d free_bytes=%d",
             sb.block_size, blocks, free, blocks * sb.block_size, free * sb.block_size,
