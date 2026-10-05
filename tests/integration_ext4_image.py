@@ -13,7 +13,7 @@ import struct
 
 from ext4lib.fs import constants as C
 from ext4lib.fs.journal import _JournalLog
-from ext4lib.fs.extents import extent_at, file_extents
+from ext4lib.fs.extents import _collect_index_blocks, extent_at, file_extents
 from ext4lib.fs.orphan import _orphan_block_checksum
 from ext4lib.fs.bitmap import bitmap_checksum_valid, bitmap_free_count
 from ext4lib.fs.crc32c import crc32c
@@ -631,6 +631,12 @@ def orphan_repair_roundtrip(path: str) -> None:
         assert repair.sb.state & C.EXT4_ERROR_FS
         assert not repair.journal_needs_recovery()
 
+        # Steam Deck regression: if the orphaned inode owns an external
+        # xattr block, i_blocks must keep counting it after Windows truncates
+        # the orphan.  Missing it is an exact 8-sector deficit on 4 KiB EXT4.
+        before = repair.read_inode(node.ino)
+        had_external_xattr = bool(before.file_acl)
+
         ostats = repair.recover_pending_orphans()
         assert ostats.entries_found == 1
         assert ostats.truncated == 1
@@ -639,6 +645,14 @@ def orphan_repair_roundtrip(path: str) -> None:
             repair.sb.feature_ro_compat
             & C.EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT
         )
+
+        after = repair.read_inode(node.ino)
+        if had_external_xattr:
+            sectors_per_block = repair.sb.block_size // 512
+            data_blocks = sum(ex.length for ex in file_extents(repair, after))
+            index_blocks = len(_collect_index_blocks(repair, after))
+            expected_blocks = data_blocks + index_blocks + 1
+            assert after.blocks == expected_blocks * sectors_per_block
 
         estats = repair.repair_error_state_if_safe()
         assert estats.repaired
