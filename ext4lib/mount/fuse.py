@@ -382,6 +382,22 @@ class Ext4FuseOps:
             self._ensure_write_healthy()
             try:
                 self._wb_flush()
+                # Windows policy: Linux freedesktop trash is not retained on an
+                # Ext4Reader writable mount. Recovery, when desired, is a Linux
+                # concern; Windows should reclaim the blocks automatically.
+                # Purge every root .Trash-<uid> tree at the durability boundary
+                # so stale trash cannot silently consume tens of GiB.
+                try:
+                    root = lookup_path(self.vol, "/")
+                    trash_names = [
+                        ent.name for ent in list(list_dir(self.vol, root))
+                        if ent.name.startswith(".Trash-") and ent.name[7:].isdigit()
+                    ]
+                    for name in trash_names:
+                        LOG.warning("Linux 휴지통 자동 삭제: /%s", name)
+                        self._purge_trash_tree("/" + name)
+                except FileNotFoundError:
+                    pass
                 if getattr(self.vol, "_write_session_active", False):
                     self.vol.finish_write_session()
                 else:
