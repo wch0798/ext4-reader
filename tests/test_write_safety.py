@@ -121,6 +121,29 @@ class WriteSafetyTests(unittest.TestCase):
         self.assertNotIn("E:", fm._SESSIONS)
 
 
+    def test_sync_auto_purges_linux_freedesktop_trash(self):
+        vol = DummyVolume(active=False)
+        root = SimpleNamespace(ino=2)
+        entries = [
+            SimpleNamespace(name=".Trash-1000"),
+            SimpleNamespace(name=".Trash-0"),
+            SimpleNamespace(name="$RECYCLE.BIN"),
+            SimpleNamespace(name="Games"),
+        ]
+        ops = fm.Ext4FuseOps(vol, read_only=False)
+        purged = []
+
+        with (
+            patch("ext4lib.mount.fuse.lookup_path", return_value=root),
+            patch("ext4lib.mount.fuse.list_dir", return_value=entries),
+            patch.object(ops, "_purge_trash_tree", side_effect=purged.append),
+        ):
+            ops.sync_pending()
+
+        self.assertEqual(purged, ["/.Trash-1000", "/.Trash-0"])
+        self.assertEqual(vol.sync_calls, [True])
+
+
 class WriteSessionStateTests(unittest.TestCase):
     def _make_volume(self):
         class Device:
