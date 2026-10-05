@@ -530,8 +530,12 @@ class Ext4FuseOps:
             set_file_size(self.vol, self.vol.read_inode(node.ino), len(_RECYCLE_INI))
 
     def _materialize_recycle(self, path: str) -> None:
-        if self.read_only:
-            return
+        # Ext4Reader uses permanent-delete semantics on Windows. Never create
+        # or repair Windows $RECYCLE.BIN metadata; doing so makes Explorer
+        # treat this filesystem as a managed recycle bin and can trigger the
+        # "Recycle Bin is corrupted" repair dialog.
+        return
+
         targets = recycle_repair_targets(path)
         if targets is None:
             return
@@ -569,8 +573,6 @@ class Ext4FuseOps:
             mode &= ~0o222
         nlink = max(2 if node.is_dir else 1, node.links)
         flags = int(self._win_flags.get(path, 0))
-        if recycle_attr_path(path):
-            flags |= _UF_HIDDEN | _UF_SYSTEM
         self._st_flags = flags
         return {
             "st_mode": mode,
@@ -1426,9 +1428,11 @@ def _run_fuse(ops, letter: str, label: str, read_only: bool, session: MountSessi
         "volname": _safe_volname(label),
         "fsname": "fuse",
         "FileSecurity": "D:P(A;;FA;;;WD)",
-        # 64KB clusters let Windows ask for larger reads and writes.
+        # Report one EXT4 block per allocation unit. statfs returns EXT4 block
+        # counts, so using 64 KiB units here makes Explorer compute capacity
+        # and free space with incompatible units.
         "SectorSize": sector,
-        "SectorsPerAllocationUnit": 65536 // sector,
+        "SectorsPerAllocationUnit": max(1, bs // sector),
         "FileInfoTimeout": 2000,
         "DirInfoTimeout": 2000,
         "VolumeInfoTimeout": 2000,
