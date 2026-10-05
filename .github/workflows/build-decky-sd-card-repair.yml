@@ -3,9 +3,8 @@ on:
   workflow_dispatch:
   push:
     branches: [decky-sd-card-repair-v1.0.1]
-    paths:
-      - 'decky-sd-card-repair/**'
-      - '.github/workflows/build-decky-sd-card-repair.yml'
+  pull_request:
+    branches: [main]
 jobs:
   build:
     runs-on: ubuntu-latest
