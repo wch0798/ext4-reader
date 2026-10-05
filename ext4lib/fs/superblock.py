@@ -140,10 +140,23 @@ class Superblock:
         return crc32c_seed(self.uuid)
 
     def update_counts(self) -> None:
-        struct.pack_into("<I", self.raw, 0x0C, self.free_blocks_count & 0xFFFFFFFF)
-        struct.pack_into("<I", self.raw, 0x10, self.free_inodes_count & 0xFFFFFFFF)
+        # Never serialize an impossible aggregate. A negative free count means
+        # allocator/accounting corruption and previously surfaced as an opaque
+        # struct.error/EIO to Explorer.
+        if not 0 <= int(self.free_blocks_count) <= int(self.blocks_count):
+            raise ValueError(
+                f"invalid EXT4 free block count {self.free_blocks_count} "
+                f"(total {self.blocks_count})"
+            )
+        if not 0 <= int(self.free_inodes_count) <= int(self.inodes_count):
+            raise ValueError(
+                f"invalid EXT4 free inode count {self.free_inodes_count} "
+                f"(total {self.inodes_count})"
+            )
+        struct.pack_into("<I", self.raw, 0x0C, int(self.free_blocks_count) & 0xFFFFFFFF)
+        struct.pack_into("<I", self.raw, 0x10, int(self.free_inodes_count) & 0xFFFFFFFF)
         if self.has_64bit:
-            struct.pack_into("<I", self.raw, 0x154, self.free_blocks_count >> 32)
+            struct.pack_into("<I", self.raw, 0x154, (int(self.free_blocks_count) >> 32) & 0xFFFFFFFF)
         import time as _t
         self.wtime = int(_t.time())
         struct.pack_into("<I", self.raw, 0x30, self.wtime)
