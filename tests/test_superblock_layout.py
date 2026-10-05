@@ -42,6 +42,19 @@ class SuperblockLayoutTests(unittest.TestCase):
         self.assertEqual(sb.default_mount_opts, 0xA1B2C3D4)
 
 
+    def test_update_counts_rejects_negative_free_blocks(self):
+        sb = parse_superblock(self._raw())
+        sb.free_blocks_count = -1
+        with self.assertRaisesRegex(ValueError, "invalid EXT4 free block count"):
+            sb.update_counts()
+
+    def test_update_counts_rejects_free_blocks_above_total(self):
+        sb = parse_superblock(self._raw())
+        sb.free_blocks_count = sb.blocks_count + 1
+        with self.assertRaisesRegex(ValueError, "invalid EXT4 free block count"):
+            sb.update_counts()
+
+
     def test_update_counts_preserves_64bit_total_and_writes_free_hi(self):
         raw = self._raw()
         struct.pack_into("<I", raw, 0x60, C.EXT4_FEATURE_INCOMPAT_EXTENTS | C.EXT4_FEATURE_INCOMPAT_64BIT)
