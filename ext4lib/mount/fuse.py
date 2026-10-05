@@ -877,12 +877,22 @@ class Ext4FuseOps:
 
     def statfs(self, path):
         sb = self.vol.sb
+        # WinFsp/fusepy on Windows interprets these values as allocation-unit
+        # counts.  Keep the allocation unit equal to the EXT4 block size;
+        # advertising 64 KiB units while returning 4 KiB block counts makes
+        # Explorer's capacity/free-space calculation incorrect.
+        blocks = int(sb.blocks_count)
+        free = max(0, min(int(sb.free_blocks_count), blocks))
+        LOG.debug(
+            "statfs block_size=%d blocks=%d free=%d total_bytes=%d free_bytes=%d",
+            sb.block_size, blocks, free, blocks * sb.block_size, free * sb.block_size,
+        )
         return {
             "f_bsize": sb.block_size,
             "f_frsize": sb.block_size,
-            "f_blocks": sb.blocks_count,
-            "f_bfree": sb.free_blocks_count,
-            "f_bavail": sb.free_blocks_count,
+            "f_blocks": blocks,
+            "f_bfree": free,
+            "f_bavail": free,
             "f_files": sb.inodes_count,
             "f_ffree": sb.free_inodes_count,
             "f_favail": sb.free_inodes_count,
