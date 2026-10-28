@@ -67,6 +67,7 @@ class PartitionExtentMatchTests(unittest.TestCase):
 class ScsiDurabilityTests(unittest.TestCase):
     def _device(self):
         dev = WindowsPhysicalDevice.__new__(WindowsPhysicalDevice)
+        dev.path = r"\\.\PhysicalDrive9"
         dev.sector_size = 512
         dev._handle = 123
         dev._scsi_dirty = False
@@ -77,6 +78,7 @@ class ScsiDurabilityTests(unittest.TestCase):
         dev._usbdk = None
         dev._partition_volume = None
         dev._nt_handle = None
+        dev._read_at = Mock(return_value=b"x" * 512)
         import threading
         dev._io_lock = threading.RLock()
         return dev
@@ -161,7 +163,7 @@ class ScsiDurabilityTests(unittest.TestCase):
         dev._scsi_synchronize_cache = Mock()
         with patch.object(diskmod.kernel32, "FlushFileBuffers", return_value=True):
             dev.flush()
-        dev._scsi_synchronize_cache.assert_called_once_with()
+        dev._scsi_synchronize_cache.assert_called_once_with(os_flush_ok=True)
 
     def test_sticky_scsi_route_skips_known_failing_windows_paths(self):
         dev = self._device()

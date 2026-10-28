@@ -51,9 +51,11 @@ IOCTL_VOLUME_ONLINE = 0x0056C008
 IOCTL_VOLUME_OFFLINE = 0x0056C00C
 IOCTL_STORAGE_GET_DEVICE_NUMBER = 0x002D1080
 IOCTL_STORAGE_CHECK_VERIFY2 = 0x002D0800
+FILE_DEVICE_DISK = 0x00000007
 STALE_HANDLE_ERRORS = {6, 31, 995, 1167}  # invalid handle / gen fail / aborted / unplugged
 
 IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = 0x000700A0
+IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C
 IOCTL_DISK_GET_PARTITION_INFO_EX = 0x00070048
 IOCTL_DISK_GET_DISK_ATTRIBUTES = 0x000700F0
 IOCTL_DISK_SET_DISK_ATTRIBUTES = 0x0007C0F4
@@ -74,6 +76,18 @@ SCSI_WRITE_FUA = 0x08
 # WRITE(10) itself can encode far more blocks. Start conservatively and adapt
 # downward on ERROR_INVALID_PARAMETER rather than failing a filesystem write.
 SCSI_WRITE_DEFAULT_CHUNK = 256 * 1024
+# Sense keys that mean the device was executing the WRITE (recovered / medium /
+# hardware / aborted / miscompare): sectors may already be on the medium.
+SCSI_SENSE_WRITE_EXECUTED = {0x01, 0x03, 0x04, 0x0B, 0x0E}
+# Sense keys that by specification mean the command was rejected before any
+# data phase (not ready / illegal request / unit attention / data protect).
+# Every other key, including "no sense" (0) with a non-GOOD status, leaves the
+# transfer state unknown and is treated as post-write.
+SCSI_SENSE_WRITE_NOT_EXECUTED = {0x02, 0x05, 0x06, 0x07}
+# DeviceIoControl errors raised after the command was sent (timeout / I/O device).
+# These stay post-write even if a later read still shows the old bytes: the
+# command may complete after that read.
+SCSI_WRITE_IN_FLIGHT_ERRORS = {121, 1117}
 
 TOKEN_QUERY = 0x0008
 TOKEN_ADJUST_PRIVILEGES = 0x0020
@@ -213,6 +227,21 @@ class _OVERLAPPED(ctypes.Structure):
 
 ERROR_IO_PENDING = 997
 ERROR_INVALID_PARAMETER = 87
+ERROR_ACCESS_DENIED = 5
+ERROR_SHARING_VIOLATION = 32
+ERROR_HANDLE_EOF = 38
+ERROR_WRITE_FAULT = 29
+ERROR_NO_MORE_FILES = 18
+ERROR_MORE_DATA = 234
+IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS = 0x00560000
+# The medium itself went away (not ready / no such device / media changed /
+# not connected / removed). No alternative write route can succeed then, and
+# reopening PhysicalDriveN by number could reach a different card.
+DEVICE_GONE_ERRORS = {21, 55, 433, 1110, 1167, 1617}
+# Explorer/indexer handles make FSCTL_LOCK_VOLUME fail with ACCESS_DENIED for
+# a moment after the card appears; retry before a forced dismount.
+LOCK_VOLUME_RETRIES = 20
+LOCK_VOLUME_RETRY_DELAY = 0.1
 kernel32.SetLastError.argtypes = [wintypes.DWORD]
 kernel32.SetLastError.restype = None
 kernel32.FindFirstVolumeW.argtypes = [wintypes.LPWSTR, wintypes.DWORD]
@@ -343,6 +372,48 @@ def _nt_success(status: int) -> bool:
 
 def _nt_status_hex(status: int) -> str:
     return f"0x{(int(status) & 0xFFFFFFFF):08X}"
+
+
+class PostWriteError(IoError):
+    """A write failed after bytes may already have reached the device.
+
+    Flush failures, short writes and read-back mismatches raise this. Callers
+    must never retry the payload through another write route afterwards: a
+    later success there would hide a write whose durability is unknown.
+    """
+
+
+class UncertainWriteError(PostWriteError):
+    """A SCSI WRITE(10) failed without any evidence either way.
+
+    The device returned no usable sense data, or DeviceIoControl failed without
+    a sense record that proves the command was rejected before its data phase.
+    Win32 1/5/6/50/87 are not that proof: drivers return them after an SRB was
+    built. It is a PostWriteError everywhere. ``_scsi_write10_one`` may
+    downgrade it only after an unbuffered (``FILE_FLAG_NO_BUFFERING``) read
+    shows the range still holds its pre-write content. A ReadFile on the
+    cached session handle is not that proof.
+    """
+
+
+def _flush_handle_checked(handle, name: str) -> None:
+    """FlushFileBuffers; every failure is fatal, whatever the error code."""
+    kernel32.SetLastError(0)
+    if not kernel32.FlushFileBuffers(handle):
+        err = ctypes.get_last_error() or ERROR_WRITE_FAULT
+        raise PostWriteError(f"{name} FlushFileBuffers 실패 (Win32 {err})", winerr=err)
+
+
+def _nt_flush_checked(handle, name: str) -> None:
+    """NtFlushBuffersFile; every failure is fatal, whatever the status."""
+    iosb = _IO_STATUS_BLOCK()
+    status = ntdll.NtFlushBuffersFile(handle, ctypes.byref(iosb))
+    if not _nt_success(status):
+        dos = int(ntdll.RtlNtStatusToDosError(status)) or ERROR_WRITE_FAULT
+        raise PostWriteError(
+            f"{name} NtFlushBuffersFile 실패 NTSTATUS={_nt_status_hex(status)} (Win32 {dos})",
+            winerr=dos,
+        )
 
 
 def _nt_native_path(path: str) -> str:
@@ -614,6 +685,24 @@ def _query_geometry(handle) -> tuple[int, int]:
     return size, sector
 
 
+def _query_disk_size(handle) -> tuple[int, int]:
+    """Return (size, logical sector). Size prefers IOCTL_DISK_GET_LENGTH_INFO.
+
+    GEOMETRY_EX.DiskSize is only a fallback: some card-reader drivers report
+    a cylinder-rounded or stale value there, while GET_LENGTH_INFO returns the
+    exact byte length the storage stack will accept I/O for.
+    """
+    geo_size, sector = _query_geometry(handle)
+    try:
+        raw = _ioctl(handle, IOCTL_DISK_GET_LENGTH_INFO, out_cb=8)
+    except OSError:
+        return geo_size, sector
+    if len(raw) < 8:
+        return geo_size, sector
+    size = int.from_bytes(raw[0:8], "little", signed=True)
+    return (size if size > 0 else geo_size), sector
+
+
 def _query_storage(handle) -> tuple[str, str, int, bool]:
     query = ctypes.create_string_buffer(12)
     # PropertyId = StorageDeviceProperty (0), QueryType = PropertyStandardQuery (0)
@@ -801,12 +890,14 @@ def _write_unbuffered_raw_path(
         )
         err = ctypes.get_last_error()
         if not ok or done.value != len(data):
-            raise IoError(
-                f"NO_BUFFERING WriteFile 실패 offset={offset} "
+            # Some sectors may already be on the device after a short write.
+            error_cls = PostWriteError if done.value else IoError
+            raise error_cls(
+                f"NO_BUFFERING WriteFile 실패 path={path} offset={offset} "
                 f"{done.value}/{len(data)} Win32={err}",
-                winerr=err,
+                winerr=err or ERROR_WRITE_FAULT,
             )
-        kernel32.FlushFileBuffers(handle)
+        _flush_handle_checked(handle, f"NO_BUFFERING {path} offset={offset}")
 
         ctypes.memset(aligned_addr, 0, len(data))
         if not kernel32.SetFilePointerEx(
@@ -816,7 +907,7 @@ def _write_unbuffered_raw_path(
             FILE_BEGIN,
         ):
             err = ctypes.get_last_error()
-            raise IoError(
+            raise PostWriteError(
                 f"NO_BUFFERING read-back seek 실패 offset={offset} Win32={err}",
                 winerr=err,
             )
@@ -832,14 +923,14 @@ def _write_unbuffered_raw_path(
         )
         err = ctypes.get_last_error()
         if not ok or read_done.value != len(data):
-            raise IoError(
+            raise PostWriteError(
                 f"NO_BUFFERING read-back 실패 offset={offset} "
                 f"{read_done.value}/{len(data)} Win32={err}",
                 winerr=err,
             )
         verify = ctypes.string_at(aligned_addr, len(data))
         if verify != data:
-            raise IoError(
+            raise PostWriteError(
                 f"NO_BUFFERING read-back 불일치 offset={offset} len={len(data)}",
                 winerr=23,
             )
@@ -851,14 +942,15 @@ def _write_unbuffered_raw_path(
 
 def _physical_index(path: str) -> int | None:
     tag = "PHYSICALDRIVE"
-    up = path.upper().replace("/", "\\")
+    up = path.upper().replace("/", "\\").rstrip("\\")
     if tag not in up:
         return None
-    tail = up.split(tag, 1)[1]
-    digits = "".join(ch for ch in tail if ch.isdigit())
-    if not digits:
+    # Only an all-digit suffix names the disk. Collecting every digit after
+    # the tag turned e.g. "PhysicalDrive1\x2" into disk 12.
+    tail = up.rsplit(tag, 1)[1]
+    if not (tail.isascii() and tail.isdigit()):
         return None
-    return int(digits)
+    return int(tail)
 
 
 def _ioctl(handle, code: int, inbuf=None, out_cb: int = 0) -> bytes:
@@ -1302,6 +1394,113 @@ def _release_locked_volume(item: _LockedVolume) -> None:
             LOG.warning("FVE raw-access 해제 실패 %s HRESULT=0x%08X", fve_name, hr)
 
 
+def _lock_volume_error(handle, name: str) -> int:
+    """FSCTL_LOCK_VOLUME, retried while other processes still hold the volume.
+
+    Returns 0 on success, otherwise the last Win32 error.
+    """
+    from ext4lib.debuglog import LOG
+
+    last: OSError | None = None
+    err = 0
+    for attempt in range(LOCK_VOLUME_RETRIES):
+        try:
+            _ioctl(handle, FSCTL_LOCK_VOLUME)
+            return 0
+        except OSError as exc:
+            last = exc
+            err = int(exc.args[0]) if exc.args else 0
+            if err not in (ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION):
+                break
+            if attempt + 1 < LOCK_VOLUME_RETRIES:
+                time.sleep(LOCK_VOLUME_RETRY_DELAY)
+    LOG.warning("볼륨 잠금 실패 %s: %s", name, last)
+    return err or ERROR_ACCESS_DENIED
+
+
+def _lock_volume_with_retry(handle, name: str) -> bool:
+    return _lock_volume_error(handle, name) == 0
+
+
+def _secure_exclusive_access(handle, name: str) -> tuple[bool, bool, bool]:
+    """Lock, then dismount, then take ``name`` offline.
+
+    Returns (locked, dismounted, offline). Raises IoError, naming the volume
+    and the Win32 codes, when none of the three succeeded: writing under a
+    live mount races the Windows filesystem cache and can corrupt the card.
+    The caller still owns ``handle`` and must close it on error.
+    """
+    from ext4lib.debuglog import LOG
+
+    lock_err = _lock_volume_error(handle, name)
+    lock_ok = lock_err == 0
+    if lock_ok:
+        LOG.info("볼륨 잠금 성공 %s", name)
+
+    dismount_ok = False
+    dismount_err = 0
+    try:
+        _ioctl(handle, FSCTL_DISMOUNT_VOLUME)
+        dismount_ok = True
+        LOG.info("볼륨 분리 성공 %s", name)
+    except OSError as exc:
+        dismount_err = int(exc.args[0]) if exc.args and isinstance(exc.args[0], int) else 0
+        LOG.warning("볼륨 분리 실패 %s: %s", name, exc)
+
+    # IOCTL_VOLUME_OFFLINE is only valid after a successful dismount.
+    offline_ok = _take_volume_offline(handle, name) if dismount_ok else False
+    if not (lock_ok or dismount_ok or offline_ok):
+        raise IoError(
+            f"{name} 볼륨을 잠그거나 분리할 수 없습니다 "
+            f"(lock Win32 {lock_err}, dismount Win32 {dismount_err or '?'}, "
+            "offline 시도 불가). 다른 프로세스"
+            "(Windows 탐색기/백신/인덱서 등)가 카드를 사용 중입니다. "
+            "해당 프로그램을 닫고 다시 시도하세요.",
+            winerr=lock_err or dismount_err or ERROR_ACCESS_DENIED,
+        )
+    return lock_ok, dismount_ok, offline_ok
+
+
+def _volume_on_disk(handle, disk_index: int) -> tuple[bool | None, int]:
+    """Tell whether an open volume lives on PhysicalDrive``disk_index``.
+
+    Returns (on_disk, partition_number); on_disk is None when Windows answers
+    neither IOCTL_STORAGE_GET_DEVICE_NUMBER nor the disk-extents query.
+    """
+    try:
+        raw = _ioctl(
+            handle,
+            IOCTL_STORAGE_GET_DEVICE_NUMBER,
+            out_cb=ctypes.sizeof(STORAGE_DEVICE_NUMBER),
+        )
+        num = STORAGE_DEVICE_NUMBER.from_buffer_copy(raw)
+        # CdRomN shares the number space with PhysicalDriveN.
+        on_disk = num.DeviceNumber == disk_index and num.DeviceType == FILE_DEVICE_DISK
+        return on_disk, int(num.PartitionNumber)
+    except (OSError, ValueError):
+        pass
+    # Spanned/dynamic volumes have no single device number.
+    try:
+        raw = _ioctl(handle, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, out_cb=8 + 24 * 32)
+    except OSError:
+        return None, 0
+    if len(raw) < 8:
+        return None, 0
+    count = int.from_bytes(raw[0:4], "little")
+    if count <= 0 or len(raw) < 8 + 24 * count:
+        return None, 0
+    disks = {int.from_bytes(raw[8 + 24 * i : 12 + 24 * i], "little") for i in range(count)}
+    return int(disk_index) in disks, 0
+
+
+def _volume_scan_error(vol: str, what: str, err: int, disk_index: int) -> IoError:
+    return IoError(
+        f"{vol} {what} 실패 (Win32 {err}). PhysicalDrive{disk_index}의 볼륨을 "
+        "모두 잠갔는지 확인할 수 없어 쓰기를 중단합니다.",
+        winerr=err or ERROR_ACCESS_DENIED,
+    )
+
+
 def _take_volume_offline(handle, name: str) -> bool:
     """Keep a dismounted volume from being automatically remounted.
 
@@ -1367,7 +1566,10 @@ def _lock_volumes_for_disk(disk_index: int) -> list[_LockedVolume]:
     name = ctypes.create_unicode_buffer(260)
     find = kernel32.FindFirstVolumeW(name, 260)
     if find == INVALID_HANDLE_VALUE or find is None:
-        return locked
+        err = ctypes.get_last_error()
+        if err == ERROR_NO_MORE_FILES:
+            return locked
+        raise _volume_scan_error("FindFirstVolumeW", "볼륨 목록 조회", err, disk_index)
     try:
         while True:
             vol = name.value.rstrip("\\")
@@ -1380,43 +1582,48 @@ def _lock_volumes_for_disk(disk_index: int) -> list[_LockedVolume]:
                 FILE_FLAG_BACKUP_SEMANTICS,
                 None,
             )
-            if handle != INVALID_HANDLE_VALUE and handle is not None:
+            if handle == INVALID_HANDLE_VALUE or handle is None:
+                open_err = ctypes.get_last_error()
+                # A query-only handle is enough to tell which disk it is on.
+                probe = kernel32.CreateFileW(
+                    vol,
+                    0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                    None,
+                )
+                on_disk = None
+                if probe != INVALID_HANDLE_VALUE and probe is not None:
+                    try:
+                        on_disk, _part = _volume_on_disk(probe, disk_index)
+                    finally:
+                        kernel32.CloseHandle(probe)
+                if on_disk is not False:
+                    raise _volume_scan_error(vol, "볼륨 열기", open_err, disk_index)
+            else:
                 try:
-                    raw = _ioctl(handle, IOCTL_STORAGE_GET_DEVICE_NUMBER, out_cb=ctypes.sizeof(STORAGE_DEVICE_NUMBER))
-                    num = STORAGE_DEVICE_NUMBER.from_buffer_copy(raw)
-                    if num.DeviceNumber == disk_index:
-                        lock_ok = False
-                        try:
-                            _ioctl(handle, FSCTL_LOCK_VOLUME)
-                            lock_ok = True
-                            LOG.info(
-                                "Windows 볼륨 잠금 성공 %s (PhysicalDrive%s part=%s)",
-                                vol,
-                                disk_index,
-                                num.PartitionNumber,
-                            )
-                        except OSError as exc:
-                            LOG.warning("볼륨 잠금 실패 %s: %s", vol, exc)
-                        dismount_ok = False
-                        try:
-                            _ioctl(handle, FSCTL_DISMOUNT_VOLUME)
-                            dismount_ok = True
-                            LOG.info(
-                                "Windows 볼륨 분리 %s (PhysicalDrive%s part=%s)",
-                                vol,
-                                disk_index,
-                                num.PartitionNumber,
-                            )
-                        except OSError as exc:
-                            LOG.warning("볼륨 분리 실패 %s: %s", vol, exc)
-                        offline_ok = _take_volume_offline(handle, vol) if dismount_ok else False
+                    on_disk, part_no = _volume_on_disk(handle, disk_index)
+                    if on_disk is None:
+                        raise _volume_scan_error(
+                            vol, "볼륨 디스크 번호 확인", ctypes.get_last_error(), disk_index
+                        )
+                    if on_disk:
+                        lock_ok, _dismount_ok, offline_ok = _secure_exclusive_access(handle, vol)
+                        LOG.info(
+                            "Windows 볼륨 확보 %s (PhysicalDrive%s part=%s locked=%s offline=%s)",
+                            vol,
+                            disk_index,
+                            part_no,
+                            lock_ok,
+                            offline_ok,
+                        )
                         _allow_extended_io(handle)
                         extent = _query_partition_extent(handle)
                         part_offset = int(extent[0]) if extent is not None else 0
                         part_size = int(extent[1]) if extent is not None else 0
-                        part_number = (
-                            int(extent[2]) if extent is not None else int(num.PartitionNumber)
-                        )
+                        part_number = int(extent[2]) if extent is not None else part_no
                         locked.append(
                             _LockedVolume(
                                 handle=int(handle),
@@ -1430,13 +1637,19 @@ def _lock_volumes_for_disk(disk_index: int) -> list[_LockedVolume]:
                             )
                         )
                         handle = None
-                except OSError:
-                    pass
                 finally:
                     if handle:
                         kernel32.CloseHandle(handle)
             if not kernel32.FindNextVolumeW(find, name, 260):
-                break
+                err = ctypes.get_last_error()
+                if err == ERROR_NO_MORE_FILES:
+                    break
+                raise _volume_scan_error("FindNextVolumeW", "볼륨 목록 조회", err, disk_index)
+    except BaseException:
+        # The caller never receives the list, so it cannot unlock these.
+        for item in locked:
+            _release_locked_volume(item)
+        raise
     finally:
         kernel32.FindVolumeClose(find)
     return locked
@@ -1477,7 +1690,12 @@ def _open_handle(path: str, writable: bool):
         if writable:
             LOG.warning("RAW 디스크 핸들 열기 재시도 share=0x%X Win32=%s", share, last_err)
 
-    raise IoError(f"{path} 를 열 수 없습니다. (Win32 {last_err})", winerr=last_err)
+    hint = ""
+    if last_err == ERROR_ACCESS_DENIED and not is_admin():
+        hint = " 관리자 권한으로 다시 실행하세요."
+    elif last_err == ERROR_SHARING_VIOLATION:
+        hint = " 다른 프로그램이 디스크를 사용 중입니다."
+    raise IoError(f"{path} 를 열 수 없습니다. (Win32 {last_err}){hint}", winerr=last_err)
 
 
 def _open_hidden_volume_alias(
@@ -1528,6 +1746,7 @@ def _open_hidden_volume_alias(
             )
             matched = (
                 int(num.DeviceNumber) == int(disk_index)
+                and int(num.DeviceType) == FILE_DEVICE_DISK
                 and int(num.PartitionNumber) == int(partition_number)
                 and extent_ok
             )
@@ -1586,23 +1805,9 @@ def _open_hidden_volume_alias(
                 writable_err,
                 fve_ok,
             )
-            lock_ok = False
-            try:
-                _ioctl(handle, FSCTL_LOCK_VOLUME)
-                lock_ok = True
-                LOG.info("볼륨 잠금 성공 %s", path)
-            except OSError as exc:
-                LOG.info("볼륨 잠금 생략/실패 %s: %s", path, exc)
-
-            dismount_ok = False
-            try:
-                _ioctl(handle, FSCTL_DISMOUNT_VOLUME)
-                dismount_ok = True
-                LOG.info("볼륨 분리 성공 %s", path)
-            except OSError as exc:
-                LOG.info("볼륨 분리 생략/실패 %s: %s", path, exc)
-
-            offline_ok = _take_volume_offline(handle, path) if dismount_ok else False
+            # Raises (and the finally below closes the handle) unless lock,
+            # dismount or offline secured the volume.
+            lock_ok, _dismount_ok, offline_ok = _secure_exclusive_access(handle, path)
             _allow_extended_io(handle)
             keep = True
             extent = _query_partition_extent(handle)
@@ -1618,6 +1823,8 @@ def _open_hidden_volume_alias(
                 fve_name=fve_name,
                 fve_raw=fve_ok,
             )
+        except IoError:
+            raise
         except OSError:
             pass
         finally:
@@ -1686,29 +1893,17 @@ def _open_partition_device(
                     writable_err,
                 )
 
-            lock_ok = False
-            try:
-                _ioctl(handle, FSCTL_LOCK_VOLUME)
-                lock_ok = True
-                LOG.info("파티션 장치 잠금 성공 %s", path)
-            except OSError as exc:
-                LOG.info("파티션 장치 잠금 생략/실패 %s: %s", path, exc)
-            try:
-                _ioctl(handle, FSCTL_DISMOUNT_VOLUME)
-                LOG.info("파티션 장치 분리 성공 %s", path)
-            except OSError as exc:
-                LOG.info("파티션 장치 분리 생략/실패 %s: %s", path, exc)
-            _allow_extended_io(handle)
-
             # ERROR_WRITE_PROTECT (19) is decisive: retrying another alias will
             # not bypass a hardware/media or partition read-only condition.
             if not writable_ok and writable_err == 19:
-                kernel32.CloseHandle(handle)
                 raise IoError(
                     f"{path} 는 Windows에서 쓰기 금지 상태입니다. "
                     "SD 어댑터 LOCK 스위치 또는 디스크/파티션 읽기 전용 속성을 확인하세요. (Win32 19)",
                     winerr=19,
                 )
+
+            lock_ok, _dismount_ok, offline_ok = _secure_exclusive_access(handle, path)
+            _allow_extended_io(handle)
 
             return _LockedVolume(
                 handle=int(handle),
@@ -1717,13 +1912,11 @@ def _open_partition_device(
                 locked=lock_ok,
                 partition_offset=int(extent[0]),
                 partition_size=int(extent[1]),
-                offline=False,
+                offline=offline_ok,
                 volume_guid=None,
                 fve_raw=False,
             )
-        except IoError:
-            raise
-        except Exception:
+        except BaseException:
             kernel32.CloseHandle(handle)
             raise
 
@@ -1857,7 +2050,32 @@ def list_physical_disks() -> list[DiskInfo]:
 
 
 class WindowsPhysicalDevice(BlockDevice):
-    def __init__(
+    def __init__(self, *args, **kwargs):
+        try:
+            self._open(*args, **kwargs)
+        except BaseException:
+            self._abort_open()
+            raise
+
+    def _abort_open(self) -> None:
+        """Undo a half-finished open so no volume stays locked or offline."""
+        stop = getattr(self, "_stop_ka", None)
+        if stop is not None:
+            stop.set()
+        handle = getattr(self, "_handle", None)
+        if handle:
+            try:
+                kernel32.CloseHandle(handle)
+            except Exception:
+                pass
+        self._handle = None
+        for item in getattr(self, "_volume_locks", []):
+            _release_locked_volume(item)
+        self._volume_locks = []
+        self._partition_volume = None
+        self._closed = True
+
+    def _open(
         self,
         path: str,
         sector_size: int = 512,
@@ -1882,6 +2100,9 @@ class WindowsPhysicalDevice(BlockDevice):
         self._partition_offset = int(partition_offset or 0)
         self._partition_size = int(partition_size or 0)
         self._partition_volume: _LockedVolume | None = None
+        self._expected_size = int(expected_size or 0)
+        self._expected_serial = expected_serial or ""
+        self._expected_ext_uuid = expected_ext_uuid
         self._nt_handle = None
         self._write_blockers: list[str] = []
         self._disk_offline = False
@@ -2026,9 +2247,15 @@ class WindowsPhysicalDevice(BlockDevice):
         # Use synchronous seek+WriteFile for writable raw disks. Some USB/card
         # reader drivers are more reliable with the classic DASD write pattern.
         self._use_overlapped = not writable
-        self._size, geo_ss = _query_geometry(self._handle)
+        self._size, geo_ss = _query_disk_size(self._handle)
         if geo_ss:
             self.sector_size = geo_ss
+        # Remember what this medium looks like so a reopen after a stale
+        # handle can refuse a different card that took the same number.
+        if not self._expected_size:
+            self._expected_size = int(_query_geometry(self._handle)[0] or 0)
+        if not self._expected_serial:
+            self._expected_serial = self._serial
         LOG.info("디스크 열림 size=%s sector=%s", self._size, self.sector_size)
         self._ka = None
         if self._size:
@@ -2075,6 +2302,9 @@ class WindowsPhysicalDevice(BlockDevice):
         from ext4lib.debuglog import LOG
 
         old = self._handle
+        # Forget the value before reopening: if _open_handle fails, close()
+        # must not CloseHandle() a number Windows may already have reused.
+        self._handle = None
         try:
             kernel32.CloseHandle(old)
         except Exception:
@@ -2085,12 +2315,27 @@ class WindowsPhysicalDevice(BlockDevice):
             except Exception:
                 pass
             self._nt_handle = None
+        # A stale handle usually means the card was pulled or the reader
+        # re-enumerated. Check the identity before locking/dismounting any
+        # volume of whatever disk now owns this PhysicalDrive number.
+        exp_size = int(getattr(self, "_expected_size", 0) or 0)
+        exp_serial = getattr(self, "_expected_serial", "") or ""
+        exp_uuid = getattr(self, "_expected_ext_uuid", None)
+        if exp_size or exp_serial or exp_uuid is not None:
+            _verify_expected_medium(
+                self.path,
+                self._partition_offset,
+                expected_size=exp_size,
+                expected_serial=exp_serial,
+                expected_ext_uuid=exp_uuid,
+            )
         if self._writable:
             _enable_storage_privileges()
             idx = _physical_index(self.path)
             if idx is not None and not self._disk_offline:
                 for item in self._volume_locks:
                     _release_locked_volume(item)
+                self._volume_locks = []
                 self._volume_locks = _lock_volumes_for_disk(idx)
                 self._partition_volume = None
                 if self._partition_number is not None:
@@ -2129,7 +2374,15 @@ class WindowsPhysicalDevice(BlockDevice):
                             self._partition_volume = direct
         self._handle = _open_handle(self.path, self._writable)
         self._use_overlapped = not self._writable
-        self._size, geo_ss = _query_geometry(self._handle)
+        # The new handle is a new transport. FUA, SYNCHRONIZE CACHE and the
+        # sticky SCSI route were learned on the handle just closed; keeping
+        # them would skip FUA or a device flush after re-enumeration.
+        # _scsi_dirty is not a verdict: a completed non-FUA WRITE(10) may
+        # still sit in the device cache, so the next flush must still run.
+        self._scsi_fua_supported = None
+        self._scsi_sync_cache_supported = None
+        self._fallback_write_route = None
+        self._size, geo_ss = _query_disk_size(self._handle)
         if geo_ss:
             self.sector_size = geo_ss
         LOG.warning("디스크 핸들을 다시 열었습니다 %s", self.path)
@@ -2142,6 +2395,10 @@ class WindowsPhysicalDevice(BlockDevice):
                     return fn()
                 except IoError as exc:
                     last = exc
+                    # Bytes may already be on the device: a later retry that
+                    # succeeds would hide a write whose durability is unknown.
+                    if isinstance(exc, PostWriteError):
+                        raise
                     if exc.winerr not in STALE_HANDLE_ERRORS or attempt == 2 or self._closed:
                         raise
                     from ext4lib.debuglog import LOG
@@ -2170,36 +2427,47 @@ class WindowsPhysicalDevice(BlockDevice):
         if ok:
             return
         err = ctypes.get_last_error()
-        if err == ERROR_IO_PENDING:
+        pending = err == ERROR_IO_PENDING
+        if pending:
             ok = kernel32.GetOverlappedResult(self._handle, ctypes.byref(ov), ctypes.byref(done), True)
             if ok:
                 return
             err = ctypes.get_last_error()
         if err == ERROR_INVALID_PARAMETER:
             self._use_overlapped = False
-        raise IoError(f"{self.path} {what} 실패 (Win32 {err})", winerr=err)
+        exc = IoError(f"{self.path} {what} 실패 (Win32 {err})", winerr=err)
+        # The request was queued to the device before it failed.
+        exc.io_pending = pending
+        raise exc
 
     def _read_seek(self, offset: int, length: int) -> bytes:
-        self._seek(offset)
+        # A short ReadFile is continued, never zero-filled: zeros in the middle
+        # of the device would be taken as real metadata and written back.
         buf = bytearray(length)
-        done = wintypes.DWORD(0)
-        kernel32.SetLastError(0)
-        ok = kernel32.ReadFile(
-            self._handle,
-            (ctypes.c_char * length).from_buffer(buf),
-            length,
-            ctypes.byref(done),
-            None,
-        )
-        if not ok:
-            err = ctypes.get_last_error()
-            raise IoError(
-                f"{self.path} 오프셋 {offset}에서 {length}바이트 읽기 실패 (Win32 {err})",
-                winerr=err,
+        got = 0
+        while got < length:
+            self._seek(offset + got)
+            done = wintypes.DWORD(0)
+            kernel32.SetLastError(0)
+            ok = kernel32.ReadFile(
+                self._handle,
+                (ctypes.c_char * (length - got)).from_buffer(buf, got),
+                length - got,
+                ctypes.byref(done),
+                None,
             )
-        got = int(done.value)
-        if got < length:
-            buf[got:] = b"\x00" * (length - got)
+            if not ok:
+                err = ctypes.get_last_error()
+                raise IoError(
+                    f"{self.path} 오프셋 {offset}에서 {length}바이트 읽기 실패 (Win32 {err})",
+                    winerr=err,
+                )
+            if int(done.value) == 0:
+                raise IoError(
+                    f"{self.path} 오프셋 {offset} 짧은 읽기 {got}/{length}",
+                    winerr=ERROR_HANDLE_EOF,
+                )
+            got += int(done.value)
         return bytes(buf)
 
     def _read_at(self, offset: int, length: int) -> bytes:
@@ -2226,18 +2494,41 @@ class WindowsPhysicalDevice(BlockDevice):
             raise
         got = int(done.value)
         if got < length:
-            buf[got:] = b"\x00" * (length - got)
+            return bytes(buf[:got]) + self._read_seek(offset + got, length - got)
         return bytes(buf)
 
     def _write_seek(self, offset: int, data: bytes) -> None:
-        self._seek(offset)
-        done = wintypes.DWORD(0)
         buf = (ctypes.c_char * len(data)).from_buffer_copy(data)
-        kernel32.SetLastError(0)
-        ok = kernel32.WriteFile(self._handle, buf, len(data), ctypes.byref(done), None)
-        err = ctypes.get_last_error()
-        if not ok or done.value != len(data):
-            raise IoError(f"{offset}에서 쓰기 실패 (Win32 {err})", winerr=err)
+        written = 0
+        while written < len(data):
+            try:
+                self._seek(offset + written)
+            except IoError as exc:
+                if not written:
+                    raise
+                # The earlier part of the payload is already on the device.
+                raise PostWriteError(
+                    f"{offset}에서 쓰기 일부만 완료 ({written}/{len(data)}): {exc}",
+                    winerr=exc.winerr or ERROR_WRITE_FAULT,
+                ) from exc
+            done = wintypes.DWORD(0)
+            kernel32.SetLastError(0)
+            ok = kernel32.WriteFile(
+                self._handle,
+                ctypes.c_void_p(ctypes.addressof(buf) + written),
+                len(data) - written,
+                ctypes.byref(done),
+                None,
+            )
+            err = ctypes.get_last_error()
+            if not ok or int(done.value) == 0:
+                # A failed WriteFile can still report transferred bytes.
+                error_cls = PostWriteError if written or int(done.value) else IoError
+                raise error_cls(
+                    f"{offset}에서 쓰기 실패 (Win32 {err}, {written}/{len(data)})",
+                    winerr=err or ERROR_WRITE_FAULT,
+                )
+            written += int(done.value)
 
 
     def _nt_write_at(self, absolute_offset: int, data: bytes) -> None:
@@ -2264,25 +2555,24 @@ class WindowsPhysicalDevice(BlockDevice):
         )
         if not _nt_success(status):
             dos = int(ntdll.RtlNtStatusToDosError(status))
-            raise IoError(
+            # A failed status with bytes transferred is still a partial write.
+            error_cls = PostWriteError if int(iosb.Information) else IoError
+            raise error_cls(
                 "NtWriteFile 실패 "
                 f"offset={absolute_offset} len={len(data)} "
                 f"NTSTATUS={_nt_status_hex(status)} (Win32 {dos})",
                 winerr=dos,
             )
         if int(iosb.Information) != len(data):
-            raise IoError(
+            raise PostWriteError(
                 f"NtWriteFile 짧은 쓰기 offset={absolute_offset} "
                 f"{int(iosb.Information)}/{len(data)}",
                 winerr=23,
             )
 
-        verify = self._read_at(absolute_offset, len(data))
-        if verify != data:
-            raise IoError(
-                f"NtWriteFile read-back 검증 실패 offset={absolute_offset} len={len(data)}",
-                winerr=23,
-            )
+        # Read-back alone can be served from a cache; it never replaces a flush.
+        _nt_flush_checked(self._nt_handle, f"{_nt_native_path(self.path)} offset={absolute_offset}")
+        self._verify_readback(absolute_offset, data, "NtWriteFile")
         LOG.warning(
             "Win32 raw write 우회: NtWriteFile 성공 offset=%s len=%s",
             absolute_offset,
@@ -2317,6 +2607,64 @@ class WindowsPhysicalDevice(BlockDevice):
         ):
             return sense
         return None
+
+    @staticmethod
+    def _scsi_write_error(what: str, status: int, parsed: tuple[int, int, int]) -> IoError:
+        """Build the error for a non-GOOD WRITE(10).
+
+        Executed-write sense keys are post-write. Sense keys that mean the
+        command was rejected before its data phase stay plain IoError. Anything
+        else (notably sense key 0 "no sense" with a failing status) gives no
+        evidence either way and is reported as UncertainWriteError: a
+        conservative stop unless the caller can prove the range is untouched.
+        """
+        detail = (
+            f"{what} 장치 오류 "
+            f"status=0x{status:02X} "
+            f"sense=0x{parsed[0]:X}/0x{parsed[1]:02X}/0x{parsed[2]:02X}"
+        )
+        if parsed[0] in SCSI_SENSE_WRITE_EXECUTED:
+            exc: IoError = PostWriteError(detail, winerr=5)
+        elif parsed[0] in SCSI_SENSE_WRITE_NOT_EXECUTED:
+            exc = IoError(detail, winerr=5)
+        else:
+            exc = UncertainWriteError(
+                detail + " — 데이터 전송 여부 판단 불가로 보수적으로 중단(재시도 금지)",
+                winerr=5,
+            )
+        exc.scsi_sense = parsed
+        return exc
+
+    @staticmethod
+    def _scsi_ioctl_error(
+        what: str,
+        lba: int,
+        blocks: int,
+        err: int,
+        sense: bytes = b"",
+    ) -> IoError:
+        """Build the error for a failed WRITE(10) DeviceIoControl call.
+
+        Timeout / I/O-device errors mean the command was in flight (post-write).
+        Any other Win32 code proves nothing by itself: access denied and
+        invalid-parameter are returned both before an SRB exists and after the
+        device has already taken the command. A recorded sense buffer is the
+        only pre-transport proof accepted here; without one the failure is
+        UncertainWriteError.
+        """
+        detail = f"{what} 실패 lba={lba} blocks={blocks} (Win32 {err})"
+        if err in SCSI_WRITE_IN_FLIGHT_ERRORS:
+            return PostWriteError(detail, winerr=err)
+        if sense and (sense[0] & 0x7F) in (0x70, 0x71, 0x72, 0x73):
+            exc = WindowsPhysicalDevice._scsi_write_error(
+                what, 0x02, WindowsPhysicalDevice._parse_scsi_sense(sense)
+            )
+            exc.winerr = err or exc.winerr
+            return exc
+        return UncertainWriteError(
+            detail + " — 데이터 전송 여부 판단 불가로 보수적으로 중단(재시도 금지)",
+            winerr=err,
+        )
 
     @staticmethod
     def _scsi_field_unsupported(exc: BaseException) -> bool:
@@ -2396,7 +2744,7 @@ class WindowsPhysicalDevice(BlockDevice):
 
         return False, None, f"{label} Win32={err}"
 
-    def _scsi_synchronize_cache(self) -> None:
+    def _scsi_synchronize_cache(self, os_flush_ok: bool = True) -> None:
         """Flush plain WRITE(10) cache when the bridge supports that command.
 
         Some SD/MMC USB readers legitimately expose WRITE(10) but not
@@ -2404,6 +2752,14 @@ class WindowsPhysicalDevice(BlockDevice):
         operation into EIO. Prefer FUA writes; if both FUA and cache-sync are not
         implemented by the bridge, use serialized command-completion mode and
         report the compatibility choice once.
+
+        os_flush_ok tells whether the Windows-level flush succeeded. When it
+        failed the dirty marker is never cleared, even if SYNCHRONIZE CACHE
+        succeeds: the device cache is empty, but data still held in a Windows
+        file-object cache never reached the device. (Clearing would only be
+        sound for handles opened FILE_FLAG_NO_BUFFERING|WRITE_THROUGH, and the
+        handles flushed here are not.) Without SYNCHRONIZE CACHE the Windows
+        flush is the only barrier, so its failure is raised here too.
         """
         from ext4lib.debuglog import LOG
 
@@ -2413,6 +2769,11 @@ class WindowsPhysicalDevice(BlockDevice):
             # Capability was already learned. Plain WRITE(10) on these simple
             # removable bridges is serialized by BOT; avoid repeating a command
             # the device has explicitly rejected as unsupported.
+            if not os_flush_ok:
+                raise PostWriteError(
+                    "SCSI SYNCHRONIZE CACHE 미지원 장치에서 Windows flush도 실패했습니다.",
+                    winerr=ERROR_WRITE_FAULT,
+                )
             self._scsi_dirty = False
             return
 
@@ -2423,7 +2784,8 @@ class WindowsPhysicalDevice(BlockDevice):
             ok, _sense, label = result
             if ok:
                 self._scsi_sync_cache_supported = True
-                self._scsi_dirty = False
+                if os_flush_ok:
+                    self._scsi_dirty = False
                 LOG.debug("SCSI SYNCHRONIZE CACHE(10) %s 성공", label)
                 return
 
@@ -2435,6 +2797,11 @@ class WindowsPhysicalDevice(BlockDevice):
         )
         if unsupported:
             self._scsi_sync_cache_supported = False
+            if not os_flush_ok:
+                raise PostWriteError(
+                    "SCSI SYNCHRONIZE CACHE 미지원 장치에서 Windows flush도 실패했습니다.",
+                    winerr=ERROR_WRITE_FAULT,
+                )
             self._scsi_dirty = False
             LOG.info(
                 "SCSI cache-sync 명령 미지원 장치 — 반복 오류 없이 "
@@ -2443,7 +2810,8 @@ class WindowsPhysicalDevice(BlockDevice):
             return
 
         details = " | ".join(detail for _ok, _sense, detail in results)
-        raise IoError("SCSI SYNCHRONIZE CACHE(10) 실패: " + details, winerr=31)
+        # Only reached while plain WRITE(10) data is dirty: always post-write.
+        raise PostWriteError("SCSI SYNCHRONIZE CACHE(10) 실패: " + details, winerr=31)
 
     def _note_scsi_write(self, length: int) -> None:
         """Keep high-frequency SCSI traffic out of the normal GUI log."""
@@ -2517,27 +2885,21 @@ class WindowsPhysicalDevice(BlockDevice):
         )
         err = ctypes.get_last_error()
         if not ok:
-            raise IoError(
-                f"SCSI WRITE(10) DIRECT 실패 lba={lba} blocks={blocks} (Win32 {err})",
-                winerr=err,
+            sense = bytes(packet.raw[sense_off : sense_off + sense_len])
+            raise self._scsi_ioctl_error(
+                "SCSI WRITE(10) DIRECT", lba, blocks, err, sense
             )
 
         result = SCSI_PASS_THROUGH_DIRECT.from_buffer(packet)
         if int(result.ScsiStatus) != SCSI_STATUS_GOOD:
             sense = bytes(packet.raw[sense_off : sense_off + sense_len])
-            parsed = self._parse_scsi_sense(sense)
-            exc = IoError(
-                "SCSI WRITE(10) DIRECT 장치 오류 "
-                f"status=0x{int(result.ScsiStatus):02X} "
-                f"sense=0x{parsed[0]:X}/0x{parsed[1]:02X}/0x{parsed[2]:02X}",
-                winerr=5,
+            raise self._scsi_write_error(
+                "SCSI WRITE(10) DIRECT", int(result.ScsiStatus), self._parse_scsi_sense(sense)
             )
-            exc.scsi_sense = parsed
-            raise exc
 
-        verify = self._read_at(absolute_offset, len(data))
+        verify = self._post_write_read(absolute_offset, len(data), "SCSI WRITE(10) DIRECT")
         if verify != data:
-            raise IoError(
+            raise PostWriteError(
                 f"SCSI WRITE(10) DIRECT 검증 실패 offset={absolute_offset} len={len(data)}",
                 winerr=23,
             )
@@ -2606,27 +2968,21 @@ class WindowsPhysicalDevice(BlockDevice):
         )
         err = ctypes.get_last_error()
         if not ok:
-            raise IoError(
-                f"SCSI WRITE(10) DeviceIoControl 실패 lba={lba} blocks={blocks} (Win32 {err})",
-                winerr=err,
+            sense = bytes(packet.raw[sense_off : sense_off + sense_len])
+            raise self._scsi_ioctl_error(
+                "SCSI WRITE(10) DeviceIoControl", lba, blocks, err, sense
             )
 
         result = SCSI_PASS_THROUGH.from_buffer(packet)
         if int(result.ScsiStatus) != SCSI_STATUS_GOOD:
             sense = bytes(packet.raw[sense_off : sense_off + sense_len])
-            parsed = self._parse_scsi_sense(sense)
-            exc = IoError(
-                "SCSI WRITE(10) 장치 오류 "
-                f"status=0x{int(result.ScsiStatus):02X} "
-                f"sense=0x{parsed[0]:X}/0x{parsed[1]:02X}/0x{parsed[2]:02X}",
-                winerr=5,
+            raise self._scsi_write_error(
+                "SCSI WRITE(10)", int(result.ScsiStatus), self._parse_scsi_sense(sense)
             )
-            exc.scsi_sense = parsed
-            raise exc
 
-        verify = self._read_at(absolute_offset, len(data))
+        verify = self._post_write_read(absolute_offset, len(data), "SCSI WRITE(10)")
         if verify != data:
-            raise IoError(
+            raise PostWriteError(
                 f"SCSI WRITE(10) 검증 실패 offset={absolute_offset} len={len(data)}",
                 winerr=23,
             )
@@ -2636,64 +2992,271 @@ class WindowsPhysicalDevice(BlockDevice):
             self._scsi_dirty = True
         self._note_scsi_write(len(data))
 
+    def _post_write_read(self, absolute_offset: int, length: int, what: str) -> bytes:
+        """Read back after a completed write; any read failure is post-write."""
+        try:
+            return self._read_at(absolute_offset, length)
+        except PostWriteError:
+            raise
+        except (IoError, OSError) as exc:
+            raise PostWriteError(
+                f"{what} read-back 실패 offset={absolute_offset} len={length}: {exc}",
+                winerr=getattr(exc, "winerr", 0) or 23,
+            ) from exc
+
+    def _verify_readback(self, absolute_offset: int, data: bytes, what: str) -> None:
+        """Read back after a completed write+flush; read errors and mismatches are post-write."""
+        if self._post_write_read(absolute_offset, len(data), what) != data:
+            raise PostWriteError(
+                f"{what} read-back 검증 실패 offset={absolute_offset} len={len(data)}",
+                winerr=23,
+            )
+
+    def _read_device_unbuffered(self, absolute_offset: int, length: int) -> bytes:
+        """Read device bytes with FILE_FLAG_NO_BUFFERING.
+
+        The session handle is opened without that flag, so ReadFile on it can
+        return bytes Windows already cached. Matching that cache does not prove
+        the medium is unchanged, and must not unlock another write route.
+        """
+        ss = int(self.sector_size or 512)
+        if absolute_offset < 0 or length <= 0 or absolute_offset % ss or length % ss:
+            raise IoError(
+                f"NO_BUFFERING 읽기 정렬 오류 offset={absolute_offset} "
+                f"len={length} sector={ss}",
+                winerr=ERROR_INVALID_PARAMETER,
+            )
+        handle = kernel32.CreateFileW(
+            self.path,
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
+            None,
+        )
+        if handle == INVALID_HANDLE_VALUE or handle is None:
+            err = ctypes.get_last_error()
+            raise IoError(
+                f"NO_BUFFERING 읽기 핸들 열기 실패 path={self.path} (Win32 {err})",
+                winerr=err,
+            )
+        base = None
+        try:
+            base = kernel32.VirtualAlloc(
+                None,
+                length,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+            if not base:
+                err = ctypes.get_last_error()
+                raise IoError(
+                    f"NO_BUFFERING 읽기 버퍼 실패 (Win32 {err})",
+                    winerr=err,
+                )
+            new_pos = ctypes.c_longlong(0)
+            if not kernel32.SetFilePointerEx(
+                handle,
+                int(absolute_offset),
+                ctypes.byref(new_pos),
+                FILE_BEGIN,
+            ):
+                err = ctypes.get_last_error()
+                raise IoError(
+                    f"NO_BUFFERING 읽기 seek 실패 offset={absolute_offset} (Win32 {err})",
+                    winerr=err,
+                )
+            done = wintypes.DWORD(0)
+            kernel32.SetLastError(0)
+            ok = kernel32.ReadFile(
+                handle,
+                ctypes.c_void_p(int(base)),
+                length,
+                ctypes.byref(done),
+                None,
+            )
+            if not ok or int(done.value) != length:
+                err = ctypes.get_last_error()
+                raise IoError(
+                    f"NO_BUFFERING 읽기 실패 offset={absolute_offset} "
+                    f"{int(done.value)}/{length} (Win32 {err})",
+                    winerr=err or 23,
+                )
+            return ctypes.string_at(int(base), length)
+        finally:
+            if base:
+                kernel32.VirtualFree(base, 0, MEM_RELEASE)
+            kernel32.CloseHandle(handle)
+
+    def _scsi_pre_image(self, absolute_offset: int, length: int) -> bytes | None:
+        """Snapshot the target range before a WRITE(10) so an ambiguous failure
+        can later be proven harmless. The snapshot is an unbuffered device read;
+        a cached ReadFile is not a picture of the medium. A failed snapshot is
+        not an error by itself: it only removes that proof."""
+        from ext4lib.debuglog import LOG
+
+        try:
+            image = self._read_device_unbuffered(absolute_offset, length)
+        except (IoError, OSError) as exc:
+            LOG.debug("SCSI WRITE(10) 사전 이미지 읽기 실패 offset=%s: %s", absolute_offset, exc)
+            return None
+        return image if len(image) == length else None
+
+    def _scsi_require_untouched(
+        self,
+        absolute_offset: int,
+        data: bytes,
+        pre_image: bytes | None,
+        exc: UncertainWriteError,
+    ) -> IoError:
+        """Downgrade an uncertain WRITE(10) failure only with device proof.
+
+        Returns a plain IoError (other write routes allowed) when an unbuffered
+        read shows the range still holds exactly its pre-write content. The
+        session handle is cached, so ``_read_at`` matching the old bytes is not
+        proof. Without a pre-image, when the unbuffered read fails, or when the
+        content changed, the uncertain error is raised unchanged.
+        """
+        from ext4lib.debuglog import LOG
+
+        if pre_image is None or len(pre_image) != len(data):
+            LOG.warning(
+                "SCSI WRITE(10) 결과 판단 불가(사전 이미지 없음) — 보수적으로 중단: %s", exc
+            )
+            raise exc
+        try:
+            now = self._read_device_unbuffered(absolute_offset, len(data))
+        except (IoError, OSError) as read_exc:
+            LOG.warning(
+                "SCSI WRITE(10) 결과 판단 불가(읽기 비교 실패: %s) — 보수적으로 중단: %s",
+                read_exc,
+                exc,
+            )
+            raise exc from read_exc
+        if now != pre_image:
+            LOG.warning(
+                "SCSI WRITE(10) 실패 후 읽기 비교에서 범위가 변경됨 — "
+                "데이터가 장치에 닿았을 수 있어 중단: %s",
+                exc,
+            )
+            raise exc
+        LOG.info(
+            "SCSI WRITE(10) 실패 후 읽기 비교로 범위 미기록 확인 offset=%s len=%s — "
+            "다른 쓰기 경로를 허용합니다: %s",
+            absolute_offset,
+            len(data),
+            exc,
+        )
+        safe = IoError(f"{exc} [읽기 비교로 미기록 확인]", winerr=getattr(exc, "winerr", 5) or 5)
+        safe.scsi_sense = getattr(exc, "scsi_sense", None)
+        safe.scsi_untouched = True
+        return safe
+
+    def _scsi_write10_attempt(
+        self,
+        fn,
+        absolute_offset: int,
+        data: bytes,
+        fua: bool,
+        pre_image: bytes | None,
+    ) -> IoError | None:
+        """Run one WRITE(10) variant; None on success, else the IoError that
+        permits another attempt. PostWriteError (including an unproven
+        UncertainWriteError) propagates."""
+        try:
+            fn(absolute_offset, data, fua=fua)
+        except UncertainWriteError as exc:
+            return self._scsi_require_untouched(absolute_offset, data, pre_image, exc)
+        except PostWriteError:
+            raise
+        except IoError as exc:
+            return exc
+        return None
+
+    def _scsi_write10_variant(
+        self,
+        fn,
+        label: str,
+        absolute_offset: int,
+        data: bytes,
+        pre_image: bytes | None,
+    ) -> IoError | None:
+        """Try one IOCTL variant with FUA first, then plain WRITE(10) when the
+        FUA attempt is proven not to have touched the medium."""
+        from ext4lib.debuglog import LOG
+
+        use_fua = self._scsi_fua_supported is not False
+        error = self._scsi_write10_attempt(fn, absolute_offset, data, use_fua, pre_image)
+        if error is None or not use_fua:
+            return error
+        if self._scsi_field_unsupported(error):
+            # Explicit ILLEGAL REQUEST / invalid CDB field: the command was
+            # rejected before any data phase. Cache the verdict per device.
+            self._scsi_fua_supported = False
+            LOG.info(
+                "이 카드리더는 WRITE(10) FUA를 지원하지 않습니다(%s, ILLEGAL REQUEST). "
+                "일반 WRITE(10) 호환 모드로 자동 전환합니다.",
+                label,
+            )
+        elif self._scsi_fua_supported is None and getattr(error, "scsi_untouched", False):
+            LOG.info(
+                "%s FUA WRITE(10) 실패 후 읽기 비교로 미기록 확인 — 일반 WRITE(10)을 시도합니다.",
+                label,
+            )
+        else:
+            return error
+        plain_error = self._scsi_write10_attempt(fn, absolute_offset, data, False, pre_image)
+        if plain_error is None and self._scsi_fua_supported is None:
+            # FUA failed without touching the medium, plain WRITE(10) worked:
+            # remember so later writes skip the failing FUA probe.
+            self._scsi_fua_supported = False
+            LOG.info("FUA 미지원으로 판정(%s) — 일반 WRITE(10) 호환 모드로 전환합니다.", label)
+        return plain_error
+
     def _scsi_write10_one(self, absolute_offset: int, data: bytes) -> None:
         """Send one adaptive SCSI WRITE(10) command.
 
         Prefer FUA so successful command completion is itself the durability
         barrier. If the bridge rejects only the FUA field, remember that once
         and retry plain WRITE(10), using SYNCHRONIZE CACHE when available.
+        PostWriteError is never retried through another WRITE(10) variant. A
+        failure that proves nothing either way (no sense data, unexplained
+        DeviceIoControl error, including Win32 5 and 87) is retried only after
+        an unbuffered read shows the range still holds the snapshot taken
+        before the write. A cached ReadFile is not that proof.
         """
         from ext4lib.debuglog import LOG
 
-        use_fua = self._scsi_fua_supported is not False
-        direct_error: IoError | None = None
+        pre_image = self._scsi_pre_image(absolute_offset, len(data))
 
-        try:
-            self._scsi_write10_direct(absolute_offset, data, fua=use_fua)
+        direct_error = self._scsi_write10_variant(
+            self._scsi_write10_direct, "DIRECT", absolute_offset, data, pre_image
+        )
+        if direct_error is None:
             return
-        except IoError as exc:
-            if use_fua and self._scsi_field_unsupported(exc):
-                self._scsi_fua_supported = False
-                LOG.info(
-                    "이 카드리더는 WRITE(10) FUA를 지원하지 않습니다. "
-                    "일반 WRITE(10) 호환 모드로 자동 전환합니다."
-                )
-                try:
-                    self._scsi_write10_direct(absolute_offset, data, fua=False)
-                    return
-                except IoError as plain_exc:
-                    direct_error = plain_exc
-            else:
-                direct_error = exc
-
         LOG.debug("SCSI WRITE(10) DIRECT 경로 실패: %s", direct_error)
 
-        use_fua = self._scsi_fua_supported is not False
-        try:
-            self._scsi_write10_buffered(absolute_offset, data, fua=use_fua)
+        buffered_error = self._scsi_write10_variant(
+            self._scsi_write10_buffered, "BUFFERED", absolute_offset, data, pre_image
+        )
+        if buffered_error is None:
             return
-        except IoError as exc:
-            if use_fua and self._scsi_field_unsupported(exc):
-                self._scsi_fua_supported = False
-                LOG.info(
-                    "버퍼드 SCSI에서도 FUA 미지원 확인 — 일반 WRITE(10)으로 전환합니다."
-                )
-                self._scsi_write10_buffered(absolute_offset, data, fua=False)
-                return
-            raise IoError(
-                "SCSI WRITE(10) 경로 실패: "
-                f"DIRECT={direct_error} | BUFFERED={exc}",
-                winerr=getattr(exc, "winerr", 5) or 5,
-            ) from exc
+        raise IoError(
+            "SCSI WRITE(10) 경로 실패: "
+            f"DIRECT={direct_error} | BUFFERED={buffered_error}",
+            winerr=getattr(buffered_error, "winerr", 5) or 5,
+        ) from buffered_error
 
     def _scsi_write10(self, absolute_offset: int, data: bytes) -> None:
         """Write arbitrary aligned payloads using bridge-safe WRITE(10) chunks.
 
         Windows USBSTOR/card-reader miniports can reject a 1 MiB SCSI pass-
         through buffer with ERROR_INVALID_PARAMETER even when smaller commands
-        work. Split large filesystem writes before issuing WRITE(10), and if a
-        bridge still reports Win32 87, halve the learned transfer size and
-        retry the same unwritten range.
+        work. Split large filesystem writes before issuing WRITE(10). Win32 87
+        halves the learned transfer size only when the failed command is proven
+        not to have reached the device (sense, or an unbuffered unchanged
+        read). An unproven 87 is PostWriteError and is not retried.
         """
         from ext4lib.debuglog import LOG
 
@@ -2729,6 +3292,8 @@ class WindowsPhysicalDevice(BlockDevice):
             try:
                 self._scsi_write10_one(absolute_offset + pos, chunk)
             except IoError as exc:
+                if isinstance(exc, PostWriteError):
+                    raise
                 if getattr(exc, "winerr", 0) == 87 and n > ss:
                     new_limit = max(ss, ((n // 2) // ss) * ss)
                     if new_limit >= n:
@@ -2741,6 +3306,13 @@ class WindowsPhysicalDevice(BlockDevice):
                         new_limit,
                     )
                     continue
+                if pos:
+                    # Earlier chunks are already on the device: no other route.
+                    raise PostWriteError(
+                        f"SCSI WRITE(10) 일부만 완료 offset={absolute_offset} "
+                        f"{pos}/{len(data)}: {exc}",
+                        winerr=getattr(exc, "winerr", 0) or ERROR_WRITE_FAULT,
+                    ) from exc
                 raise
             pos += n
 
@@ -2787,7 +3359,10 @@ class WindowsPhysicalDevice(BlockDevice):
                 None,
             )
             if handle == INVALID_HANDLE_VALUE or handle is None:
-                failures.append(f"{path} open Win32={ctypes.get_last_error()}")
+                err = ctypes.get_last_error()
+                if err in DEVICE_GONE_ERRORS:
+                    raise IoError(f"{path} 장치가 분리되었습니다 (Win32 {err})", winerr=err)
+                failures.append(f"{path} open Win32={err}")
                 continue
             try:
                 _allow_extended_io(handle)
@@ -2808,13 +3383,9 @@ class WindowsPhysicalDevice(BlockDevice):
                 ok = kernel32.WriteFile(handle, buf, len(data), ctypes.byref(done), None)
                 err = ctypes.get_last_error()
                 if ok and done.value == len(data):
-                    kernel32.FlushFileBuffers(handle)
+                    _flush_handle_checked(handle, f"{path} 파티션 쓰기 offset={offset}")
                     absolute = self._partition_offset + offset
-                    if self._read_at(absolute, len(data)) != data:
-                        raise IoError(
-                            f"{path} 파티션 쓰기 read-back 검증 실패 offset={offset}",
-                            winerr=23,
-                        )
+                    self._verify_readback(absolute, data, f"{path} 파티션 쓰기")
                     LOG.warning(
                         "잠금된 hidden volume 우회: 파티션 장치 WriteFile 성공 "
                         "path=%s offset=%s len=%s",
@@ -2823,6 +3394,15 @@ class WindowsPhysicalDevice(BlockDevice):
                         len(data),
                     )
                     return
+                # A partial write outranks device-gone: bytes are on the medium.
+                if done.value:
+                    raise PostWriteError(
+                        f"{path} 파티션 쓰기 일부만 완료 offset={offset} "
+                        f"{done.value}/{len(data)} (Win32 {err})",
+                        winerr=err or ERROR_WRITE_FAULT,
+                    )
+                if err in DEVICE_GONE_ERRORS:
+                    raise IoError(f"{path} 쓰기 중 장치 분리 (Win32 {err})", winerr=err)
                 failures.append(
                     f"{path} WriteFile Win32={err} {done.value}/{len(data)}"
                 )
@@ -2851,26 +3431,29 @@ class WindowsPhysicalDevice(BlockDevice):
                     None,
                 )
                 if not _nt_success(status):
+                    if int(iosb.Information):
+                        # Bytes reached the partition: no next candidate.
+                        raise PostWriteError(
+                            f"{_nt_native_path(path)} NtWriteFile 일부만 완료 "
+                            f"offset={offset} {int(iosb.Information)}/{len(data)} "
+                            f"NTSTATUS={_nt_status_hex(status)}",
+                            winerr=ERROR_WRITE_FAULT,
+                        )
                     failures.append(
                         f"{_nt_native_path(path)} NtWriteFile "
                         f"NTSTATUS={_nt_status_hex(status)}"
                     )
                     continue
                 if int(iosb.Information) != len(data):
-                    failures.append(
-                        f"{_nt_native_path(path)} NtWriteFile short "
-                        f"{int(iosb.Information)}/{len(data)}"
-                    )
-                    continue
-
-                flush_iosb = _IO_STATUS_BLOCK()
-                ntdll.NtFlushBuffersFile(nt_handle, ctypes.byref(flush_iosb))
-                absolute = self._partition_offset + offset
-                if self._read_at(absolute, len(data)) != data:
-                    raise IoError(
-                        f"{path} Native NT 파티션 쓰기 read-back 검증 실패 offset={offset}",
+                    raise PostWriteError(
+                        f"{_nt_native_path(path)} NtWriteFile 짧은 쓰기 offset={offset} "
+                        f"{int(iosb.Information)}/{len(data)}",
                         winerr=23,
                     )
+
+                _nt_flush_checked(nt_handle, f"{_nt_native_path(path)} offset={offset}")
+                absolute = self._partition_offset + offset
+                self._verify_readback(absolute, data, f"{path} Native NT 파티션 쓰기")
                 LOG.warning(
                     "잠금된 hidden volume 우회: 파티션 장치 NtWriteFile 성공 "
                     "path=%s offset=%s len=%s",
@@ -2880,6 +3463,7 @@ class WindowsPhysicalDevice(BlockDevice):
                 )
                 return
             except IoError as exc:
+                self._raise_if_device_gone(exc)
                 failures.append(str(exc))
             finally:
                 if nt_handle is not None:
@@ -3011,8 +3595,16 @@ class WindowsPhysicalDevice(BlockDevice):
 
         self._handle = handle
         _allow_extended_io(handle)
-        size, sector = _query_geometry(handle)
+        # Same query as _open stored in self._size; GEOMETRY_EX can differ
+        # from GET_LENGTH_INFO on card readers and caused a false mismatch.
+        size, sector = _query_disk_size(handle)
         _vendor, _product, _bus, removable = _query_storage(handle)
+        old_serial = (getattr(self, "_serial", "") or "").strip().lower()
+        new_serial = _query_storage_serial(handle).strip().lower()
+        if old_serial and new_serial and old_serial != new_serial:
+            kernel32.CloseHandle(handle)
+            self._handle = None
+            raise IoError("LocalSystem 준비 중 저장장치 serial이 변경되었습니다.", winerr=1167)
         if not removable:
             kernel32.CloseHandle(handle)
             self._handle = _open_handle(self.path, True)
@@ -3157,6 +3749,17 @@ class WindowsPhysicalDevice(BlockDevice):
                 ) from usb_exc
             raise
 
+    @staticmethod
+    def _raise_if_device_gone(exc: IoError) -> None:
+        """Re-raise errors that no other write route may paper over.
+
+        That is a vanished device, and any failure after bytes may already
+        have been written (flush, short write, read-back): only errors
+        raised before the first byte allow a fallback route.
+        """
+        if isinstance(exc, PostWriteError) or getattr(exc, "winerr", 0) in DEVICE_GONE_ERRORS:
+            raise exc
+
     def _write_unbuffered_physical(self, offset: int, data: bytes) -> None:
         from ext4lib.debuglog import LOG
 
@@ -3173,6 +3776,11 @@ class WindowsPhysicalDevice(BlockDevice):
             logical,
             physical,
         )
+
+    def _write_at_flushed(self, absolute: int, data: bytes) -> None:
+        """PhysicalDrive WriteFile used as a fallback route: flush and check it."""
+        self._write_at(absolute, data)
+        _flush_handle_checked(self._handle, f"{self.path} absolute={absolute}")
 
     def _fallback_after_volume_access_denied(self, offset: int, data: bytes) -> None:
         """Retry through PhysicalDrive after the matching volume is locked.
@@ -3195,13 +3803,14 @@ class WindowsPhysicalDevice(BlockDevice):
             self._write_locked_partition_device(offset, data)
             return
         except IoError as part_exc:
+            self._raise_if_device_gone(part_exc)
             LOG.info(
                 "잠금된 파티션 장치 쓰기도 실패: %s; PhysicalDrive write 시도",
                 part_exc,
             )
 
         try:
-            self._write_at(absolute, data)
+            self._write_at_flushed(absolute, data)
             LOG.warning(
                 "볼륨 WriteFile Win32 5 우회: 잠금된 볼륨 상태에서 PhysicalDrive 쓰기 성공 "
                 "absolute=%s len=%s",
@@ -3210,6 +3819,7 @@ class WindowsPhysicalDevice(BlockDevice):
             )
             return
         except IoError as phys_exc:
+            self._raise_if_device_gone(phys_exc)
             LOG.info(
                 "잠금 후 PhysicalDrive Win32 쓰기 실패: %s; Native NT write 시도",
                 phys_exc,
@@ -3219,6 +3829,7 @@ class WindowsPhysicalDevice(BlockDevice):
             self._nt_write_at(absolute, data)
             return
         except IoError as nt_exc:
+            self._raise_if_device_gone(nt_exc)
             LOG.info(
                 "Native NT write도 실패: %s; NO_BUFFERING raw write 시도",
                 nt_exc,
@@ -3231,6 +3842,7 @@ class WindowsPhysicalDevice(BlockDevice):
             self._write_unbuffered_physical(absolute, data)
             return
         except IoError as direct_exc:
+            self._raise_if_device_gone(direct_exc)
             LOG.info(
                 "NO_BUFFERING raw write도 실패: %s; SCSI fallback 시도",
                 direct_exc,
@@ -3245,6 +3857,9 @@ class WindowsPhysicalDevice(BlockDevice):
             )
             return
         except IoError as scsi_exc:
+            # Card pulled mid-write: do not escalate to OFFLINE / LocalSystem /
+            # UsbDk, which would reopen the drive number and may hit another card.
+            self._raise_if_device_gone(scsi_exc)
             blockers = list(self._write_blockers)
             if blockers:
                 detail = " / ".join(blockers)
@@ -3262,7 +3877,7 @@ class WindowsPhysicalDevice(BlockDevice):
             offline_ok, offline_err = self._activate_whole_disk_offline()
             if offline_ok:
                 for label, writer in (
-                    ("OFFLINE PhysicalDrive WriteFile", self._write_at),
+                    ("OFFLINE PhysicalDrive WriteFile", self._write_at_flushed),
                     ("OFFLINE PhysicalDrive NtWriteFile", self._nt_write_at),
                     ("OFFLINE SCSI WRITE(10)", self._scsi_write10),
                 ):
@@ -3276,6 +3891,7 @@ class WindowsPhysicalDevice(BlockDevice):
                         )
                         return
                     except IoError as offline_exc:
+                        self._raise_if_device_gone(offline_exc)
                         LOG.warning("%s 실패: %s", label, offline_exc)
             else:
                 LOG.warning(
@@ -3303,6 +3919,12 @@ class WindowsPhysicalDevice(BlockDevice):
             )
             if not result.get("ok"):
                 system_detail = str(result.get("error") or result)
+                if result.get("post_write"):
+                    # The helper wrote but could not flush/verify: no other route.
+                    raise PostWriteError(
+                        "LocalSystem raw helper 쓰기 후 flush/검증 실패: " + system_detail,
+                        winerr=ERROR_WRITE_FAULT,
+                    ) from scsi_exc
                 if self._removable and int(self._bus_type) == 7:
                     LOG.warning(
                         "LocalSystem도 raw-write 거부: %s; UsbDk direct-USB BOT fallback 시도",
@@ -3320,7 +3942,7 @@ class WindowsPhysicalDevice(BlockDevice):
                     except Exception as usb_exc:
                         from ext4lib.windows.usbdk_setup import UsbDkRequiredError
 
-                        if isinstance(usb_exc, UsbDkRequiredError):
+                        if isinstance(usb_exc, (UsbDkRequiredError, PostWriteError)):
                             raise
                         raise IoError(
                             "LocalSystem raw helper 실패: "
@@ -3335,7 +3957,14 @@ class WindowsPhysicalDevice(BlockDevice):
                 ) from scsi_exc
 
             if result.get("disk_offline") and not self._disk_offline:
-                self._adopt_whole_disk_offline()
+                try:
+                    self._adopt_whole_disk_offline()
+                except Exception as exc:
+                    # The helper already wrote: no retry or other route.
+                    raise PostWriteError(
+                        f"LocalSystem raw helper 쓰기 후 OFFLINE 전환 실패: {exc}",
+                        winerr=getattr(exc, "winerr", 0) or ERROR_WRITE_FAULT,
+                    ) from exc
 
             LOG.warning(
                 "LocalSystem raw helper 성공 method=%s absolute=%s len=%s disk_offline=%s",
@@ -3344,12 +3973,7 @@ class WindowsPhysicalDevice(BlockDevice):
                 len(data),
                 bool(result.get("disk_offline")),
             )
-            verify = self._read_at(absolute, len(data))
-            if verify != data:
-                raise IoError(
-                    f"LocalSystem raw helper read-back 불일치 offset={absolute}",
-                    winerr=23,
-                )
+            self._verify_readback(absolute, data, "LocalSystem raw helper")
             return
 
     def _nt_write_volume_handle(
@@ -3382,31 +4006,25 @@ class WindowsPhysicalDevice(BlockDevice):
         )
         if not _nt_success(status):
             dos = int(ntdll.RtlNtStatusToDosError(status))
-            raise IoError(
+            error_cls = PostWriteError if int(iosb.Information) else IoError
+            raise error_cls(
                 f"{item.name} NtWriteFile 실패 offset={offset} len={len(data)} "
                 f"NTSTATUS={_nt_status_hex(status)} (Win32 {dos})",
                 winerr=dos,
             )
         if int(iosb.Information) != len(data):
-            raise IoError(
+            raise PostWriteError(
                 f"{item.name} NtWriteFile 짧은 쓰기 offset={offset} "
                 f"{int(iosb.Information)}/{len(data)}",
                 winerr=23,
             )
 
-        flush_iosb = _IO_STATUS_BLOCK()
-        ntdll.NtFlushBuffersFile(
-            wintypes.HANDLE(item.handle),
-            ctypes.byref(flush_iosb),
+        _nt_flush_checked(
+            wintypes.HANDLE(item.handle), f"{item.name} offset={offset} len={len(data)}"
         )
 
         absolute = self._partition_offset + int(offset)
-        verify = self._read_at(absolute, len(data))
-        if verify != data:
-            raise IoError(
-                f"{item.name} NtWriteFile read-back 검증 실패 offset={offset} len={len(data)}",
-                winerr=23,
-            )
+        self._verify_readback(absolute, data, f"{item.name} NtWriteFile")
         LOG.warning(
             "숨은 볼륨 Native NT write 성공 path=%s offset=%s len=%s",
             item.name,
@@ -3422,41 +4040,57 @@ class WindowsPhysicalDevice(BlockDevice):
             # for every 512-byte or 4-KiB filesystem write.
             self._fallback_after_volume_access_denied(offset, data)
             return
-        kernel32.SetLastError(0)
-        new_pos = ctypes.c_longlong(0)
-        ok = kernel32.SetFilePointerEx(
-            item.handle,
-            offset,
-            ctypes.byref(new_pos),
-            FILE_BEGIN,
-        )
-        if not ok:
-            err = ctypes.get_last_error()
-            raise IoError(
-                f"{item.name} 볼륨 오프셋 {offset} 이동 실패 (Win32 {err})",
-                winerr=err,
+        wrote_any = False
+        while data:
+            kernel32.SetLastError(0)
+            new_pos = ctypes.c_longlong(0)
+            ok = kernel32.SetFilePointerEx(
+                item.handle,
+                offset,
+                ctypes.byref(new_pos),
+                FILE_BEGIN,
             )
-        done = wintypes.DWORD(0)
-        buf = (ctypes.c_char * len(data)).from_buffer_copy(data)
-        kernel32.SetLastError(0)
-        ok = kernel32.WriteFile(item.handle, buf, len(data), ctypes.byref(done), None)
-        err = ctypes.get_last_error()
-        if not ok or done.value != len(data):
-            if err == 5:
+            if not ok:
+                err = ctypes.get_last_error()
+                error_cls = PostWriteError if wrote_any else IoError
+                raise error_cls(
+                    f"{item.name} 볼륨 오프셋 {offset} 이동 실패 (Win32 {err})",
+                    winerr=err or ERROR_WRITE_FAULT,
+                )
+            done = wintypes.DWORD(0)
+            buf = (ctypes.c_char * len(data)).from_buffer_copy(data)
+            kernel32.SetLastError(0)
+            ok = kernel32.WriteFile(item.handle, buf, len(data), ctypes.byref(done), None)
+            err = ctypes.get_last_error()
+            got = int(done.value)
+            if ok and got == len(data):
+                return
+            if ok and 0 < got < len(data):
+                # Short but successful write: continue with the remainder.
+                offset += got
+                data = data[got:]
+                wrote_any = True
+                continue
+            if not ok and err == 5 and not wrote_any and not got:
+                # Nothing reached the device yet, so another route may retry.
                 from ext4lib.debuglog import LOG
                 try:
                     self._nt_write_volume_handle(item, offset, data)
                     return
                 except IoError as nt_exc:
+                    # Flush/read-back failures after NtWriteFile propagate.
+                    self._raise_if_device_gone(nt_exc)
                     LOG.warning(
                         "숨은 볼륨 Native NT write도 실패: %s; 다른 raw 경로 시도",
                         nt_exc,
                     )
                 self._fallback_after_volume_access_denied(offset, data)
                 return
-            raise IoError(
-                f"{item.name} 볼륨 오프셋 {offset} 쓰기 실패 (Win32 {err})",
-                winerr=err,
+            error_cls = PostWriteError if wrote_any or got else IoError
+            raise error_cls(
+                f"{item.name} 볼륨 오프셋 {offset} 쓰기 실패 "
+                f"(Win32 {err}, {got}/{len(data)})",
+                winerr=err or ERROR_WRITE_FAULT,
             )
 
     def _partition_write_target(self, offset: int, length: int) -> tuple[_LockedVolume, int] | None:
@@ -3464,6 +4098,11 @@ class WindowsPhysicalDevice(BlockDevice):
         if item is None or length <= 0:
             return None
         start = self._partition_offset
+        item_start = int(getattr(item, "partition_offset", 0) or 0)
+        if item_start and item_start != start:
+            # The volume handle is relative to its own start; subtracting a
+            # different base would land the write at the wrong place.
+            return None
         end = start + self._partition_size if self._partition_size else self._size
         if offset < start or offset + length > end:
             return None
@@ -3482,16 +4121,42 @@ class WindowsPhysicalDevice(BlockDevice):
         ok = kernel32.WriteFile(self._handle, buf, len(data), ctypes.byref(done), ctypes.byref(ov))
         try:
             self._finish_overlapped(bool(ok), ov, done, f"오프셋 {offset} 쓰기")
-        except IoError:
+        except IoError as exc:
+            if int(done.value) or getattr(exc, "io_pending", False):
+                # Part of the payload completed, or the queued write failed in
+                # flight: either way bytes may already be on the device.
+                raise PostWriteError(
+                    f"{offset}에서 쓰기 일부만 완료 ({int(done.value)}/{len(data)}): {exc}",
+                    winerr=exc.winerr or ERROR_WRITE_FAULT,
+                ) from exc
             if not self._use_overlapped:
                 self._write_seek(offset, data)
                 return
             raise
-        if done.value != len(data):
-            err = ctypes.get_last_error()
-            raise IoError(f"{offset}에서 쓰기 실패 (Win32 {err}, {done.value}/{len(data)})", winerr=err)
+        got = int(done.value)
+        if got < len(data):
+            # Short but successful write: continue, as _read_at does for reads.
+            if got == 0:
+                raise IoError(
+                    f"{offset}에서 쓰기 실패 (0/{len(data)})", winerr=ERROR_WRITE_FAULT
+                )
+            try:
+                self._write_seek(offset + got, data[got:])
+            except PostWriteError:
+                raise
+            except IoError as exc:
+                raise PostWriteError(
+                    f"{offset}에서 쓰기 일부만 완료 ({got}/{len(data)}): {exc}",
+                    winerr=exc.winerr or ERROR_WRITE_FAULT,
+                ) from exc
 
     def _raw_read_once(self, offset: int, length: int) -> bytes:
+        size = int(getattr(self, "_size", 0) or 0)
+        if size and offset + length > size:
+            # Past the end of the medium reads as zeros, like ImageDevice.
+            avail = max(0, size - offset)
+            head = self._raw_read_once(offset, avail) if avail else b""
+            return head + b"\x00" * (length - avail)
         if length <= IO_CHUNK:
             return self._read_at(offset, length)
         parts: list[bytes] = []
@@ -3506,6 +4171,13 @@ class WindowsPhysicalDevice(BlockDevice):
         # When this device was opened for one selected partition, no write is
         # allowed to escape that partition. Falling back to whole-PhysicalDrive
         # I/O outside the selected range could corrupt another partition.
+        disk_size = int(getattr(self, "_size", 0) or 0)
+        if offset < 0 or (disk_size and offset + len(data) > disk_size):
+            raise IoError(
+                f"디스크 범위를 벗어난 raw write를 차단했습니다. "
+                f"offset={offset} len={len(data)} size={disk_size}",
+                winerr=ERROR_INVALID_PARAMETER,
+            )
         if self._partition_size > 0:
             start = self._partition_offset
             end = start + self._partition_size
@@ -3521,11 +4193,22 @@ class WindowsPhysicalDevice(BlockDevice):
             absolute = offset + pos
             chunk = data[pos : pos + n]
             target = self._partition_write_target(absolute, len(chunk))
-            if target is not None:
-                item, relative = target
-                self._write_volume_seek(item, relative, chunk)
-            else:
-                self._write_at(absolute, chunk)
+            try:
+                if target is not None:
+                    item, relative = target
+                    self._write_volume_seek(item, relative, chunk)
+                else:
+                    self._write_at(absolute, chunk)
+            except PostWriteError:
+                raise
+            except IoError as exc:
+                if not pos:
+                    raise
+                # Earlier chunks are already on the device: no retry may hide that.
+                raise PostWriteError(
+                    f"raw write 일부만 완료 offset={offset} {pos}/{len(data)}: {exc}",
+                    winerr=exc.winerr or ERROR_WRITE_FAULT,
+                ) from exc
             pos += n
 
     def _raw_read(self, offset: int, length: int) -> bytes:
@@ -3535,6 +4218,8 @@ class WindowsPhysicalDevice(BlockDevice):
         return self._retry(lambda: self._raw_read_once(offset, length))
 
     def _raw_write(self, offset: int, data: bytes) -> None:
+        if not self._writable:
+            raise IoError(f"{self.path} 는 읽기 전용으로 열렸습니다.", winerr=ERROR_ACCESS_DENIED)
         with self._io_lock:
             if self._usbdk is not None:
                 self._usbdk.write(offset, bytes(data))
@@ -3543,54 +4228,102 @@ class WindowsPhysicalDevice(BlockDevice):
 
     def flush(self) -> None:
         with self._io_lock:
-            if self._closed:
+            if self._closed or not getattr(self, "_writable", True):
                 return
             if self._usbdk is not None:
-                self._usbdk.flush()
+                try:
+                    self._usbdk.flush()
+                except PostWriteError:
+                    raise
+                except IoError as exc:
+                    # A flush only exists because data was already written.
+                    raise PostWriteError(
+                        f"UsbDk flush 실패: {exc}",
+                        winerr=exc.winerr or ERROR_WRITE_FAULT,
+                    ) from exc
                 return
 
-            # First drain normal Windows/native file-object buffers.
-            kernel32.FlushFileBuffers(self._handle)
+            # First drain normal Windows/native file-object buffers. Every
+            # failure is fatal: the data may still sit in a Windows cache.
+            flushes = [(self._handle, getattr(self, "path", "PhysicalDrive"))]
             if self._partition_volume is not None:
-                kernel32.FlushFileBuffers(self._partition_volume.handle)
+                flushes.append((self._partition_volume.handle, self._partition_volume.name))
+            errors: list[PostWriteError] = []
+            for handle, name in flushes:
+                try:
+                    _flush_handle_checked(handle, name)
+                except PostWriteError as exc:
+                    errors.append(exc)
             if self._nt_handle is not None:
-                iosb = _IO_STATUS_BLOCK()
-                status = ntdll.NtFlushBuffersFile(self._nt_handle, ctypes.byref(iosb))
-                if not _nt_success(status):
-                    from ext4lib.debuglog import LOG
-                    LOG.warning(
-                        "Native NT flush 실패 NTSTATUS=%s",
-                        _nt_status_hex(status),
-                    )
+                try:
+                    _nt_flush_checked(self._nt_handle, _nt_native_path(self.path))
+                except PostWriteError as exc:
+                    errors.append(exc)
 
             # Plain WRITE(10) bypasses Windows file-object caches. FUA writes
             # need no extra barrier; plain writes use cache-sync when the bridge
             # supports it and a learned compatibility path when it does not.
-            self._scsi_synchronize_cache()
+            if not errors:
+                self._scsi_synchronize_cache(os_flush_ok=True)
+                return
+            from ext4lib.debuglog import LOG
+
+            # Still push the device cache, but the dirty marker stays set and
+            # the Windows flush failure is what the caller sees.
+            try:
+                self._scsi_synchronize_cache(os_flush_ok=False)
+            except IoError as exc:
+                LOG.warning("Windows flush 실패 후 SCSI cache-sync도 실패: %s", exc)
+            raise PostWriteError(
+                " | ".join(str(exc) for exc in errors),
+                winerr=errors[0].winerr,
+            )
 
     def close(self) -> None:
         self._stop_ka.set()
         with self._io_lock:
             if self._closed:
                 return
-            self._closed = True
-            if self._usbdk is not None:
-                backend = self._usbdk
-                self._usbdk = None
+            # Flush while the volumes are still locked and the handles open;
+            # once they are released Windows may remount the partition.
+            flush_exc: BaseException | None = None
+            if self._writable:
                 try:
-                    backend.close()
-                finally:
-                    self._volume_locks = []
-                    self._partition_volume = None
-                    self._nt_handle = None
-                    self._handle = None
-                return
+                    self.flush()
+                except Exception as exc:
+                    from ext4lib.debuglog import LOG
+
+                    LOG.error("닫기 전 디스크 flush 실패 %s: %s", self.path, exc)
+                    flush_exc = exc
+            self._closed = True
+            try:
+                self._close_handles()
+            finally:
+                if flush_exc is not None:
+                    raise flush_exc
+
+    def _close_handles(self) -> None:
+        if self._usbdk is not None:
+            backend = self._usbdk
+            self._usbdk = None
+            try:
+                backend.close()
+            finally:
+                self._volume_locks = []
+                self._partition_volume = None
+                self._nt_handle = None
+                self._handle = None
+            return
+        try:
             if self._disk_offline:
                 self._restore_whole_disk_online()
-            try:
-                kernel32.CloseHandle(self._handle)
-            except Exception:
-                pass
+        finally:
+            if self._handle:
+                try:
+                    kernel32.CloseHandle(self._handle)
+                except Exception:
+                    pass
+            self._handle = None
             if self._nt_handle is not None:
                 try:
                     ntdll.NtClose(self._nt_handle)
@@ -3600,6 +4333,7 @@ class WindowsPhysicalDevice(BlockDevice):
             for item in self._volume_locks:
                 _release_locked_volume(item)
             self._volume_locks = []
+            self._partition_volume = None
 
     def __enter__(self) -> "WindowsPhysicalDevice":
         return self

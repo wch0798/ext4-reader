@@ -22,6 +22,7 @@ class WriteFallbackTests(unittest.TestCase):
         dev._usbdk = None
         dev._nt_handle = None
         dev._use_overlapped = False
+        dev._scsi_fua_supported = None
         dev._partition_volume = _LockedVolume(
             handle=999,
             name=r"\\.\HarddiskVolume27",
@@ -63,11 +64,15 @@ class WriteFallbackTests(unittest.TestCase):
         dev._scsi_write10 = scsi
 
         payload = b"x" * 4096
-        dev._fallback_after_volume_access_denied(4755456, payload)
+        with patch(
+            "ext4lib.windows.disk._flush_handle_checked",
+            lambda handle, name: calls.append(("flush", handle)),
+        ):
+            dev._fallback_after_volume_access_denied(4755456, payload)
 
         self.assertEqual(
             calls,
-            [("physical", 1048576 + 4755456, payload)],
+            [("physical", 1048576 + 4755456, payload), ("flush", 888)],
         )
 
     def test_locked_partition_device_is_first_fallback_and_stops_on_success(self):
@@ -216,6 +221,9 @@ class WriteFallbackTests(unittest.TestCase):
         with patch(
             "ext4lib.windows.system_raw.run_system_raw_write",
             side_effect=AssertionError("LocalSystem must not run after offline write succeeds"),
+        ), patch(
+            "ext4lib.windows.disk._flush_handle_checked",
+            lambda handle, name: calls.append(("flush", handle)),
         ):
             dev._fallback_after_volume_access_denied(4755456, payload)
 
@@ -225,6 +233,7 @@ class WriteFallbackTests(unittest.TestCase):
                 ("physical", 1, absolute),
                 ("offline",),
                 ("physical", 2, absolute),
+                ("flush", 888),
             ],
         )
 
