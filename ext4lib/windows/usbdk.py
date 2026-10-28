@@ -37,6 +37,8 @@ INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 CBW_SIGNATURE = 0x43425355
 CSW_SIGNATURE = 0x53425355
+# NOT READY / ILLEGAL REQUEST / UNIT ATTENTION / DATA PROTECT: not executed.
+BOT_SENSE_NOT_EXECUTED = {0x02, 0x05, 0x06, 0x07}
 SCSI_TEST_UNIT_READY = 0x00
 SCSI_REQUEST_SENSE = 0x03
 SCSI_INQUIRY = 0x12
@@ -750,10 +752,14 @@ class UsbDkBotBackend:
             cdb.ljust(16, b"\x00"),
         )
 
+        # Once the data-out phase starts the device may be writing sectors.
+        writes = bool(data_out)
+        data_sent = False
         try:
             self._api.transfer(self._redirect, self.bulk_out, cbw)
             payload = b""
             if data_out is not None and data_out:
+                data_sent = True
                 self._api.transfer(self._redirect, self.bulk_out, data_out)
             elif data_in_len:
                 payload = self._api.transfer(
@@ -764,17 +770,20 @@ class UsbDkBotBackend:
                 )
 
             csw = self._api.transfer(self._redirect, self.bulk_in, None, 13)
-        except UsbDkError:
+        except UsbDkError as exc:
+            exc.data_sent = data_sent
             self._recover_pipes()
             raise
 
         sig, csw_tag, residue, status = struct.unpack("<IIIB", csw)
         if sig != CSW_SIGNATURE or csw_tag != tag:
             self._recover_pipes()
-            raise UsbDkError(
+            err = UsbDkError(
                 f"USB BOT CSW 불일치 sig=0x{sig:08X} tag=0x{csw_tag:08X}/{tag:08X}",
                 winerr=23,
             )
+            err.data_sent = writes
+            raise err
         if status != 0:
             detail = f"status={status} residue={residue}"
             sense_key = None
@@ -803,12 +812,18 @@ class UsbDkBotBackend:
             err.sense_key = sense_key
             err.asc = asc
             err.ascq = ascq
+            # Only a command the device refused outright wrote nothing.
+            err.data_sent = writes and not (
+                status == 1 and sense_key in BOT_SENSE_NOT_EXECUTED
+            )
             raise err
         if residue:
-            raise UsbDkError(
+            err = UsbDkError(
                 f"USB BOT 데이터 residue={residue} opcode=0x{cdb[0]:02X}",
                 winerr=23,
             )
+            err.data_sent = writes and residue < transfer_len
+            raise err
         return payload
 
     def request_sense(self) -> bytes:
@@ -932,6 +947,8 @@ class UsbDkBotBackend:
                 winerr=5,
             )
 
+        from ext4lib.windows.disk import PostWriteError
+
         lba, blocks = self._check_aligned(offset, len(data))
         max_blocks = max(1, min(0xFFFF, IO_CHUNK // self.sector_size))
         done = 0
@@ -940,10 +957,25 @@ class UsbDkBotBackend:
             byte_start = done * self.sector_size
             byte_end = byte_start + n * self.sector_size
             chunk = data[byte_start:byte_end]
-            self._write_blocks(lba + done, n, chunk)
-            verify = self._read_blocks(lba + done, n)
+            try:
+                self._write_blocks(lba + done, n, chunk)
+            except IoError as exc:
+                if not done and not getattr(exc, "data_sent", False):
+                    raise
+                # Earlier chunks are already on the device: no other route.
+                raise PostWriteError(
+                    f"UsbDk direct write 일부만 완료 lba={lba} {done}/{blocks}: {exc}",
+                    winerr=getattr(exc, "winerr", 0) or 29,
+                ) from exc
+            try:
+                verify = self._read_blocks(lba + done, n)
+            except IoError as exc:
+                raise PostWriteError(
+                    f"UsbDk direct write read-back 실패 lba={lba + done} blocks={n}: {exc}",
+                    winerr=getattr(exc, "winerr", 0) or 23,
+                ) from exc
             if verify != chunk:
-                raise UsbDkError(
+                raise PostWriteError(
                     f"UsbDk direct write read-back 불일치 lba={lba + done} blocks={n}",
                     winerr=23,
                 )

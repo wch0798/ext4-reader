@@ -121,12 +121,17 @@ class ScsiDurabilityTests(unittest.TestCase):
         dev = self._device()
         dev._scsi_dirty = True
         dev._scsi_sync_cache_once = Mock(return_value=(True, None, "DIRECT"))
+        dev._handle = 11
+        k32 = Mock(**{"FlushFileBuffers.return_value": True})
 
-        dev._scsi_synchronize_cache()
+        # No Windows flush ran yet, so the device handle is flushed here too.
+        with patch.object(diskmod, "kernel32", k32):
+            dev._scsi_synchronize_cache()
 
         self.assertFalse(dev._scsi_dirty)
         self.assertTrue(dev._scsi_sync_cache_supported)
         dev._scsi_sync_cache_once.assert_called_once_with(True)
+        k32.FlushFileBuffers.assert_called_once_with(11)
 
     def test_unsupported_sync_cache_enters_compatibility_mode(self):
         dev = self._device()
@@ -137,11 +142,17 @@ class ScsiDurabilityTests(unittest.TestCase):
                 (False, (0x05, 0x24, 0x00), "BUFFERED illegal field"),
             ]
         )
+        dev._handle = 11
+        k32 = Mock(**{"FlushFileBuffers.return_value": True})
 
-        dev._scsi_synchronize_cache()
+        # Unsupported SYNCHRONIZE CACHE: FlushFileBuffers is the fallback
+        # barrier, and only its success clears the dirty marker.
+        with patch.object(diskmod, "kernel32", k32):
+            dev._scsi_synchronize_cache()
 
         self.assertFalse(dev._scsi_dirty)
         self.assertFalse(dev._scsi_sync_cache_supported)
+        k32.FlushFileBuffers.assert_called_once_with(11)
 
     def test_real_sync_cache_failure_still_fails_closed(self):
         dev = self._device()

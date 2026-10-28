@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import struct
-import time
 from dataclasses import dataclass
 
 from ext4lib.debuglog import LOG
@@ -218,7 +217,7 @@ def _truncate_orphan(vol, inode: Inode) -> None:
 
 
 def _delete_orphan(vol, inode: Inode) -> None:
-    from ext4lib.fs.writer import release_inode_blocks
+    from ext4lib.fs.writer import clear_freed_inode, release_inode_blocks
 
     if inode.ino < vol.sb.first_ino:
         raise OrphanRecoveryError(f"예약 inode {inode.ino}는 자동 삭제할 수 없습니다.")
@@ -228,13 +227,7 @@ def _delete_orphan(vol, inode: Inode) -> None:
             vol.groups[group].used_dirs -= 1
             vol.dirty_groups.add(group)
     release_inode_blocks(vol, inode)
-
-    _g, off = vol._inode_loc(inode.ino)
-    raw = bytearray(vol.sb.inode_size)
-    struct.pack_into("<I", raw, 0x14, int(time.time()) & 0xFFFFFFFF)
-    vol.write_metadata_bytes(off, bytes(raw))
-    vol._inode_cache.pop(inode.ino, None)
-    vol._extent_cache.pop(inode.ino, None)
+    clear_freed_inode(vol, inode)
     free_inode(vol, inode.ino)
 
 

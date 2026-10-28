@@ -117,6 +117,18 @@ DX_HASH_HALF_MD4_UNSIGNED = 4
 DX_HASH_TEA_UNSIGNED = 5
 DX_HASH_SIPHASH = 6
 
+# s_flags: directory hash signedness chosen by the mkfs host CPU.
+EXT2_FLAGS_SIGNED_HASH = 0x0001
+EXT2_FLAGS_UNSIGNED_HASH = 0x0002
+
+# Linux EXT4_LINK_MAX (fs/ext4/ext4.h) and e2fsck EXT2_LINK_MAX.
+# i_links_count includes '.' and each subdirectory '..', so 64998
+# subdirectories are stored as 65000. ext4_inc_count() keeps that value.
+# An indexed directory stores 1 only when the incremented count is greater
+# than this (64999 or more subdirectories, including exactly 65000).
+EXT4_LINK_MAX = 65000
+EXT2_LINK_MAX = EXT4_LINK_MAX
+
 S_IFMT = 0o170000
 S_IFSOCK = 0o140000
 S_IFLNK = 0o120000
@@ -156,6 +168,20 @@ SUPPORTED_INCOMPAT_READ = (
     | EXT4_FEATURE_INCOMPAT_INLINE_DATA
     | EXT4_FEATURE_INCOMPAT_ENCRYPT
     | EXT4_FEATURE_INCOMPAT_CASEFOLD
+)
+
+# ro_compat bits whose metadata the writer keeps consistent. Anything else
+# (quota, project, verity, ...) needs on-disk updates we do not perform.
+SUPPORTED_RO_COMPAT_WRITE = (
+    EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER
+    | EXT4_FEATURE_RO_COMPAT_LARGE_FILE
+    | EXT4_FEATURE_RO_COMPAT_BTREE_DIR
+    | EXT4_FEATURE_RO_COMPAT_HUGE_FILE
+    | EXT4_FEATURE_RO_COMPAT_GDT_CSUM
+    | EXT4_FEATURE_RO_COMPAT_DIR_NLINK
+    | EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE
+    | EXT4_FEATURE_RO_COMPAT_METADATA_CSUM
+    | EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT
 )
 
 SUPPORTED_INCOMPAT_WRITE = (

@@ -108,6 +108,19 @@ class Superblock:
         return bool(self.feature_incompat & C.EXT4_FEATURE_INCOMPAT_RECOVER)
 
     @property
+    def hash_unsigned(self) -> bool:
+        # s_flags (0x160). Linux adds 3 to a dx_root hash version <= TEA
+        # when the filesystem was made on an unsigned-char CPU.
+        flags = struct.unpack_from("<I", self.raw, 0x160)[0] if len(self.raw) >= 0x164 else 0
+        return bool(flags & C.EXT2_FLAGS_UNSIGNED_HASH)
+
+    @property
+    def strict_encoding(self) -> bool:
+        # s_encoding_flags (0x27E) bit 0, SB_ENC_STRICT_MODE_FL: casefold
+        # directories reject names that are not valid UTF-8.
+        return len(self.raw) >= 0x280 and bool(struct.unpack_from("<H", self.raw, 0x27E)[0] & 1)
+
+    @property
     def has_dir_index(self) -> bool:
         return bool(self.feature_compat & C.EXT4_FEATURE_COMPAT_DIR_INDEX)
 
@@ -156,7 +169,8 @@ class Superblock:
         struct.pack_into("<I", self.raw, 0x0C, int(self.free_blocks_count) & 0xFFFFFFFF)
         struct.pack_into("<I", self.raw, 0x10, int(self.free_inodes_count) & 0xFFFFFFFF)
         if self.has_64bit:
-            struct.pack_into("<I", self.raw, 0x154, (int(self.free_blocks_count) >> 32) & 0xFFFFFFFF)
+            # 0x154 is s_r_blocks_count_hi; s_free_blocks_count_hi is 0x158.
+            struct.pack_into("<I", self.raw, 0x158, (int(self.free_blocks_count) >> 32) & 0xFFFFFFFF)
         import time as _t
         self.wtime = int(_t.time())
         struct.pack_into("<I", self.raw, 0x30, self.wtime)
@@ -183,7 +197,7 @@ def parse_superblock(data: bytes) -> Superblock:
     blocks_lo = _u32(data, 0x04)
     blocks_hi = _u32(data, 0x150) if has64 else 0
     free_lo = _u32(data, 0x0C)
-    free_hi = _u32(data, 0x154) if has64 else 0
+    free_hi = _u32(data, 0x158) if has64 else 0
     log_bs = _u32(data, 0x18)
     block_size = C.EXT4_MIN_BLOCK_SIZE << log_bs
     inodes_per_group = _u32(data, 0x28)
@@ -234,8 +248,9 @@ def parse_superblock(data: bytes) -> Superblock:
         first_meta_bg=_u32(data, 0x104),
         mkfs_time=_u32(data, 0x108),
         journal_inum=_u32(data, 0xE0),
-        want_extra_isize=_u16(data, 0x15C) or 32,
-        min_extra_isize=_u16(data, 0x15A) or 32,
+        # s_min_extra_isize 0x15C, s_want_extra_isize 0x15E.
+        want_extra_isize=_u16(data, 0x15E) or 32,
+        min_extra_isize=_u16(data, 0x15C) or 32,
         checksum_seed=csum_seed,
         reserved_gdt_blocks=_u16(data, 0xCE),
         last_orphan=_u32(data, 0xE8),
@@ -296,29 +311,25 @@ def superblock_error_info(sb: Superblock) -> dict[str, int | str]:
         "last_func": cstr(0x1E0, 32),
     }
 
+def crc16(crc: int, data: bytes) -> int:
+    """Linux lib/crc16.c: poly 0x8005, bit-reflected (CRC-16/ARC core)."""
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+    return crc & 0xFFFF
+
+
 def _gdt_csum_old(sb: Superblock, group: int, raw: bytearray) -> int:
     """Original crc16 GDT checksum (RO_COMPAT_GDT_CSUM without metadata_csum)."""
-    # crc16-itu-t of uuid + le16(group) [+ le16(group>>16) if 64bit] + desc with csum zero
-    crc = 0xFFFF
-    poly = 0x1021
-
-    def crc16(crc: int, data: bytes) -> int:
-        for byte in data:
-            crc ^= byte << 8
-            for _ in range(8):
-                if crc & 0x8000:
-                    crc = ((crc << 1) ^ poly) & 0xFFFF
-                else:
-                    crc = (crc << 1) & 0xFFFF
-        return crc
-
-    crc = crc16(crc, sb.uuid)
-    crc = crc16(crc, struct.pack("<H", group & 0xFFFF))
-    if sb.has_64bit:
-        crc = crc16(crc, struct.pack("<H", (group >> 16) & 0xFFFF))
-    tmp = bytearray(raw)
-    struct.pack_into("<H", tmp, 0x1E, 0)
-    crc = crc16(crc, bytes(tmp))
+    # Linux ext4_group_desc_csum(): crc16(~0, uuid), le32 group, the bytes
+    # before bg_checksum, then (64bit only) the bytes after it. The checksum
+    # field is skipped, not zeroed.
+    crc = crc16(0xFFFF, sb.uuid)
+    crc = crc16(crc, struct.pack("<I", group & 0xFFFFFFFF))
+    crc = crc16(crc, bytes(raw[:0x1E]))
+    if sb.has_64bit and len(raw) > 0x20:
+        crc = crc16(crc, bytes(raw[0x20:]))
     return crc
 
 

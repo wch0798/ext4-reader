@@ -170,6 +170,8 @@ class WriteSessionStateTests(unittest.TestCase):
         sb = SimpleNamespace(
             raw=raw,
             state=C.EXT4_VALID_FS,
+            blocks_count=0,
+            free_blocks_count=0,
             write_checksum=lambda: None,
         )
         vol = Ext4Volume.__new__(Ext4Volume)
@@ -177,6 +179,7 @@ class WriteSessionStateTests(unittest.TestCase):
         vol.owns_device = False
         vol.part_offset = 1048576
         vol.sb = sb
+        vol.groups = []
         vol._data_dirty = False
         vol._write_session_active = False
         vol.commit_metadata = lambda sync=True: vol.dev.flush() if sync else None

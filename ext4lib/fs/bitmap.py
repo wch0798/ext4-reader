@@ -270,6 +270,10 @@ def _init_block_bitmap(vol, gd: GroupDesc) -> Bitmap:
         gdt_blocks = (
             vol.sb.groups_count * vol.sb.desc_size + vol.sb.block_size - 1
         ) // vol.sb.block_size
+        # Reserved GDT blocks (resize_inode) follow every backup GDT too.
+        # Linux ext4_num_base_meta_clusters() counts them; leaving them clear
+        # let file data overwrite blocks owned by the resize inode.
+        gdt_blocks += int(getattr(vol.sb, "reserved_gdt_blocks", 0) or 0)
         for b in range(start + 1, start + 1 + gdt_blocks):
             used.append(b)
     for b in used:
@@ -455,9 +459,20 @@ class AllocError(RuntimeError):
     pass
 
 
-def alloc_blocks(vol, count: int, prefer_group: int | None = None, *, metadata: bool = False) -> list[int]:
+def alloc_blocks(
+    vol,
+    count: int,
+    prefer_group: int | None = None,
+    *,
+    metadata: bool = False,
+    max_groups: int | None = None,
+) -> list[int]:
+    """Allocate ``count`` blocks. With ``max_groups`` at most that many block
+    groups are touched (bounding the bitmap/GDT blocks one JBD2 step dirties)
+    and a shorter, non-empty list may be returned."""
     if count <= 0:
         return []
+    touched = 0
     ng = vol.sb.groups_count
     if metadata:
         # Extent index blocks come from the end of the disk. Taking them from
@@ -472,6 +487,8 @@ def alloc_blocks(vol, count: int, prefer_group: int | None = None, *, metadata: 
     out: list[int] = []
     for g in order:
         if remaining <= 0:
+            break
+        if max_groups is not None and touched >= max_groups:
             break
         gd = vol.groups[g]
         if gd.free_blocks <= 0:
@@ -515,11 +532,17 @@ def alloc_blocks(vol, count: int, prefer_group: int | None = None, *, metadata: 
                 hints[g] = bit + got
         if not allocated_here:
             continue
+        touched += 1
         write_block_bitmap(vol, gd, bm)
         update_group_desc_fields(vol.sb, gd)
         vol.dirty_groups.add(g)
         vol.dirty_super = True
+    if remaining and max_groups is not None and out and touched >= max_groups:
+        return out
     if remaining:
+        # Nothing references the partial allocation yet; keeping it would
+        # leave bitmap bits e2fsck reports as "Block bitmap differences".
+        _free_phys_runs_now(vol, [(b, 1) for b in out])
         raise AllocError(f"자유 블록이 부족합니다 ({count - remaining}/{count}).")
     return out
 
@@ -530,14 +553,20 @@ def alloc_inode(vol, prefer_group: int | None = None) -> int:
     if prefer_group is not None:
         prefer_group %= ng
         order = list(range(prefer_group, ng)) + list(range(prefer_group))
+    # find_one() wraps, so a hint only skips a dense prefix of allocated
+    # inodes. A hole below it is still found once the tail has no free bit.
+    hints = getattr(vol, "_inode_alloc_hint", None)
+    if hints is None:
+        hints = {}
+        setattr(vol, "_inode_alloc_hint", hints)
     for g in order:
         gd = vol.groups[g]
         if gd.free_inodes <= 0:
             continue
         bm = read_inode_bitmap(vol, gd)
-        hint = 0
+        hint = int(hints.get(g, 0))
         if g == 0:
-            hint = max(0, vol.sb.first_ino - 1)
+            hint = max(hint, max(0, vol.sb.first_ino - 1))
         bit = bm.find_one(hint)
         if bit < 0:
             continue
@@ -556,6 +585,7 @@ def alloc_inode(vol, prefer_group: int | None = None) -> int:
         update_group_desc_fields(vol.sb, gd)
         vol.dirty_groups.add(g)
         vol.dirty_super = True
+        hints[g] = bit + 1
         return g * vol.sb.inodes_per_group + bit + 1
     raise AllocError("자유 inode가 없습니다.")
 

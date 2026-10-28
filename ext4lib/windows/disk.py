@@ -396,6 +396,16 @@ class UncertainWriteError(PostWriteError):
     """
 
 
+class VolumeLockError(IoError):
+    """A mounted volume could not be locked, dismounted or taken offline.
+
+    Writing under a live Windows mount races the filesystem cache and can
+    corrupt the medium, so the write is refused before any byte is sent.
+    Only an explicit opt-in (``allow_unlocked_volume_write=True``) bypasses
+    this; a raw disk without any mounted volume never raises it.
+    """
+
+
 def _flush_handle_checked(handle, name: str) -> None:
     """FlushFileBuffers; every failure is fatal, whatever the error code."""
     kernel32.SetLastError(0)
@@ -621,6 +631,12 @@ class _LockedVolume:
     volume_guid: str | None = None
     fve_name: str | None = None
     fve_raw: bool = False
+    dismounted: bool = False
+
+    @property
+    def secured(self) -> bool:
+        """True when lock, dismount or offline keeps Windows off this volume."""
+        return bool(self.locked or self.dismounted or self.offline)
 
 
 @dataclass
@@ -1422,13 +1438,18 @@ def _lock_volume_with_retry(handle, name: str) -> bool:
     return _lock_volume_error(handle, name) == 0
 
 
-def _secure_exclusive_access(handle, name: str) -> tuple[bool, bool, bool]:
+def _secure_exclusive_access(
+    handle, name: str, allow_unlocked: bool = False
+) -> tuple[bool, bool, bool]:
     """Lock, then dismount, then take ``name`` offline.
 
-    Returns (locked, dismounted, offline). Raises IoError, naming the volume
-    and the Win32 codes, when none of the three succeeded: writing under a
-    live mount races the Windows filesystem cache and can corrupt the card.
-    The caller still owns ``handle`` and must close it on error.
+    Returns (locked, dismounted, offline). Raises VolumeLockError, naming the
+    volume and the Win32 codes, when none of the three succeeded: writing
+    under a live mount races the Windows filesystem cache and can corrupt the
+    card. Only ``allow_unlocked=True`` (an explicit caller opt-in) turns that
+    into a logged error with (False, False, False); the write-time guard then
+    lets the write through as well. The caller still owns ``handle`` and must
+    close it on error.
     """
     from ext4lib.debuglog import LOG
 
@@ -1450,14 +1471,18 @@ def _secure_exclusive_access(handle, name: str) -> tuple[bool, bool, bool]:
     # IOCTL_VOLUME_OFFLINE is only valid after a successful dismount.
     offline_ok = _take_volume_offline(handle, name) if dismount_ok else False
     if not (lock_ok or dismount_ok or offline_ok):
-        raise IoError(
+        message = (
             f"{name} 볼륨을 잠그거나 분리할 수 없습니다 "
             f"(lock Win32 {lock_err}, dismount Win32 {dismount_err or '?'}, "
             "offline 시도 불가). 다른 프로세스"
             "(Windows 탐색기/백신/인덱서 등)가 카드를 사용 중입니다. "
-            "해당 프로그램을 닫고 다시 시도하세요.",
-            winerr=lock_err or dismount_err or ERROR_ACCESS_DENIED,
+            "해당 프로그램을 닫고 다시 시도하세요."
         )
+        if not allow_unlocked:
+            raise VolumeLockError(
+                message, winerr=lock_err or dismount_err or ERROR_ACCESS_DENIED
+            )
+        LOG.error("%s (allow_unlocked_volume_write=True: 잠금 없이 계속합니다)", message)
     return lock_ok, dismount_ok, offline_ok
 
 
@@ -1551,7 +1576,9 @@ def _is_writable_ioctl(handle) -> tuple[bool, int]:
     return False, ctypes.get_last_error()
 
 
-def _lock_volumes_for_disk(disk_index: int) -> list[_LockedVolume]:
+def _lock_volumes_for_disk(
+    disk_index: int, allow_unlocked: bool = False
+) -> list[_LockedVolume]:
     """Lock/dismount Windows volumes on this disk and keep their handles open.
 
     Windows Vista+ blocks raw PhysicalDrive writes that overlap a mounted
@@ -1610,7 +1637,9 @@ def _lock_volumes_for_disk(disk_index: int) -> list[_LockedVolume]:
                             vol, "볼륨 디스크 번호 확인", ctypes.get_last_error(), disk_index
                         )
                     if on_disk:
-                        lock_ok, _dismount_ok, offline_ok = _secure_exclusive_access(handle, vol)
+                        lock_ok, dismount_ok, offline_ok = _secure_exclusive_access(
+                            handle, vol, allow_unlocked
+                        )
                         LOG.info(
                             "Windows 볼륨 확보 %s (PhysicalDrive%s part=%s locked=%s offline=%s)",
                             vol,
@@ -1634,6 +1663,7 @@ def _lock_volumes_for_disk(disk_index: int) -> list[_LockedVolume]:
                                 partition_size=part_size,
                                 offline=offline_ok,
                                 volume_guid=_volume_guid_for_fve(name.value),
+                                dismounted=dismount_ok,
                             )
                         )
                         handle = None
@@ -1703,6 +1733,7 @@ def _open_hidden_volume_alias(
     partition_number: int,
     partition_offset: int = 0,
     partition_size: int = 0,
+    allow_unlocked: bool = False,
 ) -> _LockedVolume | None:
     """Find a matching volume through every DOS alias exposed by Windows.
 
@@ -1807,7 +1838,9 @@ def _open_hidden_volume_alias(
             )
             # Raises (and the finally below closes the handle) unless lock,
             # dismount or offline secured the volume.
-            lock_ok, _dismount_ok, offline_ok = _secure_exclusive_access(handle, path)
+            lock_ok, dismount_ok, offline_ok = _secure_exclusive_access(
+                handle, path, allow_unlocked
+            )
             _allow_extended_io(handle)
             keep = True
             extent = _query_partition_extent(handle)
@@ -1822,6 +1855,7 @@ def _open_hidden_volume_alias(
                 volume_guid=volume_guid,
                 fve_name=fve_name,
                 fve_raw=fve_ok,
+                dismounted=dismount_ok,
             )
         except IoError:
             raise
@@ -1839,6 +1873,7 @@ def _open_partition_device(
     partition_number: int,
     partition_offset: int = 0,
     partition_size: int = 0,
+    allow_unlocked: bool = False,
 ) -> _LockedVolume | None:
     """Open a partition DASD handle when Mount Manager exposes no Volume GUID."""
     from ext4lib.debuglog import LOG
@@ -1902,7 +1937,9 @@ def _open_partition_device(
                     winerr=19,
                 )
 
-            lock_ok, _dismount_ok, offline_ok = _secure_exclusive_access(handle, path)
+            lock_ok, dismount_ok, offline_ok = _secure_exclusive_access(
+                handle, path, allow_unlocked
+            )
             _allow_extended_io(handle)
 
             return _LockedVolume(
@@ -1915,6 +1952,7 @@ def _open_partition_device(
                 offline=offline_ok,
                 volume_guid=None,
                 fve_raw=False,
+                dismounted=dismount_ok,
             )
         except BaseException:
             kernel32.CloseHandle(handle)
@@ -2086,12 +2124,16 @@ class WindowsPhysicalDevice(BlockDevice):
         expected_size: int = 0,
         expected_serial: str = "",
         expected_ext_uuid: bytes | None = None,
+        allow_unlocked_volume_write: bool = False,
     ):
         from ext4lib.debuglog import LOG
 
         self.path = path
         self.sector_size = sector_size or 512
         self._writable = writable
+        # Opt-in only: write to a volume Windows still has mounted even when
+        # lock, dismount and offline all failed. Default refuses (VolumeLockError).
+        self._allow_unlocked_volume_write = bool(allow_unlocked_volume_write)
         self._io_lock = threading.RLock()
         self._closed = False
         self._stop_ka = threading.Event()
@@ -2146,7 +2188,9 @@ class WindowsPhysicalDevice(BlockDevice):
             _enable_storage_privileges()
             idx = _physical_index(path)
             if idx is not None:
-                self._volume_locks = _lock_volumes_for_disk(idx)
+                self._volume_locks = _lock_volumes_for_disk(
+                    idx, self._allow_unlocked_volume_write
+                )
                 if partition_number is not None:
                     self._partition_volume = next(
                         (
@@ -2180,6 +2224,7 @@ class WindowsPhysicalDevice(BlockDevice):
                             int(partition_number),
                             self._partition_offset,
                             self._partition_size,
+                            self._allow_unlocked_volume_write,
                         )
                         if hidden is not None:
                             self._volume_locks.append(hidden)
@@ -2200,6 +2245,7 @@ class WindowsPhysicalDevice(BlockDevice):
                                 int(partition_number),
                                 self._partition_offset,
                                 self._partition_size,
+                                self._allow_unlocked_volume_write,
                             )
                             if direct is not None:
                                 self._volume_locks.append(direct)
@@ -2336,7 +2382,8 @@ class WindowsPhysicalDevice(BlockDevice):
                 for item in self._volume_locks:
                     _release_locked_volume(item)
                 self._volume_locks = []
-                self._volume_locks = _lock_volumes_for_disk(idx)
+                allow_unlocked = getattr(self, "_allow_unlocked_volume_write", False)
+                self._volume_locks = _lock_volumes_for_disk(idx, allow_unlocked)
                 self._partition_volume = None
                 if self._partition_number is not None:
                     self._partition_volume = next(
@@ -2358,6 +2405,7 @@ class WindowsPhysicalDevice(BlockDevice):
                             int(self._partition_number),
                             self._partition_offset,
                             self._partition_size,
+                            allow_unlocked,
                         )
                         if hidden is not None:
                             self._volume_locks.append(hidden)
@@ -2368,6 +2416,7 @@ class WindowsPhysicalDevice(BlockDevice):
                             int(self._partition_number),
                             self._partition_offset,
                             self._partition_size,
+                            allow_unlocked,
                         )
                         if direct is not None:
                             self._volume_locks.append(direct)
@@ -2744,22 +2793,51 @@ class WindowsPhysicalDevice(BlockDevice):
 
         return False, None, f"{label} Win32={err}"
 
-    def _scsi_synchronize_cache(self, os_flush_ok: bool = True) -> None:
+    def _sync_cache_unsupported_fallback(self, os_flush_ok: bool | None) -> None:
+        """SYNCHRONIZE CACHE is not implemented: FlushFileBuffers is the barrier.
+
+        ``os_flush_ok`` None means no Windows flush ran yet for this dirty
+        data, so FlushFileBuffers is issued here on the device handle. False
+        means it already failed. Either failure raises (dirty stays set); only
+        a real success clears the dirty marker.
+        """
+        if os_flush_ok is None:
+            try:
+                _flush_handle_checked(
+                    self._handle, f"{getattr(self, 'path', 'PhysicalDrive')} (SYNC CACHE 미지원 폴백)"
+                )
+            except IoError as exc:
+                raise PostWriteError(
+                    "SCSI SYNCHRONIZE CACHE 미지원 장치에서 FlushFileBuffers 폴백도 "
+                    f"실패했습니다: {exc}",
+                    winerr=exc.winerr or ERROR_WRITE_FAULT,
+                ) from exc
+        elif not os_flush_ok:
+            raise PostWriteError(
+                "SCSI SYNCHRONIZE CACHE 미지원 장치에서 Windows flush도 실패했습니다.",
+                winerr=ERROR_WRITE_FAULT,
+            )
+        self._scsi_dirty = False
+
+    def _scsi_synchronize_cache(self, os_flush_ok: bool | None = None) -> None:
         """Flush plain WRITE(10) cache when the bridge supports that command.
 
         Some SD/MMC USB readers legitimately expose WRITE(10) but not
         SYNCHRONIZE CACHE(10). That capability mismatch must not turn every file
         operation into EIO. Prefer FUA writes; if both FUA and cache-sync are not
-        implemented by the bridge, use serialized command-completion mode and
-        report the compatibility choice once.
+        implemented by the bridge, fall back to FlushFileBuffers on the device
+        handle and report the compatibility choice once.
 
-        os_flush_ok tells whether the Windows-level flush succeeded. When it
-        failed the dirty marker is never cleared, even if SYNCHRONIZE CACHE
-        succeeds: the device cache is empty, but data still held in a Windows
-        file-object cache never reached the device. (Clearing would only be
-        sound for handles opened FILE_FLAG_NO_BUFFERING|WRITE_THROUGH, and the
-        handles flushed here are not.) Without SYNCHRONIZE CACHE the Windows
-        flush is the only barrier, so its failure is raised here too.
+        os_flush_ok tells whether the Windows-level flush already ran: True
+        (succeeded), False (failed) or None (not attempted; the unsupported
+        path then issues FlushFileBuffers itself). When it failed the dirty
+        marker is never cleared, even if SYNCHRONIZE CACHE succeeds: the
+        device cache is empty, but data still held in a Windows file-object
+        cache never reached the device. (Clearing would only be sound for
+        handles opened FILE_FLAG_NO_BUFFERING|WRITE_THROUGH, and the handles
+        flushed here are not.) Without SYNCHRONIZE CACHE the Windows flush is
+        the only barrier, so its failure is raised here too. The dirty marker
+        is cleared only after some flush path actually succeeded.
         """
         from ext4lib.debuglog import LOG
 
@@ -2769,12 +2847,7 @@ class WindowsPhysicalDevice(BlockDevice):
             # Capability was already learned. Plain WRITE(10) on these simple
             # removable bridges is serialized by BOT; avoid repeating a command
             # the device has explicitly rejected as unsupported.
-            if not os_flush_ok:
-                raise PostWriteError(
-                    "SCSI SYNCHRONIZE CACHE 미지원 장치에서 Windows flush도 실패했습니다.",
-                    winerr=ERROR_WRITE_FAULT,
-                )
-            self._scsi_dirty = False
+            self._sync_cache_unsupported_fallback(os_flush_ok)
             return
 
         results = []
@@ -2784,6 +2857,18 @@ class WindowsPhysicalDevice(BlockDevice):
             ok, _sense, label = result
             if ok:
                 self._scsi_sync_cache_supported = True
+                if os_flush_ok is None:
+                    # Nothing drained the Windows file-object cache yet.
+                    try:
+                        _flush_handle_checked(
+                            self._handle, getattr(self, "path", "PhysicalDrive")
+                        )
+                    except IoError as exc:
+                        raise PostWriteError(
+                            f"SCSI SYNCHRONIZE CACHE 성공 후 Windows flush 실패: {exc}",
+                            winerr=exc.winerr or ERROR_WRITE_FAULT,
+                        ) from exc
+                    os_flush_ok = True
                 if os_flush_ok:
                     self._scsi_dirty = False
                 LOG.debug("SCSI SYNCHRONIZE CACHE(10) %s 성공", label)
@@ -2797,16 +2882,11 @@ class WindowsPhysicalDevice(BlockDevice):
         )
         if unsupported:
             self._scsi_sync_cache_supported = False
-            if not os_flush_ok:
-                raise PostWriteError(
-                    "SCSI SYNCHRONIZE CACHE 미지원 장치에서 Windows flush도 실패했습니다.",
-                    winerr=ERROR_WRITE_FAULT,
-                )
-            self._scsi_dirty = False
             LOG.info(
-                "SCSI cache-sync 명령 미지원 장치 — 반복 오류 없이 "
+                "SCSI cache-sync 명령 미지원 장치 — FlushFileBuffers 폴백으로 "
                 "WRITE(10) 호환 모드로 계속합니다."
             )
+            self._sync_cache_unsupported_fallback(os_flush_ok)
             return
 
         details = " | ".join(detail for _ok, _sense, detail in results)
@@ -4032,8 +4112,23 @@ class WindowsPhysicalDevice(BlockDevice):
             len(data),
         )
 
+    def _require_secured_volume(self, item: _LockedVolume) -> None:
+        """Refuse to write through a volume handle Windows still has mounted.
+
+        Lock, dismount and offline all failed for ``item``; without the
+        explicit ``allow_unlocked_volume_write`` opt-in no byte may be sent.
+        """
+        if item.secured or getattr(self, "_allow_unlocked_volume_write", False):
+            return
+        raise VolumeLockError(
+            f"{item.name} 볼륨이 잠기지 않아(lock/dismount/offline 모두 실패) "
+            "쓰기를 중단했습니다. 볼륨을 사용하는 프로그램을 닫고 다시 시도하세요.",
+            winerr=ERROR_ACCESS_DENIED,
+        )
+
     def _write_volume_seek(self, item: _LockedVolume, offset: int, data: bytes) -> None:
         """Write relative to a locked/dismounted volume handle."""
+        self._require_secured_volume(item)
         if item.offline:
             # The route choice was already logged when the volume was taken
             # offline / the SCSI fallback became sticky. Do not emit one line

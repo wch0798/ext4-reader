@@ -75,23 +75,31 @@ class Inode:
         struct.pack_into("<I", self.raw, 0x04, size & 0xFFFFFFFF)
         struct.pack_into("<I", self.raw, 0x6C, (size >> 32) & 0xFFFFFFFF)
 
-    def set_times(self, now: int | None = None) -> None:
-        now = int(now if now is not None else time.time())
-        self.atime = self.ctime = self.mtime = now
-        struct.pack_into("<I", self.raw, 0x08, now)
-        struct.pack_into("<I", self.raw, 0x0C, now)
-        struct.pack_into("<I", self.raw, 0x10, now)
-        if self.extra_isize >= 24:
-            struct.pack_into("<I", self.raw, 0x90, now)
+    def _put_time(self, sec_off: int, extra_off: int, ts: float | int | None) -> int:
+        lo, extra, sec = encode_time(ts)
+        struct.pack_into("<I", self.raw, sec_off, lo)
+        # The *_extra word exists only when i_extra_isize covers it.
+        if self.extra_isize >= extra_off + 4 - C.EXT4_GOOD_OLD_INODE_SIZE:
+            struct.pack_into("<I", self.raw, extra_off, extra)
+        return sec
 
-    def set_atime_mtime(self, atime: int, mtime: int) -> None:
-        now = int(time.time())
-        self.atime = int(atime)
-        self.mtime = int(mtime)
-        self.ctime = now
-        struct.pack_into("<I", self.raw, 0x08, self.atime)
-        struct.pack_into("<I", self.raw, 0x10, self.mtime)
-        struct.pack_into("<I", self.raw, 0x0C, now)
+    def set_times(self, now: float | int | None = None) -> None:
+        # a/c/mtime only: i_crtime is the creation time and must not move.
+        if now is None:
+            now = time.time_ns() / 1e9
+        self.atime = self._put_time(0x08, 0x8C, now)
+        self.ctime = self._put_time(0x0C, 0x84, now)
+        self.mtime = self._put_time(0x10, 0x88, now)
+
+    def set_ctime(self) -> None:
+        self.ctime = self._put_time(0x0C, 0x84, time.time_ns() / 1e9)
+
+    def set_atime_mtime(self, atime: float | int, mtime: float | int) -> None:
+        # Windows FILETIME may be before 1970 or after 2038; encode_time()
+        # stores those with epoch bits instead of failing struct.pack.
+        self.atime = self._put_time(0x08, 0x8C, atime)
+        self.mtime = self._put_time(0x10, 0x88, mtime)
+        self.set_ctime()
 
     def set_links(self, n: int) -> None:
         self.links = n
@@ -106,6 +114,10 @@ class Inode:
         if self.flags & C.EXT4_HUGE_FILE_FL:
             self.flags &= ~C.EXT4_HUGE_FILE_FL
             struct.pack_into("<I", self.raw, 0x20, self.flags)
+
+    def set_owned_blocks(self, data_blocks: int, block_size: int) -> None:
+        # i_blocks also counts the external xattr block (i_file_acl).
+        self.set_blocks(data_blocks + (1 if self.file_acl else 0), block_size)
 
     def set_flags(self, flags: int) -> None:
         self.flags = flags
@@ -148,18 +160,41 @@ class Inode:
         return "파일"
 
 
+# Linux EXT4_INODE_CSUM_HI_EXTRA_END: i_checksum_hi ends 4 bytes into the
+# extra area, so it exists only when i_extra_isize >= 4.
+_CSUM_HI_EXTRA_END = 4
+
+
+def encode_time(ts: float | int | None) -> tuple[int, int, int]:
+    """Linux ext4_encode_extra_time(): (low 32 bits, epoch|ns<<2, seconds)."""
+    if ts is None:
+        ns_total = time.time_ns()
+    elif isinstance(ts, int):
+        ns_total = ts * 1_000_000_000
+    else:
+        ns_total = int(round(float(ts) * 1_000_000_000))
+    sec, nsec = divmod(ns_total, 1_000_000_000)
+    # Representable range is 1901-12-13 .. 2446-05-10.
+    if sec < -0x80000000:
+        sec, nsec = -0x80000000, 0
+    elif sec > 0x37FFFFFFF:
+        sec, nsec = 0x37FFFFFFF, 999_999_999
+    epoch = ((sec + 0x80000000) >> 32) & 3
+    return sec & 0xFFFFFFFF, epoch | (nsec << 2), sec
+
+
 def apply_inode_checksum(sb: Superblock, inode: Inode) -> None:
     if not sb.has_metadata_csum:
         return
     raw = inode.raw
     struct.pack_into("<H", raw, 0x7C, 0)
-    if inode.extra_isize >= 2 and len(raw) >= 0x84:
+    if inode.extra_isize >= _CSUM_HI_EXTRA_END and len(raw) >= 0x84:
         struct.pack_into("<H", raw, 0x82, 0)
     crc = crc32c(sb.csum_seed(), struct.pack("<I", inode.ino))
     crc = crc32c(crc, struct.pack("<I", inode.generation))
     crc = crc32c(crc, raw)
     struct.pack_into("<H", raw, 0x7C, crc & 0xFFFF)
-    if inode.extra_isize >= 2 and len(raw) >= 0x84:
+    if inode.extra_isize >= _CSUM_HI_EXTRA_END and len(raw) >= 0x84:
         struct.pack_into("<H", raw, 0x82, (crc >> 16) & 0xFFFF)
 
 
@@ -172,7 +207,7 @@ def inode_checksum_valid(sb: Superblock, inode: Inode) -> bool:
     stored_lo = _u16(raw, 0x7C) if len(raw) >= 0x7E else 0
     stored_hi = (
         _u16(raw, 0x82)
-        if inode.extra_isize >= 2 and len(raw) >= 0x84
+        if inode.extra_isize >= _CSUM_HI_EXTRA_END and len(raw) >= 0x84
         else None
     )
     struct.pack_into("<H", raw, 0x7C, 0)
@@ -237,15 +272,15 @@ def parse_inode(sb: Superblock, ino: int, raw: bytes) -> Inode:
 def new_inode_raw(sb: Superblock, ino: int, mode: int, uid: int = 0, gid: int = 0) -> Inode:
     raw = bytearray(sb.inode_size)
     extra = min(sb.want_extra_isize, sb.inode_size - 128)
-    now = int(time.time())
+    now_lo, now_extra, _ = encode_time(None)
     struct.pack_into("<H", raw, 0x00, mode)
     struct.pack_into("<H", raw, 0x02, uid & 0xFFFF)
     struct.pack_into("<H", raw, 0x18, gid & 0xFFFF)
     struct.pack_into("<H", raw, 0x78, (uid >> 16) & 0xFFFF)
     struct.pack_into("<H", raw, 0x7A, (gid >> 16) & 0xFFFF)
-    struct.pack_into("<I", raw, 0x08, now)
-    struct.pack_into("<I", raw, 0x0C, now)
-    struct.pack_into("<I", raw, 0x10, now)
+    struct.pack_into("<I", raw, 0x08, now_lo)
+    struct.pack_into("<I", raw, 0x0C, now_lo)
+    struct.pack_into("<I", raw, 0x10, now_lo)
     struct.pack_into("<H", raw, 0x1A, 1)
     flags = C.EXT4_EXTENTS_FL
     struct.pack_into("<I", raw, 0x20, flags)
@@ -253,8 +288,10 @@ def new_inode_raw(sb: Superblock, ino: int, mode: int, uid: int = 0, gid: int = 
     struct.pack_into("<I", raw, 0x64, gen)
     if extra:
         struct.pack_into("<H", raw, 0x80, extra)
-        if extra >= 24:
-            struct.pack_into("<I", raw, 0x90, now)
+        # *_extra words hold nanoseconds + epoch bits; 0x90 is i_crtime.
+        for off in (0x84, 0x88, 0x8C, 0x90, 0x94):
+            if extra >= off + 4 - C.EXT4_GOOD_OLD_INODE_SIZE:
+                struct.pack_into("<I", raw, off, now_lo if off == 0x90 else now_extra)
     inode = parse_inode(sb, ino, raw)
     # empty extent header
     hdr = struct.pack("<HHHHI", C.EXT4_EXT_MAGIC, 0, 4, 0, 0)

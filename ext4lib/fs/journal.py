@@ -53,6 +53,11 @@ JBD2_KNOWN_INCOMPAT = (
 
 JBD2_CRC32C_CHKSUM = 4
 
+# Smallest transaction that can still hold one bounded write step: inode,
+# superblock, a few bitmaps/GDT blocks and an extent-tree path. Linux needs at
+# least JBD2_MIN_JOURNAL_BLOCKS (1024) for the same reason.
+JOURNAL_MIN_TRANSACTION_BLOCKS = 48
+
 
 class JournalRecoveryError(RuntimeError):
     """Journal cannot be replayed safely by this implementation."""
@@ -347,32 +352,39 @@ class _JournalLog:
                 f"JBD2 data checksum 오류: disk={expected} calc=0x{crc:08X}"
             )
 
+    def tags_per_descriptor(self) -> int:
+        """Tags one descriptor block holds: the first carries the 16-byte
+        UUID, the rest set SAME_UUID; csum v2/v3 reserve a 4-byte tail."""
+        tag_bytes = self._tag_bytes()
+        space = self.fs_block_size - 12 - (4 if self.has_csum else 0)
+        if space < tag_bytes + 16:
+            raise JournalWriteError("JBD2 descriptor에 tag와 UUID를 넣을 공간이 없습니다.")
+        return 1 + (space - tag_bytes - 16) // tag_bytes
+
+    def log_blocks_for(self, nblocks: int) -> int:
+        """Journal blocks a transaction of ``nblocks`` metadata blocks uses:
+        descriptors + block copies + commit. Each transaction is checkpointed
+        before the next one starts, so no revoke block is ever needed."""
+        if nblocks <= 0:
+            return 0
+        per = self.tags_per_descriptor()
+        return nblocks + (nblocks + per - 1) // per + 1
+
     def build_descriptor(
         self, sequence: int, target_block: int, block: bytes
     ) -> tuple[bytes, bytes]:
-        """Build a one-tag descriptor and the exact journal data image.
+        """Build a one-tag descriptor and the exact journal data image."""
+        desc, stored = self.build_descriptor_tags(sequence, [(target_block, block)])
+        return desc, stored[0]
 
-        Using one descriptor per metadata block is deliberately conservative:
-        it avoids tag packing ambiguity across checksum/64-bit variants while
-        remaining fully valid JBD2. The transaction writer still batches all
-        descriptors under one commit record.
-        """
-        if len(block) != self.fs_block_size:
-            raise JournalWriteError("JBD2 metadata block size가 파일시스템 블록 크기와 다릅니다.")
-
-        stored = bytearray(block)
-        flags = JBD2_FLAG_LAST_TAG
-        if struct.unpack_from(">I", stored, 0)[0] == C.JBD2_MAGIC_NUMBER:
-            struct.pack_into(">I", stored, 0, 0)
-            flags |= JBD2_FLAG_ESCAPE
-
-        checksum = self.data_checksum(sequence, bytes(stored))
+    def build_descriptor_tags(
+        self, sequence: int, blocks: list[tuple[int, bytes]]
+    ) -> tuple[bytes, list[bytes]]:
+        """Pack up to tags_per_descriptor() tags into one descriptor block,
+        the same layout Linux jbd2_journal_commit_transaction() writes."""
+        if not blocks or len(blocks) > self.tags_per_descriptor():
+            raise JournalWriteError("JBD2 descriptor tag 개수가 올바르지 않습니다.")
         tag_bytes = self._tag_bytes()
-        tail = 4 if self.has_csum else 0
-        need = 12 + tag_bytes + 16 + tail
-        if need > self.fs_block_size:
-            raise JournalWriteError("JBD2 descriptor에 tag와 UUID를 넣을 공간이 없습니다.")
-
         desc = bytearray(self.fs_block_size)
         struct.pack_into(
             ">III",
@@ -383,25 +395,42 @@ class _JournalLog:
             sequence & 0xFFFFFFFF,
         )
         off = 12
-        lo = target_block & 0xFFFFFFFF
-        hi = (target_block >> 32) & 0xFFFFFFFF
-        if self.has_csum3:
-            struct.pack_into(">IIII", desc, off, lo, flags, hi if self.has_64bit else 0, checksum)
-        else:
-            struct.pack_into(">IHH", desc, off, lo, checksum & 0xFFFF, flags & 0xFFFF)
-            if self.has_64bit:
-                struct.pack_into(">I", desc, off + 8, hi)
-            # checksum-v2's on-disk tag length contains two historical
-            # compatibility bytes beyond the fields parsed above. The buffer is
-            # zero-filled, so advancing by _tag_bytes() produces Linux's layout.
-        off += tag_bytes
-        desc[off : off + 16] = self.info.uuid
+        images: list[bytes] = []
+        for i, (target_block, block) in enumerate(blocks):
+            if len(block) != self.fs_block_size:
+                raise JournalWriteError("JBD2 metadata block size가 파일시스템 블록 크기와 다릅니다.")
+            stored = bytearray(block)
+            flags = 0
+            if i:
+                flags |= JBD2_FLAG_SAME_UUID
+            if i == len(blocks) - 1:
+                flags |= JBD2_FLAG_LAST_TAG
+            if struct.unpack_from(">I", stored, 0)[0] == C.JBD2_MAGIC_NUMBER:
+                struct.pack_into(">I", stored, 0, 0)
+                flags |= JBD2_FLAG_ESCAPE
+            checksum = self.data_checksum(sequence, bytes(stored))
+            lo = target_block & 0xFFFFFFFF
+            hi = (target_block >> 32) & 0xFFFFFFFF
+            if self.has_csum3:
+                struct.pack_into(">IIII", desc, off, lo, flags, hi if self.has_64bit else 0, checksum)
+            else:
+                struct.pack_into(">IHH", desc, off, lo, checksum & 0xFFFF, flags & 0xFFFF)
+                if self.has_64bit:
+                    struct.pack_into(">I", desc, off + 8, hi)
+                # checksum-v2's on-disk tag length contains two historical
+                # compatibility bytes beyond the fields parsed above. The buffer is
+                # zero-filled, so advancing by _tag_bytes() produces Linux's layout.
+            off += tag_bytes
+            if not i:
+                desc[off : off + 16] = self.info.uuid
+                off += 16
+            images.append(bytes(stored))
 
         if self.has_csum:
             struct.pack_into(">I", desc, self.fs_block_size - 4, 0)
             csum = crc32c(self.csum_seed, desc)
             struct.pack_into(">I", desc, self.fs_block_size - 4, csum)
-        return bytes(desc), bytes(stored)
+        return bytes(desc), images
 
     def build_commit(self, sequence: int) -> bytes:
         block = bytearray(self.fs_block_size)
@@ -496,8 +525,10 @@ class _JournalLog:
                             f"저널 tag의 대상 블록 {target}가 EXT4 범위를 벗어납니다."
                         )
                     data_log_block = cursor
-                    data = self.read_block(data_log_block)
-                    self.verify_data_checksum(sequence, data, checksum)
+                    # Like Linux PASS_SCAN, data checksums are checked only
+                    # at replay: a power cut while the last, uncommitted
+                    # transaction was being written leaves torn data blocks
+                    # that must just be discarded with it, not fail recovery.
                     current.writes.append(
                         JournalTag(
                             target_block=target,
@@ -567,6 +598,27 @@ class JournalWriter:
         self.last_sequence = self.log.info.sequence & 0xFFFFFFFF
         self.committed = False
 
+        # Only one transaction lives in the ring at a time (it is checkpointed
+        # and the log emptied before the next one), so the whole ring minus one
+        # spare block is the hard limit. Like Linux j_max_transaction_buffers,
+        # callers aim for a quarter of the journal and commit early.
+        self.capacity = self.log.info.maxlen - self.log.info.first
+        self.max_log_blocks = self.capacity - 1
+        self.max_transaction_blocks = self._fit(max(self.capacity // 4, 1))
+        self.hard_transaction_blocks = self._fit(self.max_log_blocks)
+        if self.max_transaction_blocks < JOURNAL_MIN_TRANSACTION_BLOCKS:
+            raise JournalWriteError(
+                f"저널이 너무 작습니다: transaction 한도 {self.max_transaction_blocks}블록 "
+                f"< 최소 {JOURNAL_MIN_TRANSACTION_BLOCKS}블록 (journal {self.capacity}블록)"
+            )
+
+    def _fit(self, log_blocks: int) -> int:
+        """Most metadata blocks whose transaction fits in ``log_blocks``."""
+        n = max(0, log_blocks - 1)
+        while n > 0 and self.log.log_blocks_for(n) > log_blocks:
+            n -= 1
+        return n
+
     def _next(self, block: int) -> int:
         return self.log.next_block(block)
 
@@ -605,30 +657,37 @@ class JournalWriter:
 
         sequence = self.sequence
         start = self.head
+        # Check the size before anything reaches the journal. The superblock
+        # block is added by _declare(), so count it now.
+        sb_block = 1024 // self.log.fs_block_size
+        count = len(self.vol._metadata_overlay) + (
+            0 if sb_block in self.vol._metadata_overlay else 1
+        )
+        needed = self.log.log_blocks_for(count)
+        if needed > self.max_log_blocks:
+            raise JournalWriteError(
+                f"JBD2 transaction이 저널보다 큽니다: need={needed} capacity={self.max_log_blocks}"
+            )
+        for target in self.vol._metadata_overlay:
+            if target < 0 or target >= self.vol.sb.blocks_count:
+                raise JournalWriteError(f"JBD2 대상 블록이 EXT4 범위를 벗어났습니다: {target}")
+
         self._declare(sequence, start)
         metadata = {
             block: bytes(data)
             for block, data in sorted(self.vol._metadata_overlay.items())
         }
-        needed = len(metadata) * 2 + 1
-        capacity = self.log.info.maxlen - self.log.info.first
-        if needed >= capacity:
-            raise JournalWriteError(
-                f"JBD2 transaction이 저널보다 큽니다: need={needed} capacity={capacity}"
-            )
-        for target in metadata:
-            if target < 0 or target >= self.vol.sb.blocks_count:
-                raise JournalWriteError(f"JBD2 대상 블록이 EXT4 범위를 벗어났습니다: {target}")
 
         cursor = start
-        for target, home_image in metadata.items():
-            descriptor, journal_image = self.log.build_descriptor(
-                sequence, target, home_image
-            )
+        items = list(metadata.items())
+        per = self.log.tags_per_descriptor()
+        for i in range(0, len(items), per):
+            descriptor, images = self.log.build_descriptor_tags(sequence, items[i : i + per])
             self._write_log_block(cursor, descriptor)
             cursor = self._next(cursor)
-            self._write_log_block(cursor, journal_image)
-            cursor = self._next(cursor)
+            for journal_image in images:
+                self._write_log_block(cursor, journal_image)
+                cursor = self._next(cursor)
 
         # Descriptor + metadata copies must be durable before the commit record.
         self.vol.dev.flush()
@@ -650,6 +709,14 @@ class JournalWriter:
         self.last_sequence = sequence
         self.sequence = (sequence + 1) & 0xFFFFFFFF
         self.committed = True
+        # The checkpoint is durable, so free the log (Linux advances the tail
+        # past a checkpointed transaction). A block this transaction journaled
+        # may be freed and reused for file data before the next commit; with
+        # s_start still pointing here a crash would replay the stale copy over
+        # that data. s_start=0 also makes the whole ring free for the next one.
+        self.log.write_dynamic_super(sequence=self.sequence, start=0, head=self.head)
+        self.vol.dev.flush()
+        self.vol._data_dirty = False
         LOG.debug(
             "JBD2 write commit 완료 sequence=%s metadata_blocks=%s next_head=%s",
             sequence,

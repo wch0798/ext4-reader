@@ -439,6 +439,54 @@ class Ext4Volume:
                 self.dev.flush()
                 self._data_dirty = False
 
+    def journal_pending_blocks(self) -> int:
+        """Metadata blocks the open JBD2 transaction holds if committed now.
+
+        Counts the overlay plus what commit_metadata() still serializes:
+        dirty bitmaps, their group descriptor blocks, deferred frees and the
+        superblock.
+        """
+        blocks = set(self._metadata_overlay)
+        bs = self.sb.block_size
+        blocks.add(1024 // bs)
+        groups = set(self.dirty_groups)
+        for g in self._dirty_block_bm:
+            blocks.add(self.groups[g].block_bitmap)
+            groups.add(g)
+        for g in self._dirty_inode_bm:
+            blocks.add(self.groups[g].inode_bitmap)
+            groups.add(g)
+        first, per = self.sb.first_data_block, self.sb.blocks_per_group
+        for phys, length in self._pending_block_frees:
+            if length <= 0:
+                continue
+            lo = max(0, (phys - first) // per)
+            hi = min(self.sb.groups_count - 1, (phys + length - 1 - first) // per)
+            for g in range(lo, hi + 1):
+                blocks.add(self.groups[g].block_bitmap)
+                groups.add(g)
+        gdt = self.sb.first_data_block + 1
+        for g in groups:
+            blocks.add(gdt + (g * self.sb.desc_size) // bs)
+        return len(blocks)
+
+    def journal_transaction_limit(self) -> int | None:
+        writer = self._journal_writer
+        return None if writer is None else writer.max_transaction_blocks
+
+    def journal_reserve(self, credits: int) -> None:
+        """Make room for a step that may dirty ``credits`` more metadata blocks.
+
+        Like jbd2 start_this_handle(): when the open transaction plus this
+        step would pass the limit, commit and checkpoint it first. Call only
+        where the metadata on disk plus the overlay is self-consistent.
+        """
+        writer = self._journal_writer
+        if writer is None:
+            return
+        if self.journal_pending_blocks() + credits > writer.max_transaction_blocks:
+            self.commit_metadata(sync=True)
+
     def flush_metadata(self) -> None:
         """Durably commit pending metadata without closing the mount session.
 
@@ -464,6 +512,17 @@ class Ext4Volume:
         if not self.dev.writable:
             raise Ext4Error("쓰기 세션을 시작하려면 장치를 쓰기 가능으로 열어야 합니다.")
 
+        # Validate the journal (including "too small for one bounded write
+        # step") before anything is changed, so a refusal writes nothing.
+        writer = None
+        if getattr(self.sb, "has_journal", False):
+            try:
+                from ext4lib.fs.journal import JournalWriteError, JournalWriter
+
+                writer = JournalWriter(self)
+            except JournalWriteError as exc:
+                raise Ext4Error(f"JBD2 쓰기 저널을 시작할 수 없습니다: {exc}") from exc
+
         # s_free_blocks_count is only an aggregate cache.  If an earlier crash
         # or buggy writer left it stale, using it as the allocation baseline
         # can underflow during a perfectly valid large copy.  Group descriptor
@@ -479,15 +538,6 @@ class Ext4Volume:
             )
             self.sb.free_blocks_count = group_free
             self.dirty_super = True
-
-        writer = None
-        if getattr(self.sb, "has_journal", False):
-            try:
-                from ext4lib.fs.journal import JournalWriteError, JournalWriter
-
-                writer = JournalWriter(self)
-            except JournalWriteError as exc:
-                raise Ext4Error(f"JBD2 쓰기 저널을 시작할 수 없습니다: {exc}") from exc
 
         self._journal_writer = writer
         if writer is None:
@@ -1116,16 +1166,30 @@ class Ext4Volume:
             reasons.append("META_BG 레이아웃은 쓰기를 지원하지 않습니다.")
         if unknown & C.EXT4_FEATURE_INCOMPAT_MMP:
             reasons.append("다중 마운트 보호(MMP)가 켜져 있습니다.")
+        if unknown & C.EXT4_FEATURE_INCOMPAT_LARGEDIR:
+            reasons.append("large_dir(3단계 HTREE) 파일시스템은 쓰기를 지원하지 않습니다.")
+        if unknown & C.EXT4_FEATURE_INCOMPAT_EA_INODE:
+            reasons.append("ea_inode(큰 확장 속성) 파일시스템은 쓰기를 지원하지 않습니다.")
         if self.sb.state & C.EXT4_ERROR_FS:
             reasons.append("EXT4 슈퍼블록에 파일시스템 오류 상태가 기록되어 있습니다.")
         if self.sb.feature_ro_compat & C.EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT:
             reasons.append("EXT4 orphan file 정리가 필요합니다.")
         if getattr(self.sb, "last_orphan", 0):
             reasons.append("EXT4 legacy orphan list 정리가 필요합니다.")
+        if getattr(self.sb, "feature_compat", 0) & C.EXT4_FEATURE_COMPAT_SPARSE_SUPER2:
+            # Backups live only in s_backup_bgs; the sparse_super layout the
+            # allocator assumes would mis-mark BLOCK_UNINIT groups.
+            reasons.append("sparse_super2 파일시스템은 쓰기를 지원하지 않습니다.")
         if self.sb.feature_ro_compat & C.EXT4_FEATURE_RO_COMPAT_BIGALLOC:
             reasons.append("bigalloc 파일시스템은 쓰기를 지원하지 않습니다.")
         if self.sb.feature_ro_compat & C.EXT4_FEATURE_RO_COMPAT_READONLY:
             reasons.append("읽기 전용으로 표시된 파일시스템입니다.")
+        ro_left = self.sb.feature_ro_compat & ~C.SUPPORTED_RO_COMPAT_WRITE
+        ro_left &= ~(C.EXT4_FEATURE_RO_COMPAT_BIGALLOC | C.EXT4_FEATURE_RO_COMPAT_READONLY)
+        if ro_left:
+            reasons.append(
+                f"쓰기를 지원하지 않는 ro_compat 기능(0x{ro_left:X}, quota/project/verity 등)이 있습니다."
+            )
         leftover = self.sb.feature_incompat & ~C.SUPPORTED_INCOMPAT_WRITE & ~C.EXT4_FEATURE_INCOMPAT_RECOVER
         leftover &= ~(
             C.EXT4_FEATURE_INCOMPAT_ENCRYPT
@@ -1133,6 +1197,8 @@ class Ext4Volume:
             | C.EXT4_FEATURE_INCOMPAT_META_BG
             | C.EXT4_FEATURE_INCOMPAT_MMP
             | C.EXT4_FEATURE_INCOMPAT_INLINE_DATA
+            | C.EXT4_FEATURE_INCOMPAT_LARGEDIR
+            | C.EXT4_FEATURE_INCOMPAT_EA_INODE
         )
         if leftover:
             reasons.append(f"알 수 없는 incompat 기능(0x{leftover:X})이 있습니다.")

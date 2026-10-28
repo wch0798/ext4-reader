@@ -22,6 +22,10 @@ set "PY="
 if exist "%LocalAppData%\Programs\Python\Python312\Ext4Reader.exe" set "PY=%LocalAppData%\Programs\Python\Python312\Ext4Reader.exe"
 if not defined PY if exist "%LocalAppData%\Programs\Python\Python312\python.exe" set "PY=%LocalAppData%\Programs\Python\Python312\python.exe"
 if not defined PY if exist "%LocalAppData%\Programs\Python\Python313\python.exe" set "PY=%LocalAppData%\Programs\Python\Python313\python.exe"
+if not defined PY if exist "C:\Python312\python.exe" set "PY=C:\Python312\python.exe"
+if not defined PY if exist "C:\Python313\python.exe" set "PY=C:\Python313\python.exe"
+if not defined PY if exist "%ProgramFiles%\Python312\python.exe" set "PY=%ProgramFiles%\Python312\python.exe"
+if not defined PY if exist "%ProgramFiles%\Python313\python.exe" set "PY=%ProgramFiles%\Python313\python.exe"
 
 if not defined PY (
   echo 설치된 Python 3.12를 찾지 못했습니다.

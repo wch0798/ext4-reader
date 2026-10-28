@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import struct
 from dataclasses import dataclass
 
@@ -79,48 +80,35 @@ def _walk_node(vol, inode: Inode, data: bytes, depth: int, entries: int, in_inod
 def walk_indirect(vol, inode: Inode) -> list[Extent]:
     """Classic ext2/3 block map -> run-length extents."""
     bs = vol.sb.block_size
+    per = bs // 4
     ptrs = struct.unpack("<15I", inode.i_block + b"\x00" * (60 - len(inode.i_block)))[:15]
-    blocks: list[int] = []
-
-    def read_ptrs(phys: int, count: int) -> list[int]:
-        if phys == 0:
-            return [0] * count
-        raw = vol.read_block(phys)
-        n = min(count, bs // 4)
-        return list(struct.unpack("<%dI" % n, raw[: n * 4]))
-
-    blocks.extend(ptrs[:12])
-    if ptrs[12]:
-        blocks.extend(read_ptrs(ptrs[12], bs // 4))
-    if ptrs[13]:
-        for mid in read_ptrs(ptrs[13], bs // 4):
-            if mid:
-                blocks.extend(read_ptrs(mid, bs // 4))
-            else:
-                blocks.extend([0] * (bs // 4))
-    if ptrs[14]:
-        for hi in read_ptrs(ptrs[14], bs // 4):
-            if not hi:
-                continue
-            for mid in read_ptrs(hi, bs // 4):
-                if mid:
-                    blocks.extend(read_ptrs(mid, bs // 4))
-
     extents: list[Extent] = []
-    logical = 0
-    i = 0
-    while i < len(blocks):
-        if blocks[i] == 0:
-            logical += 1
-            i += 1
-            continue
-        start = blocks[i]
-        run = 1
-        while i + run < len(blocks) and blocks[i + run] == start + run:
-            run += 1
-        extents.append(Extent(logical, run, start, False))
-        logical += run
-        i += run
+
+    def add(logical: int, phys: int) -> None:
+        last = extents[-1] if extents else None
+        if last and last.logical + last.length == logical and last.physical + last.length == phys:
+            last.length += 1
+        else:
+            extents.append(Extent(logical, 1, phys, False))
+
+    def walk(phys: int, depth: int, logical: int) -> None:
+        # A hole pointer (0) still covers per**depth logical blocks; callers
+        # pass the absolute start so later data keeps its true offset.
+        if phys == 0:
+            return
+        if depth == 0:
+            add(logical, phys)
+            return
+        raw = vol.read_block(phys)
+        span = per ** (depth - 1)
+        for i, child in enumerate(struct.unpack("<%dI" % per, raw[: per * 4])):
+            walk(child, depth - 1, logical + i * span)
+
+    for i in range(12):
+        walk(ptrs[i], 0, i)
+    walk(ptrs[12], 1, 12)
+    walk(ptrs[13], 2, 12 + per)
+    walk(ptrs[14], 3, 12 + per + per * per)
     return extents
 
 
@@ -163,6 +151,59 @@ def _collect_indirect_pointer_blocks(vol, inode: Inode) -> list[int]:
     add_pointer_block(ptrs[13], 2)
     add_pointer_block(ptrs[14], 3)
     return out
+
+
+def _reserve_conversion(vol, nextents: int, pointers: list[int]) -> None:
+    """The block-map -> extent conversion is one metadata update (one jbd2
+    handle). Refuse it before anything is written when it cannot fit the
+    journal, otherwise commit the open transaction first if needed."""
+    writer = getattr(vol, "_journal_writer", None)
+    if writer is None:
+        return
+    cap = _node_capacity(vol.sb.block_size, vol.sb.has_metadata_csum)
+    leaves = nextents // cap + 1
+    tree = leaves + leaves // cap + 2
+    first, per = vol.sb.first_data_block, vol.sb.blocks_per_group
+    groups = len({(b - first) // per for b in pointers}) + tree
+    credits = 2 + tree + 2 * groups  # + inode table block + superblock
+    if credits > writer.hard_transaction_blocks:
+        from ext4lib.fs.volume import Ext4Error
+
+        raise Ext4Error(
+            f"extent 변환에 필요한 메타데이터({credits}블록)가 JBD2 저널 "
+            f"({writer.hard_transaction_blocks}블록)보다 큽니다. 저널을 키우거나 Linux에서 변환하세요."
+        )
+    vol.journal_reserve(credits)
+
+
+def ensure_extent_layout(vol, inode: Inode) -> Inode:
+    """Before modifying a file/directory mapping, move inline data or a classic
+    ext2/3 block map (left by an ext3 -> ext4 conversion) to an extent tree."""
+    if inode.flags & C.EXT4_INLINE_DATA_FL:
+        from ext4lib.fs.xattr import uninline
+
+        return uninline(vol, inode)
+    if inode.uses_extents or not (inode.is_reg or inode.is_dir):
+        return inode
+    from ext4lib.fs.bitmap import free_phys_runs
+
+    exts = []
+    for ex in walk_indirect(vol, inode):
+        done = 0
+        while done < ex.length:
+            n = min(ex.length - done, C.EXT_INIT_MAX_LEN)
+            exts.append(Extent(ex.logical + done, n, ex.physical + done, False))
+            done += n
+    pointers = _collect_indirect_pointer_blocks(vol, inode)
+    _reserve_conversion(vol, len(exts), pointers)
+    inode.set_flags(inode.flags | C.EXT4_EXTENTS_FL)
+    inode.set_i_block(struct.pack("<HHHHI", C.EXT4_EXT_MAGIC, 0, 4, 0, 0) + b"\x00" * 48)
+    inode.set_owned_blocks(sum(e.length for e in exts), vol.sb.block_size)
+    inode.set_i_block(build_extent_tree(vol, inode, exts))
+    vol.write_inode(inode)
+    if pointers:
+        free_phys_runs(vol, [(block, 1) for block in pointers])
+    return inode
 
 
 def inode_allocation_blocks(vol, inode: Inode) -> set[int]:
@@ -253,7 +294,9 @@ def file_extents(vol, inode: Inode) -> list[Extent]:
         if hit is not None and hit[0] == key:
             cache.move_to_end(inode.ino)
             return hit[1]
-    if inode.uses_extents or (inode.i_block[:2] == struct.pack("<H", C.EXT4_EXT_MAGIC)):
+    if inode.flags & C.EXT4_INLINE_DATA_FL:
+        exts = []
+    elif inode.uses_extents or (inode.i_block[:2] == struct.pack("<H", C.EXT4_EXT_MAGIC)):
         exts = walk_extents(vol, inode)
     else:
         exts = walk_indirect(vol, inode)
@@ -271,6 +314,10 @@ def read_mapped(vol, inode: Inode, offset: int, length: int) -> bytes:
     """Read ``length`` bytes at file offset, holes and unwritten extents as zeros."""
     if length <= 0:
         return b""
+    if inode.flags & C.EXT4_INLINE_DATA_FL:
+        from ext4lib.fs.xattr import read_inline
+
+        return read_inline(inode, offset, length).ljust(length, b"\x00")
     from ext4lib.io.backend import IO_CHUNK
 
     bs = vol.sb.block_size
@@ -391,26 +438,119 @@ def discard_old_extent_indexes(vol, inode: Inode) -> None:
     free_phys_runs(vol, [(block, 1) for block in old])
 
 
-def _write_extent_node(vol, inode: Inode, records: list[bytes], depth: int, cap: int, allocated: list[int]) -> int:
-    from ext4lib.fs.bitmap import alloc_blocks
-
-    phys = alloc_blocks(vol, 1, metadata=True)[0]
-    allocated.append(phys)
+def _write_extent_node(vol, inode: Inode, phys: int, records: list[bytes], depth: int, cap: int, reused: bool) -> None:
     bs = vol.sb.block_size
     block = bytearray(bs)
     block[0:12] = struct.pack("<HHHHI", C.EXT4_EXT_MAGIC, len(records), cap, depth, 0)
     for i, rec in enumerate(records):
         block[12 + i * 12 : 24 + i * 12] = rec
     _extent_block_csum(vol.sb, inode.ino, inode.generation, block)
+    # An unchanged node costs no journal space.
+    if reused and bytes(vol.read_block(phys)) == bytes(block):
+        return
     (getattr(vol, "write_metadata_block", None) or vol.write_block)(phys, bytes(block))
-    return phys
 
 
-def build_extent_tree(vol, inode: Inode, extents: list[Extent]) -> bytes:
-    """Return 60-byte i_block. Grows a depth-2+ tree when one index level is not enough."""
-    old_index = _collect_index_blocks(vol, inode)
+def _tree_levels(vol, inode: Inode) -> tuple[list[list[tuple[int, int]]], bool]:
+    """(index key, block) of every extent-tree node, one list per depth with
+    leaves first, each in logical order. Leaf blocks themselves are not read.
+    The flag is False when the walk hit anything unexpected."""
+    data = inode.i_block
+    if len(data) < 12:
+        return [], True
+    magic, entries, _eh_max, depth = _header(data, 0)
+    if magic != C.EXT4_EXT_MAGIC or depth <= 0 or entries <= 0:
+        return [], True
+    levels: list[list[tuple[int, int]]] = [[] for _ in range(depth)]
+    seen: set[int] = set()
+    complete = True
+
+    def visit(node: bytes, d: int, n: int) -> None:
+        nonlocal complete
+        limit = max(0, (len(node) - 12) // 12)
+        if n > limit:
+            complete = False
+        for i in range(min(n, limit)):
+            logical, phys = _idx(node, 12 + i * 12)
+            if phys <= 0 or phys in seen:
+                complete = False
+                continue
+            seen.add(phys)
+            level = levels[d - 1]
+            if level and level[-1][0] >= logical:
+                complete = False
+            level.append((logical, phys))
+            if d - 1 > 0:
+                block = vol.read_block(phys)
+                if len(block) < 12:
+                    complete = False
+                    continue
+                magic, ent, _mx, dep = _header(block, 0)
+                if magic == C.EXT4_EXT_MAGIC and ent > 0 and dep == d - 1:
+                    visit(block, d - 1, ent)
+                else:
+                    complete = False
+
+    try:
+        visit(bytes(data), depth, entries)
+    except Exception:
+        complete = False
+    return levels, complete
+
+
+def _leaf_window(
+    extents: list[Extent], keys: list[int], dirty: tuple[int, int] | None
+) -> tuple[int, int, int, int]:
+    """Old leaves [k0, k1) and new extents [i0, i1) to repack.
+
+    Old leaf k covers logical [keys[k], keys[k+1]). A leaf whose range is
+    outside the changed window ``dirty`` (inclusive logical blocks) maps the
+    same blocks as before and is kept as is, so appending to a huge
+    fragmented file rewrites only its last leaf instead of the whole tree.
+    """
+    n_old = len(keys)
+    if dirty is None or not n_old:
+        return 0, n_old, 0, len(extents)
+    lo, hi = dirty
+    k0 = max(0, bisect.bisect_right(keys, lo) - 1)
+    k1 = max(k0 + 1, bisect.bisect_right(keys, hi))
+    starts = [ex.logical for ex in extents]
+
+    def straddles(boundary: int) -> bool:
+        i = bisect.bisect_left(starts, boundary) - 1
+        return i >= 0 and extents[i].logical + extents[i].length > boundary
+
+    # A new extent crossing a window edge (merged with its neighbour) pulls
+    # that neighbouring leaf into the window.
+    while k0 > 0 and straddles(keys[k0]):
+        k0 -= 1
+    while k1 < n_old and straddles(keys[k1]):
+        k1 += 1
+    i0 = bisect.bisect_left(starts, keys[k0]) if k0 else 0
+    i1 = bisect.bisect_left(starts, keys[k1]) if k1 < n_old else len(extents)
+    return k0, k1, i0, i1
+
+
+def build_extent_tree(
+    vol, inode: Inode, extents: list[Extent], dirty: tuple[int, int] | None = None
+) -> bytes:
+    """Return 60-byte i_block. Grows a depth-2+ tree when one index level is not enough.
+
+    Existing tree blocks are rewritten in place (journaled with the inode).
+    ``dirty`` is the inclusive logical block range whose mapping changed;
+    leaves outside it are left untouched. That bounds the metadata one write
+    step puts in a JBD2 transaction.
+    """
+    from ext4lib.fs.bitmap import alloc_blocks
+
+    levels, complete = _tree_levels(vol, inode)
+    old_blocks = [phys for level in levels for _key, phys in level]
+    if not complete:
+        # Odd old tree: build a fresh one, as before, and only free the old.
+        levels = []
     bs = vol.sb.block_size
     allocated: list[int] = []
+    tree: list[int] = []
     try:
         if len(extents) <= 4:
             body = extents_to_inode_body(extents)
@@ -418,36 +558,60 @@ def build_extent_tree(vol, inode: Inode, extents: list[Extent]) -> bytes:
             cap = _node_capacity(bs, vol.sb.has_metadata_csum)
             if cap < 2:
                 raise ValueError("블록이 너무 작아 extent 트리를 만들 수 없습니다.")
-            nodes: list[tuple[int, int]] = []
-            idx = 0
-            while idx < len(extents):
-                chunk = extents[idx : idx + cap]
-                phys = _write_extent_node(vol, inode, [_leaf_record(ex) for ex in chunk], 0, cap, allocated)
+            old_leaves = levels[0] if levels else []
+            k0, k1, i0, i1 = _leaf_window(extents, [k for k, _p in old_leaves], dirty)
+            window = extents[i0:i1]
+            chunks = [window[i : i + cap] for i in range(0, len(window), cap)]
+            reuse = [phys for _k, phys in old_leaves[k0:k1]]
+
+            # Allocate every new node up front: a failure must not leave a
+            # half-rewritten tree behind the old inode.
+            counts = [k0 + len(chunks) + len(old_leaves) - k1]
+            while counts[-1] > 4:
+                counts.append((counts[-1] + cap - 1) // cap)
+            need = max(0, len(chunks) - len(reuse))
+            for d in range(1, len(counts)):
+                have = len(levels[d]) if d < len(levels) else 0
+                need += max(0, counts[d] - have)
+            if need:
+                allocated = alloc_blocks(vol, need, metadata=True)
+            pool = list(allocated)
+
+            nodes: list[tuple[int, int]] = list(old_leaves[:k0])
+            for j, chunk in enumerate(chunks):
+                reused = j < len(reuse)
+                phys = reuse[j] if reused else pool.pop(0)
+                _write_extent_node(vol, inode, phys, [_leaf_record(ex) for ex in chunk], 0, cap, reused)
                 nodes.append((chunk[0].logical, phys))
-                idx += len(chunk)
+            nodes.extend(old_leaves[k1:])
+            tree.extend(phys for _k, phys in nodes)
+
             inode_depth = 1
             while len(nodes) > 4:
+                old_level = levels[inode_depth] if inode_depth < len(levels) else []
                 packed: list[tuple[int, int]] = []
-                cursor = 0
-                while cursor < len(nodes):
+                for j, cursor in enumerate(range(0, len(nodes), cap)):
                     chunk = nodes[cursor : cursor + cap]
-                    phys = _write_extent_node(
+                    reused = j < len(old_level)
+                    phys = old_level[j][1] if reused else pool.pop(0)
+                    _write_extent_node(
                         vol,
                         inode,
-                        [_index_record(logical, phys) for logical, phys in chunk],
+                        phys,
+                        [_index_record(logical, child) for logical, child in chunk],
                         inode_depth,
                         cap,
-                        allocated,
+                        reused,
                     )
                     packed.append((chunk[0][0], phys))
-                    cursor += len(chunk)
+                    tree.append(phys)
                 nodes = packed
                 inode_depth += 1
             body_buf = bytearray(60)
             body_buf[0:12] = struct.pack("<HHHHI", C.EXT4_EXT_MAGIC, len(nodes), 4, inode_depth, 0)
             for i, (logical, phys) in enumerate(nodes):
                 body_buf[12 + i * 12 : 24 + i * 12] = _index_record(logical, phys)
-            inode.set_blocks((inode.blocks * 512) // bs + len(allocated), bs)
+            inode.set_blocks((inode.blocks * 512) // bs + len(tree), bs)
             body = bytes(body_buf)
     except Exception:
         if allocated:
@@ -458,6 +622,6 @@ def build_extent_tree(vol, inode: Inode, extents: list[Extent]) -> bytes:
             except Exception:
                 pass
         raise
-    keep = set(allocated)
-    inode._extent_index_old = [block for block in old_index if block not in keep]
+    keep = set(tree)
+    inode._extent_index_old = [block for block in old_blocks if block not in keep]
     return body

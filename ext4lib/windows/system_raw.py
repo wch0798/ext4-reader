@@ -171,6 +171,10 @@ def run_system_raw_write(
             msg = (started.stderr or started.stdout or "").strip()
             raise IoError(f"SYSTEM helper 작업 시작 실패: {msg}", winerr=5)
 
+        # The helper is running from here on and may already have written:
+        # an unknown outcome must not let the caller try another route.
+        from ext4lib.windows.disk import PostWriteError
+
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if os.path.isfile(result_path):
@@ -178,18 +182,22 @@ def run_system_raw_write(
                     with open(result_path, "r", encoding="utf-8") as fp:
                         result = json.load(fp)
                 except (OSError, ValueError) as exc:
-                    raise IoError(f"SYSTEM helper 결과 읽기 실패: {exc}", winerr=13)
+                    raise PostWriteError(f"SYSTEM helper 결과 읽기 실패: {exc}", winerr=13)
                 if result.get("token") != token:
-                    raise IoError("SYSTEM helper 결과 토큰 불일치", winerr=5)
+                    raise PostWriteError("SYSTEM helper 결과 토큰 불일치", winerr=5)
                 return result
             time.sleep(0.1)
 
-        query = _run_hidden(
-            ["schtasks.exe", "/Query", "/TN", task_name, "/V", "/FO", "LIST"],
-            timeout=5.0,
-        )
-        detail = (query.stdout or query.stderr or "").strip()
-        raise IoError(
+        try:
+            query = _run_hidden(
+                ["schtasks.exe", "/Query", "/TN", task_name, "/V", "/FO", "LIST"],
+                timeout=5.0,
+            )
+            detail = (query.stdout or query.stderr or "").strip()
+        except Exception as exc:
+            # A failed diagnostic query must not hide the post-write timeout.
+            detail = f"query 실패: {exc}"
+        raise PostWriteError(
             "SYSTEM helper 시간 초과" + (f": {detail[-800:]}" if detail else ""),
             winerr=1460,
         )
@@ -248,7 +256,12 @@ def _duplicate_handle(parent_pid: int, source_value: int) -> int:
 
 
 def _write_win32(handle: int, offset: int, data: bytes) -> None:
-    from ext4lib.windows.disk import FILE_BEGIN, kernel32
+    from ext4lib.windows.disk import (
+        FILE_BEGIN,
+        PostWriteError,
+        _flush_handle_checked,
+        kernel32,
+    )
 
     pos = ctypes.c_longlong()
     ctypes.set_last_error(0)
@@ -273,17 +286,20 @@ def _write_win32(handle: int, offset: int, data: bytes) -> None:
     )
     err = ctypes.get_last_error()
     if not ok or done.value != len(data):
-        raise IoError(
+        error_cls = PostWriteError if done.value else IoError
+        raise error_cls(
             f"SYSTEM Win32 WriteFile 실패 offset={offset} "
             f"{done.value}/{len(data)} Win32={err}",
             winerr=err,
         )
-    kernel32.FlushFileBuffers(wintypes.HANDLE(handle))
+    _flush_handle_checked(wintypes.HANDLE(handle), f"SYSTEM handle offset={offset}")
 
 
 def _write_nt(handle: int, offset: int, data: bytes) -> None:
     from ext4lib.windows.disk import (
         _IO_STATUS_BLOCK,
+        PostWriteError,
+        _nt_flush_checked,
         _nt_status_hex,
         _nt_success,
         ntdll,
@@ -305,19 +321,20 @@ def _write_nt(handle: int, offset: int, data: bytes) -> None:
     )
     if not _nt_success(status):
         dos = int(ntdll.RtlNtStatusToDosError(status))
-        raise IoError(
+        # A failed status with bytes transferred is still a partial write.
+        error_cls = PostWriteError if int(iosb.Information) else IoError
+        raise error_cls(
             f"SYSTEM NtWriteFile 실패 offset={offset} len={len(data)} "
             f"NTSTATUS={_nt_status_hex(status)} Win32={dos}",
             winerr=dos,
         )
     if int(iosb.Information) != len(data):
-        raise IoError(
+        raise PostWriteError(
             f"SYSTEM NtWriteFile 짧은 쓰기 offset={offset} "
             f"{int(iosb.Information)}/{len(data)}",
             winerr=23,
         )
-    flush_iosb = _IO_STATUS_BLOCK()
-    ntdll.NtFlushBuffersFile(wintypes.HANDLE(handle), ctypes.byref(flush_iosb))
+    _nt_flush_checked(wintypes.HANDLE(handle), f"SYSTEM handle offset={offset}")
 
 
 def _read_win32(handle: int, offset: int, length: int) -> bytes:
@@ -352,13 +369,32 @@ def _read_win32(handle: int, offset: int, length: int) -> bytes:
     return bytes(buf.raw[:length])
 
 
+def _verify_after_write(handle: int, offset: int, data: bytes, name: str) -> None:
+    """Read back a completed write; every failure here is post-write."""
+    from ext4lib.windows.disk import PostWriteError
+
+    try:
+        got = _read_win32(handle, offset, len(data))
+    except PostWriteError:
+        raise
+    except (IoError, OSError) as exc:
+        raise PostWriteError(
+            f"{name} read-back 실패: {exc}",
+            winerr=getattr(exc, "winerr", 0) or 23,
+        ) from exc
+    if got != data:
+        raise PostWriteError(f"{name} read-back 불일치", winerr=23)
+
+
 def _execute_request(req: dict) -> dict:
     from ext4lib.windows.disk import (
         IOCTL_DISK_UPDATE_PROPERTIES,
         IOCTL_STORAGE_GET_DEVICE_NUMBER,
         STORAGE_DEVICE_NUMBER,
+        PostWriteError,
         WindowsPhysicalDevice,
         _enable_storage_privileges,
+        _flush_handle_checked,
         _ioctl,
         _nt_open_raw_handle,
         _open_handle,
@@ -425,6 +461,36 @@ def _execute_request(req: dict) -> dict:
         out_cb=ctypes.sizeof(STORAGE_DEVICE_NUMBER),
     )
     parent_dev = STORAGE_DEVICE_NUMBER.from_buffer_copy(parent_dev_raw)
+    helper_set_offline = False
+
+    def _failed(post_write: bool = False) -> dict:
+        if helper_set_offline:
+            ok_online, err_online = _set_disk_offline_state(
+                wintypes.HANDLE(physical_dup),
+                False,
+            )
+            if ok_online:
+                try:
+                    _ioctl(
+                        wintypes.HANDLE(physical_dup),
+                        IOCTL_DISK_UPDATE_PROPERTIES,
+                    )
+                except OSError:
+                    pass
+                failures.append("SYSTEM whole-disk ONLINE restore: success")
+            else:
+                failures.append(
+                    f"SYSTEM whole-disk ONLINE restore failed Win32={err_online}"
+                )
+
+        return {
+            "ok": False,
+            "error": " | ".join(failures[-14:]),
+            "failures": failures,
+            "disk_offline": False,
+            # Bytes may be on the device but not durable: no other route may retry.
+            "post_write": post_write,
+        }
 
     try:
         methods: list[tuple[str, int, int, callable]] = []
@@ -445,11 +511,12 @@ def _execute_request(req: dict) -> dict:
         for name, handle, offset, writer in methods:
             try:
                 writer(handle, offset, data)
-                if _read_win32(physical_dup, absolute_offset, len(data)) != data:
-                    raise IoError(f"{name} read-back 불일치", winerr=23)
+                _verify_after_write(physical_dup, absolute_offset, data, name)
                 return {"ok": True, "method": name, "disk_offline": False}
             except IoError as exc:
                 failures.append(f"{name}: {exc}")
+                if isinstance(exc, PostWriteError):
+                    return _failed(post_write=True)
 
         try:
             logical, physical = _write_unbuffered_raw_path(
@@ -469,8 +536,9 @@ def _execute_request(req: dict) -> dict:
             }
         except IoError as exc:
             failures.append(f"SYSTEM fresh NO_BUFFERING: {exc}")
+            if isinstance(exc, PostWriteError):
+                return _failed(post_write=True)
 
-        helper_set_offline = False
         if try_disk_offline:
             ok_offline, err_offline = _set_disk_offline_state(
                 wintypes.HANDLE(physical_dup),
@@ -503,6 +571,8 @@ def _execute_request(req: dict) -> dict:
                 }
             except IoError as exc:
                 failures.append(f"SYSTEM OFFLINE NO_BUFFERING: {exc}")
+                if isinstance(exc, PostWriteError):
+                    return _failed(post_write=True)
 
         # A duplicated handle preserves the parent's original file object.
         # Create a fresh PhysicalDrive file object as LocalSystem so drivers
@@ -535,8 +605,7 @@ def _execute_request(req: dict) -> dict:
             ]:
                 try:
                     writer(int(fresh), absolute_offset, data)
-                    if _read_win32(int(fresh), absolute_offset, len(data)) != data:
-                        raise IoError(f"{name} read-back 불일치", winerr=23)
+                    _verify_after_write(int(fresh), absolute_offset, data, name)
                     return {
                         "ok": True,
                         "method": name,
@@ -544,13 +613,14 @@ def _execute_request(req: dict) -> dict:
                     }
                 except IoError as exc:
                     failures.append(f"{name}: {exc}")
+                    if isinstance(exc, PostWriteError):
+                        return _failed(post_write=True)
 
             nt_handle = None
             try:
                 nt_handle = _nt_open_raw_handle(path)
                 _write_nt(int(nt_handle.value), absolute_offset, data)
-                if _read_win32(int(fresh), absolute_offset, len(data)) != data:
-                    raise IoError("SYSTEM fresh NT read-back 불일치", winerr=23)
+                _verify_after_write(int(fresh), absolute_offset, data, "SYSTEM fresh NT")
                 return {
                     "ok": True,
                     "method": "SYSTEM fresh-PhysicalDrive NtOpenFile/NtWriteFile",
@@ -558,6 +628,8 @@ def _execute_request(req: dict) -> dict:
                 }
             except IoError as exc:
                 failures.append(f"SYSTEM fresh NtOpenFile/NtWriteFile: {exc}")
+                if isinstance(exc, PostWriteError):
+                    return _failed(post_write=True)
             finally:
                 if nt_handle is not None:
                     ntdll.NtClose(nt_handle)
@@ -567,7 +639,19 @@ def _execute_request(req: dict) -> dict:
                 dev._handle = fresh
                 dev.sector_size = sector_size
                 dev._read_at = lambda off, length: _read_win32(int(fresh), off, length)
+                dev._scsi_dirty = False
+                dev._scsi_fua_supported = None
+                dev._scsi_sync_cache_supported = None
                 dev._scsi_write10(absolute_offset, data)
+                # Plain WRITE(10) without FUA left data in the device cache.
+                try:
+                    _flush_handle_checked(fresh, "SYSTEM fresh PhysicalDrive")
+                    dev._scsi_synchronize_cache()
+                except IoError as exc:
+                    raise PostWriteError(
+                        f"SYSTEM fresh SCSI flush: {exc}",
+                        winerr=getattr(exc, "winerr", 0) or 29,
+                    ) from exc
                 return {
                     "ok": True,
                     "method": "SYSTEM fresh SCSI WRITE(10)",
@@ -575,37 +659,20 @@ def _execute_request(req: dict) -> dict:
                 }
             except IoError as exc:
                 failures.append(f"SYSTEM fresh SCSI WRITE(10): {exc}")
+                if isinstance(exc, PostWriteError):
+                    return _failed(post_write=True)
         except IoError as exc:
             failures.append(f"SYSTEM fresh PhysicalDrive open/verify: {exc}")
         finally:
             if fresh is not None:
                 kernel32.CloseHandle(fresh)
 
-        if helper_set_offline:
-            ok_online, err_online = _set_disk_offline_state(
-                wintypes.HANDLE(physical_dup),
-                False,
-            )
-            if ok_online:
-                try:
-                    _ioctl(
-                        wintypes.HANDLE(physical_dup),
-                        IOCTL_DISK_UPDATE_PROPERTIES,
-                    )
-                except OSError:
-                    pass
-                failures.append("SYSTEM whole-disk ONLINE restore: success")
-            else:
-                failures.append(
-                    f"SYSTEM whole-disk ONLINE restore failed Win32={err_online}"
-                )
-
-        return {
-            "ok": False,
-            "error": " | ".join(failures[-14:]),
-            "failures": failures,
-            "disk_offline": False,
-        }
+        return _failed()
+    except Exception as exc:
+        # Every error escaping here came after the first write method started:
+        # bytes may already be on the device, so the parent must not reroute.
+        failures.append(f"SYSTEM helper 예외 {type(exc).__name__}: {exc}")
+        return _failed(post_write=True)
     finally:
         for handle in handles:
             try:

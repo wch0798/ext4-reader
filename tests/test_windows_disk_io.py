@@ -243,7 +243,7 @@ class LockRetryTests(unittest.TestCase):
             raise IoError("denied", winerr=5)
 
         with patch.object(disk, "_enable_storage_privileges", lambda: True), \
-             patch.object(disk, "_lock_volumes_for_disk", lambda idx: [item]), \
+             patch.object(disk, "_lock_volumes_for_disk", lambda idx, *a: [item]), \
              patch.object(disk, "_open_handle", open_handle), \
              patch.object(disk, "_release_locked_volume", released.append):
             with self.assertRaises(IoError):
@@ -259,7 +259,7 @@ class LockRetryTests(unittest.TestCase):
 
         with patch.object(disk, "kernel32", k32), \
              patch.object(disk, "_enable_storage_privileges", lambda: True), \
-             patch.object(disk, "_lock_volumes_for_disk", lambda idx: [item]), \
+             patch.object(disk, "_lock_volumes_for_disk", lambda idx, *a: [item]), \
              patch.object(disk, "_open_handle", lambda path, writable: 11), \
              patch.object(disk, "_query_storage", lambda h: ("", "", 12, True)), \
              patch.object(disk, "_query_storage_serial", lambda h: ""), \

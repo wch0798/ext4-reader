@@ -127,7 +127,9 @@ class UsbDkBotTests(unittest.TestCase):
         dev = self.make_backend()
         dev._write_blocks = lambda lba, blocks, data: None
         dev._read_blocks = lambda lba, blocks: b"z" * (blocks * 512)
-        with self.assertRaises(UsbDkError) as cm:
+        from ext4lib.windows.disk import PostWriteError
+
+        with self.assertRaises(PostWriteError) as cm:
             dev.write(4096, b"x" * 512)
         self.assertIn("read-back", str(cm.exception))
 

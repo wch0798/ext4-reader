@@ -46,7 +46,7 @@ class ReopenIdentityTests(unittest.TestCase):
 
         with patch.object(disk, "kernel32", k32), \
              patch.object(disk, "_verify_expected_medium", verify), \
-             patch.object(disk, "_lock_volumes_for_disk", lambda idx: locked.append(idx) or []), \
+             patch.object(disk, "_lock_volumes_for_disk", lambda idx, *a: locked.append(idx) or []), \
              patch.object(disk, "_open_handle", lambda *a: self.fail("opened by index")):
             with self.assertRaises(IoError) as ctx:
                 dev._reopen_locked()
@@ -81,7 +81,7 @@ class ReopenScsiVerdictTests(unittest.TestCase):
         dev._scsi_dirty = True
         with patch.object(disk, "kernel32", k32), \
              patch.object(disk, "_enable_storage_privileges", lambda: None), \
-             patch.object(disk, "_lock_volumes_for_disk", lambda idx: []), \
+             patch.object(disk, "_lock_volumes_for_disk", lambda idx, *a: []), \
              patch.object(disk, "_open_handle", lambda *a: 77), \
              patch.object(disk, "_query_disk_size", lambda h: (len(k32.media), 512)):
             dev._reopen_locked()

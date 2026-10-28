@@ -15,6 +15,11 @@ class MemInode:
         self.generation = 7
         self.blocks = 0
         self.i_block = b"\x00" * 60
+        self.flags = 0
+        self.size = 0
+        self.is_reg = True
+        self.is_dir = False
+        self.is_lnk = False
 
     def set_blocks(self, fs_blocks, block_size):
         self.blocks = fs_blocks * (block_size // 512)
@@ -204,16 +209,25 @@ def test_htree_grows_levels():
             lblk = _dx_pick(items, h)
         return lblk
 
-    for i in range(80):
+    from ext4lib.fs.directory import DirError
+
+    # largedir: at most 3 levels (indirect_levels 2), then "index full"
+    # like Linux ext4_dx_add_entry() -ENOSPC.
+    full = False
+    for i in range(400):
         h = (i + 1) * 10
         target = 100000 + i
-        dirty = _dx_insert_pointer(lambda lb: blocks[lb], blocks[0], h, target, bs, 0, alloc)
+        try:
+            dirty = _dx_insert_pointer(lambda lb: blocks[lb], blocks[0], h, target, bs, 0, alloc, 3)
+        except DirError:
+            full = True
+            break
         for logical, data in dirty.items():
             blocks[logical] = data
         placed[h] = target
         for eh, expect in placed.items():
             assert probe(eh) == expect, (eh, probe(eh), expect, blocks[0][30])
-    assert blocks[0][30] >= 2
+    assert full and blocks[0][30] == 2
     print("htree levels ok", blocks[0][30], "index blocks", nxt - 2)
 
 
